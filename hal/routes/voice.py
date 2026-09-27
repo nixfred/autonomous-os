@@ -302,6 +302,23 @@ def get_voices(provider: Optional[str] = None, lang: Optional[str] = None):
     return {"provider": provider, "voices": ["alloy", "ash", "coral", "echo", "fable", "onyx", "nova", "sage", "shimmer"]}
 
 
+_last_spoken = {"seq": 0, "text": "", "ts": 0.0}
+
+
+def _record_last_spoken(text: str) -> None:
+    """Remember the latest accepted utterance for screens and remote consoles."""
+    import time
+    _last_spoken["seq"] += 1
+    _last_spoken["text"] = text
+    _last_spoken["ts"] = time.time()
+
+
+@router.get("/voice/last-spoken")
+def last_spoken():
+    """Latest text accepted by /voice/speak: {seq, text, ts}. seq increments per utterance."""
+    return dict(_last_spoken)
+
+
 @router.post("/voice/speak", response_model=StatusResponse)
 def speak_text(req: SpeakRequest):
     """Synthesize text to speech and play through the speaker."""
@@ -323,6 +340,8 @@ def speak_text(req: SpeakRequest):
             "POST /voice/speak: rejected -- music is playing (text='%s')", req.text[:80]
         )
         raise HTTPException(409, "Speaker busy -- music is playing")
+
+    _record_last_spoken(req.text)
 
     # Optional provider/voice override for a TTS preview (web Test Voice,
     # MQTT tts.preview). It applies to THIS utterance only: the running
