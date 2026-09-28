@@ -13,7 +13,10 @@ from hal import config as _hal_config
 # ---------------------------------------------------------------------------
 # OS server endpoint
 # ---------------------------------------------------------------------------
-OS_SENSING_URL = "http://127.0.0.1:5000/api/sensing/event"
+# HAL_VOICE_SENSING_URL lets a voice router sit in front of os-server (for
+# example one that hands conversation to an agent on another computer and
+# passes device commands through). Unset = os-server directly.
+OS_SENSING_URL = os.environ.get("HAL_VOICE_SENSING_URL", "").strip() or "http://127.0.0.1:5000/api/sensing/event"
 OS_HARNESS_FOLLOWUP_URL = "http://127.0.0.1:5000/api/harness/voice-followup"
 # Dead-air filler for the realtime wait. os-server owns the phrase pools, the
 # language resolution, and the WAV cache; HAL only decides WHEN the wait has run
