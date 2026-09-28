@@ -192,7 +192,13 @@ if "camera" in _declared:
         # the platform's native OpenCV backend. Only a real body reaches the
         # ROBOT.md `driver:` selector.
         if _simulation:
-            _camera_driver = "host" if _simulation_media == "host" else "virtual"
+            # HAL_SIM_CAMERA=virtual keeps the synthetic camera under SIM_MEDIA=host,
+            # for hosts where only speaker/mic should be real (e.g. Linux, where the
+            # host OpenCV webcam path can crash the process).
+            _sim_camera_virtual = os.environ.get("HAL_SIM_CAMERA", "").strip().lower() == "virtual"
+            _camera_driver = "host" if _simulation_media == "host" and not _sim_camera_virtual else "virtual"
+            if _simulation_media == "host" and _sim_camera_virtual:
+                state.sim_media_fallback("camera", "HAL_SIM_CAMERA=virtual")
         else:
             _camera_driver = _vision_cap.driver if _vision_cap else None
         LocalVideoCaptureDevice = resolve_camera_class(
