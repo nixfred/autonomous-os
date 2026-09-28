@@ -305,12 +305,20 @@ def get_voices(provider: Optional[str] = None, lang: Optional[str] = None):
 _last_spoken = {"seq": 0, "text": "", "ts": 0.0}
 
 
-def _record_last_spoken(text: str) -> None:
-    """Remember the latest accepted utterance for screens and remote consoles."""
+def _record_last_spoken(text: str, append: bool = False) -> None:
+    """Remember the latest accepted utterance for screens and remote consoles.
+
+    append=True (speak-queue): a sentence arriving within 4 s of the previous one
+    extends the same caption, so a streamed multi-sentence reply reads as one.
+    """
     import time
+    now = time.time()
+    if append and _last_spoken["text"] and now - _last_spoken["ts"] < 4:
+        _last_spoken["text"] = (_last_spoken["text"] + " " + text).strip()
+    else:
+        _last_spoken["text"] = text
     _last_spoken["seq"] += 1
-    _last_spoken["text"] = text
-    _last_spoken["ts"] = time.time()
+    _last_spoken["ts"] = now
 
 
 @router.get("/voice/last-spoken")
@@ -341,7 +349,8 @@ def speak_text(req: SpeakRequest):
         )
         raise HTTPException(409, "Speaker busy -- music is playing")
 
-    _record_last_spoken(req.text)
+    if not req.prerender:
+        _record_last_spoken(req.text)
 
     # Optional provider/voice override for a TTS preview (web Test Voice,
     # MQTT tts.preview). It applies to THIS utterance only: the running
@@ -502,6 +511,8 @@ def speak_queue_text(req: SpeakRequest):
         raise HTTPException(409, "Speaker busy -- music is playing")
     if not state.tts_service.available:
         raise HTTPException(503, "TTS not available")
+    if not req.prerender:
+        _record_last_spoken(req.text, append=True)
     if req.voice:
         state.tts_service._voice = req.voice
     state.logger.info(
