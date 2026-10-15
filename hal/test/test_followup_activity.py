@@ -1,4 +1,6 @@
 """Wake idle time belongs to the user after an authorized reply drains."""
+import threading
+
 
 import pytest
 
@@ -17,12 +19,12 @@ def test_long_realtime_reply_leaves_full_window_after_last_audio(owner):
     focus, now, pending = fixture()
     focus.begin('voice')
     now[0] = 25
-    assert focus.is_active()  # Vision/grounding still working, past old deadline.
-    focus.playback_finished()  # A filler ended, processing still owns the hold.
+    assert focus.is_active()
+    focus.playback_finished()
     pending.add(owner)
     focus.finish('voice')
     now[0] = 45
-    assert focus.is_active()  # Synthesis and all queued chunks count too.
+    assert focus.is_active()
     pending.clear()
     focus.playback_finished()
     now[0] = 64.9
@@ -35,9 +37,9 @@ def test_main_terminal_waits_for_owned_playback_and_ignores_other_tts():
     focus, now, pending = fixture()
     focus.begin('voice')
     assert focus.activity('voice', 'main', 'start')
-    focus.finish('voice')  # HTTP receipt is not task completion.
+    focus.finish('voice')
     now[0] = 40
-    focus.playback_finished()  # Main filler cannot start idle timer.
+    focus.playback_finished()
     assert focus.is_active()
     pending.update(['run:main', 'run:web'])
     assert focus.activity('voice', 'main', 'end')
@@ -46,7 +48,7 @@ def test_main_terminal_waits_for_owned_playback_and_ignores_other_tts():
     pending.remove('run:main')
     focus.playback_finished()
     now[0] = 80
-    assert not focus.is_active()  # Unrelated web playback cannot hold focus.
+    assert not focus.is_active()
     pending.clear()
     focus.playback_finished()
     assert not focus.is_active()
@@ -129,6 +131,11 @@ def test_capture_gate_and_reply_drain(monkeypatch, wake_enabled, initial_focus, 
         focus.refresh()
     request = 'What am I wearing today?'
     service = Mock()
+    service._automatic_reply_lock = threading.Lock()
+    service._automatic_reply_stop = None
+    service._automatic_reply_cancelled_at = None
+    service._stt_drain_worker = None
+    service._stt_drain_future = None
     service._running = False
     service._tts = None
     service._wakeword_focus = focus
@@ -235,7 +242,7 @@ def test_retained_main_queue_keeps_focus_across_native_stop():
     focus.finish('voice')
     focus.activity('voice', 'main', 'end')
     now[0] = 40
-    focus.playback_finished()  # Interrupted native callback, main resumes next.
+    focus.playback_finished()
     assert focus.is_active()
     tts._pending_queue.clear()
     focus.playback_finished()
@@ -243,7 +250,6 @@ def test_retained_main_queue_keeps_focus_across_native_stop():
     assert focus.is_active()
     now[0] = 60
     assert not focus.is_active()
-
 
 
 def test_silent_live_opener_retains_authorization_for_main_fallback(monkeypatch, kpi):

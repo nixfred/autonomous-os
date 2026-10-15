@@ -7,6 +7,7 @@ from pathlib import Path
 import re
 
 from hal.board.board import ButtonConfig, PROFILES
+from hal.board.config_fields import known_fields
 
 
 @dataclass(frozen=True)
@@ -15,7 +16,7 @@ class ButtonInputConfig:
     name: str = "primary"
     behavior: str = "standard"
     hold_s: float = 5.0
-    # Standard buttons only: False keeps a 10s+ hold at shutdown (device has a dedicated reset button).
+    # False keeps a 10s+ hold at shutdown (device has a dedicated reset button).
     factory_reset: bool = True
 
 
@@ -30,16 +31,19 @@ def _board_buttons(values):
     if not isinstance(values, dict):
         raise ValueError("expected a board object")
     if "buttons" not in values:
-        if set(values) != {"chip", "line", "debounce_ns"}:
+        if not {"chip", "line", "debounce_ns"} <= set(values):
             raise ValueError("expected chip, line and debounce_ns")
+        values = known_fields(values, {"chip", "line", "debounce_ns"}, "gpio_button.json board")
         return [ButtonInputConfig(_wiring(values))]
-    if set(values) != {"buttons"} or not isinstance(values["buttons"], list) or not values["buttons"]:
+    values = known_fields(values, {"buttons"}, "gpio_button.json board")
+    if not isinstance(values["buttons"], list) or not values["buttons"]:
         raise ValueError("expected a non-empty buttons list")
     result, names, pins = [], set(), set()
     required = {"name", "chip", "line", "debounce_ns"}
     for entry in values["buttons"]:
-        if not isinstance(entry, dict) or not required <= set(entry) or set(entry) - required - {"behavior", "hold_s", "factory_reset"}:
+        if not isinstance(entry, dict) or not required <= set(entry):
             raise ValueError("button requires name, chip, line, debounce_ns and optional behavior/hold_s/factory_reset")
+        entry = known_fields(entry, required | {"behavior", "hold_s", "factory_reset"}, "gpio_button.json button")
         name = entry["name"]
         if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9_-]+", name):
             raise ValueError("button name must contain only letters, digits, '_' or '-'")
@@ -67,10 +71,9 @@ def _board_buttons(values):
 
 
 def load_button_configs(device_dir: str, board_id: str) -> list[ButtonInputConfig]:
-    """Load one or more inputs; absent file/board keeps exactly one legacy button.
+    """Load one or more inputs; absent file/board keeps one legacy button.
 
-    GPIO lines are chip-relative offsets, not physical header pin numbers.
-    The shared driver uses pull-up and active-low wiring.
+    GPIO lines are chip-relative offsets (pull-up, active-low).
     """
     fallback = [ButtonInputConfig(PROFILES[board_id].button)]
     path = Path(device_dir) / "gpio_button.json"

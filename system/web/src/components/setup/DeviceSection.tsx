@@ -1,14 +1,167 @@
 import { useState } from "react";
 import { toast } from "sonner";
-import { Eye, EyeOff, Copy, Check, Cpu, Fingerprint, Network } from "lucide-react";
+import { Eye, EyeOff, Copy, Check, Cpu, Fingerprint, Network, X } from "lucide-react";
 import { SecretUpdateField } from "@/components/SecretUpdateField";
+import { WAKE_FOLLOWUP_CHOICES_S, WAKE_FOLLOWUP_DEFAULT_S, type VoiceInputMode } from "@/lib/api";
+import { WAKE_LOOK_DEFAULT, swatch, type WakeLook } from "@/lib/ledColor";
+import { WakeLightEditor } from "./WakeLightEditor";
 import { copyText } from "@/lib/clipboard";
 import { C, Field, PasswordField, SectionCard, LABEL_STYLE, INPUT_STYLE, INPUT_READONLY_STYLE, INPUT_PAD_ONE_ICON, FIELD_GAP, ADMIN_PASSWORD_MIN } from "./shared";
 
-// Read-only MAC field masked behind ••••, with an eye toggle to reveal. The
-// caller only renders this when `value` is non-empty — on the pre-auth Setup
-// page, GET /api/device/config is admin-gated and returns 401, so MAC stays
-// empty and the field is omitted entirely rather than showing "not available".
+// Mirrors config.NormalizeWakePhrases on the server.
+const MAX_WAKE_PHRASES = 30;
+const MAX_WAKE_PHRASE_CHARS = 40;
+
+function normalizePhrase(raw: string): string {
+  return raw.trim().split(/\s+/).join(" ").toLowerCase();
+}
+
+// Editable wake phrases: chips with remove, an add field, and restore-defaults.
+// The chime and the light are the two ways a wake is noticed; at least one stays on.
+function WakeCues({ chime, setChime, lightOn, setLightOn, look, setLook }: {
+  chime: boolean; setChime: (v: boolean) => void;
+  lightOn: boolean; setLightOn: (v: boolean) => void;
+  look: WakeLook; setLook: (v: WakeLook) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const row: React.CSSProperties = { display: "flex", alignItems: "center", gap: 8, fontSize: 13, color: C.text };
+  return (
+    <div style={{ marginTop: 12, display: "grid", gap: 8 }}>
+      <label htmlFor="wake_chime" style={{ ...row, cursor: lightOn ? "pointer" : "not-allowed" }}>
+        <input id="wake_chime" type="checkbox" checked={chime} disabled={chime && !lightOn}
+          onChange={(e) => setChime(e.target.checked)} style={{ flexShrink: 0 }} />
+        Play a chime when a wake phrase is heard
+      </label>
+      <div style={{ ...row, flexWrap: "wrap" }}>
+        <label htmlFor="wake_light" style={{ ...row, cursor: chime ? "pointer" : "not-allowed" }}>
+          <input id="wake_light" type="checkbox" checked={lightOn} disabled={lightOn && !chime}
+            onChange={(e) => { setLightOn(e.target.checked); if (!e.target.checked) setOpen(false); }} style={{ flexShrink: 0 }} />
+          Light up when a wake phrase is heard
+        </label>
+        {lightOn && (
+          <button
+            type="button"
+            onClick={() => setOpen((o) => !o)}
+            aria-expanded={open}
+            aria-controls="wake-light-editor"
+            style={{
+              display: "flex", alignItems: "center", gap: 6, padding: "3px 10px", borderRadius: 999,
+              background: open ? C.amberDim : C.surface, border: `1px solid ${open ? C.amber : C.border}`,
+              color: open ? C.amber : C.text, fontSize: 12, cursor: "pointer",
+            }}
+          >
+            <span style={{ width: 12, height: 12, borderRadius: "50%", background: swatch(look.color), border: `1px solid ${C.border}` }} />
+            {open ? "Done" : "Customize light"}
+          </button>
+        )}
+      </div>
+      {(!chime || !lightOn) && (
+        <div style={{ fontSize: 11.5, color: C.textMuted }}>
+          Keep the chime or the light on, so you can tell the device heard you.
+        </div>
+      )}
+      {lightOn && open && (
+        <div id="wake-light-editor">
+          <WakeLightEditor look={look} onChange={setLook} />
+        </div>
+      )}
+    </div>
+  );
+}
+
+function WakeFollowupSelect({ value, onChange }: { value: number; onChange: (v: number) => void }) {
+  // Keep a value saved outside the presets (e.g. via the API) selectable.
+  const choices = WAKE_FOLLOWUP_CHOICES_S.includes(value)
+    ? WAKE_FOLLOWUP_CHOICES_S
+    : [...WAKE_FOLLOWUP_CHOICES_S, value].sort((a, b) => a - b);
+  return (
+    <div style={{ marginTop: 12 }}>
+      <label htmlFor="wake_followup_s" style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 13, color: C.text }}>
+        Keep listening for
+        <select
+          id="wake_followup_s"
+          value={value}
+          onChange={(e) => onChange(Number(e.target.value))}
+          style={{ ...INPUT_STYLE, width: "auto", padding: "4px 8px", fontSize: 13 }}
+        >
+          {choices.map((s) => (
+            <option key={s} value={s}>{s} seconds</option>
+          ))}
+        </select>
+      </label>
+      <div style={{ marginTop: 4 }}>
+        After a wake or a reply, you can keep talking without the wake phrase for this long.
+      </div>
+    </div>
+  );
+}
+
+function WakePhraseEditor({ phrases, setPhrases, defaults, nameAnywhere = false }: {
+  phrases: string[];
+  setPhrases: (v: string[]) => void;
+  defaults: string[];
+  // Entries are names heard anywhere in a sentence, so a single word is expected.
+  nameAnywhere?: boolean;
+}) {
+  const noun = nameAnywhere ? "name" : "phrase";
+  const [draft, setDraft] = useState("");
+  const [error, setError] = useState("");
+  const isDefault = phrases.length === defaults.length && phrases.every((p, i) => p === defaults[i]);
+  const singleWord = nameAnywhere ? [] : phrases.filter((p) => !p.includes(" "));
+
+  const add = () => {
+    const phrase = normalizePhrase(draft);
+    if (!phrase) return;
+    if ([...phrase].length > MAX_WAKE_PHRASE_CHARS) return setError(`Keep it under ${MAX_WAKE_PHRASE_CHARS} characters.`);
+    if (!/\p{L}/u.test(phrase)) return setError(`A wake ${noun} needs at least one letter.`);
+    if (phrases.includes(phrase)) return setError(`That ${noun} is already in the list.`);
+    if (phrases.length >= MAX_WAKE_PHRASES) return setError(`At most ${MAX_WAKE_PHRASES} ${noun}s.`);
+    setPhrases([...phrases, phrase]);
+    setDraft("");
+    setError("");
+  };
+
+  return (
+    <div>
+      <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+        {phrases.map((phrase) => (
+          <span key={phrase} style={{ display: "inline-flex", alignItems: "center", gap: 4, padding: "3px 4px 3px 7px", borderRadius: 5, background: C.surface, border: `1px solid ${C.border}`, color: C.text, fontFamily: "monospace" }}>
+            {phrase}
+            <button type="button" aria-label={`Remove ${phrase}`} onClick={() => setPhrases(phrases.filter((p) => p !== phrase))}
+              style={{ display: "inline-flex", padding: 2, border: 0, background: "transparent", color: C.textMuted, cursor: "pointer" }}>
+              <X size={12} />
+            </button>
+          </span>
+        ))}
+        {phrases.length === 0 && (
+          <span style={{ color: C.textMuted }}>No {noun}s. The built-in list is used after you save.</span>
+        )}
+      </div>
+      <div style={{ display: "flex", gap: 8, marginTop: 10, flexWrap: "wrap" }}>
+        <input id="wake_phrase_new" value={draft} placeholder="e.g. sam"
+          onChange={(e) => { setDraft(e.target.value); setError(""); }}
+          onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); add(); } }}
+          style={{ ...INPUT_STYLE, flex: "1 1 200px", padding: "7px 10px", fontSize: 13 }} />
+        <button type="button" onClick={add} disabled={!normalizePhrase(draft)}
+          style={{ padding: "7px 14px", borderRadius: 8, border: `1px solid ${C.amber}`, background: C.amberDim, color: C.amber, fontSize: 13, cursor: "pointer", opacity: normalizePhrase(draft) ? 1 : 0.5 }}>
+          Add
+        </button>
+        <button type="button" onClick={() => { setPhrases(defaults); setError(""); }} disabled={isDefault || defaults.length === 0}
+          style={{ padding: "7px 12px", borderRadius: 8, border: `1px solid ${C.border}`, background: "transparent", color: C.textDim, fontSize: 13, cursor: isDefault ? "default" : "pointer", opacity: isDefault ? 0.5 : 1 }}>
+          Restore defaults
+        </button>
+      </div>
+      {error && <div role="alert" style={{ marginTop: 6, color: C.red }}>{error}</div>}
+      {singleWord.length > 0 && (
+        <div style={{ marginTop: 6, color: C.yellow }}>
+          Single words ({singleWord.join(", ")}) can wake the device by accident in normal conversation.
+        </div>
+      )}
+    </div>
+  );
+}
+
+// Read-only MAC field masked behind ••••, with an eye toggle to reveal.
 function MaskedReadField({ label, id, value }: {
   label: string; id: string; value: string;
 }) {
@@ -44,17 +197,7 @@ function MaskedReadField({ label, id, value }: {
   );
 }
 
-// PasswordStrength — lightweight meter under the admin password input. This
-// guards a device with a camera/mic, so we nudge toward something stronger than
-// the bare minimum: score on length + character-class variety, render a 3-segment
-// bar + label. Purely advisory (the only hard gate is the ADMIN_PASSWORD_MIN min);
-// the goal is to discourage "1111"-class passwords without hard-blocking.
-//
-// UX rule: RED is reserved for the one blocking state (below the min). Once the
-// password is long enough to submit, every other state is advisory, so the
-// hint switches to amber/green — never red — to match the fact that Next stays
-// enabled. And every message is ACTION-ORIENTED ("add a number…") rather than a
-// bare verdict ("Weak"), so the user always knows what to do next.
+// Advisory password strength meter under the admin password input.
 function PasswordStrength({ value }: { value: string }) {
   if (!value) return null;
   const tooShort = value.length < ADMIN_PASSWORD_MIN;
@@ -64,16 +207,12 @@ function PasswordStrength({ value }: { value: string }) {
         message={`At least ${ADMIN_PASSWORD_MIN} characters needed (${value.length}/${ADMIN_PASSWORD_MIN}).`} />
     );
   }
-  // Score variety + length on the already-valid (≥ min) password.
   const classes = [/[a-z]/, /[A-Z]/, /[0-9]/, /[^a-zA-Z0-9]/].filter((re) => re.test(value)).length;
   let score = 0;
   if (value.length >= 12) score += 1;
   if (classes >= 2) score += 1;
   if (classes >= 3) score += 1;
-  // Collapse to 3 buckets: weak (0), fair (1-2), strong (3).
   const level = score === 0 ? 0 : score <= 2 ? 1 : 2;
-  // Advisory messages always tell the user the concrete way to level up; the
-  // "Strong" case confirms instead of nagging.
   const messages = [
     "A bit simple — add a capital letter, number, or symbol to make it stronger.",
     "Good — add a symbol or make it longer for a stronger password.",
@@ -83,10 +222,9 @@ function PasswordStrength({ value }: { value: string }) {
   return <StrengthRow level={level} color={colors[level]} message={messages[level]} />;
 }
 
-// StrengthRow — the 3-segment bar + hint line. level -1 = invalid (no filled
-// segments, red text); 0/1/2 fill 1/2/3 segments in the given color.
+// 3-segment strength bar + hint; level -1 = invalid.
 function StrengthRow({ level, color, message }: { level: number; color: string; message: string }) {
-  const filled = level + 1; // -1→0, 0→1, 1→2, 2→3
+  const filled = level + 1;
   return (
     <div style={{ marginTop: -4, marginBottom: 12 }}>
       <div style={{ display: "flex", gap: 4 }}>
@@ -105,11 +243,6 @@ function StrengthRow({ level, color, message }: { level: number; color: string; 
   );
 }
 
-// DeviceMetaCard — compact read-only "device identity" card used in edit mode.
-// Groups Device ID + MAC into a single bordered surface with key/value rows and
-// a thin divider, instead of two free-floating read-only inputs. Device ID gets
-// a copy button; MAC keeps a reveal toggle. Purely presentational — the values
-// are server-set and never edited here, so there's no input/form state to carry.
 function MetaRow({ icon, label, children }: { icon: React.ReactNode; label: string; children: React.ReactNode }) {
   return (
     <div style={{ display: "flex", alignItems: "center", gap: 12, padding: "11px 14px", minHeight: 44 }}>
@@ -126,10 +259,6 @@ function DeviceMetaCard({ deviceId, mac }: { deviceId: string; mac?: string }) {
   const [copied, setCopied] = useState(false);
   const [showMac, setShowMac] = useState(false);
   const copyId = async () => {
-    // The old code went straight to navigator.clipboard, which is undefined on
-    // the plain-HTTP device UI (http://<pi-ip>) — the button silently no-oped.
-    // copyText() falls back to document.execCommand("copy") when the Async
-    // Clipboard API isn't available. See lib/clipboard.ts.
     const ok = await copyText(deviceId);
     if (ok) {
       setCopied(true);
@@ -194,32 +323,41 @@ export function DeviceSection({
   adminPassword, setAdminPassword,
   adminPasswordConfirm, setAdminPasswordConfirm,
   rotateAdminPassword, setRotateAdminPassword,
+  voiceInputMode = "automatic", setVoiceInputMode,
   wakeWord, setWakeWord,
-  agentName, wakePhrases,
+  agentName, wakePhrases, setWakePhrases, wakePhrasesDefault, wakeNameAnywhere = false, wakeChime, setWakeChime,
+  wakeFollowupS, setWakeFollowupS,
+  wakeLightOn, setWakeLightOn, wakeLook, setWakeLook,
 }: {
   active: boolean;
   deviceId: string;
   setDeviceId: (v: string) => void;
   mac?: string;
-  // Setup mode — operator picks an initial password (with confirm). Caller
-  // gates these on `!hasAdminPassword`.
   adminPassword?: string;
   setAdminPassword?: (v: string) => void;
   adminPasswordConfirm?: string;
   setAdminPasswordConfirm?: (v: string) => void;
-  // EditConfig mode — write-only rotate field. Empty value means "keep
-  // existing hash"; submit only ships admin_password when the operator typed
-  // something here. Server bcrypts + replaces; live sessions keep working.
+  // Empty means keep the existing password.
   rotateAdminPassword?: string;
   setRotateAdminPassword?: (v: string) => void;
-  // Edit Settings only: top-level voice gate, deliberately independent of the
-  // debug-only realtime configuration.
+  voiceInputMode?: VoiceInputMode;
+  setVoiceInputMode?: (v: VoiceInputMode) => void;
   wakeWord?: boolean;
   setWakeWord?: (v: boolean) => void;
-  // Settings mode receives the effective phrases from the server, including
-  // the active runtime's current agent name.
   agentName?: string;
   wakePhrases?: string[];
+  // Present only where the phrases can be edited (Settings).
+  setWakePhrases?: (v: string[]) => void;
+  wakePhrasesDefault?: string[];
+  wakeNameAnywhere?: boolean;
+  wakeChime?: boolean;
+  setWakeChime?: (v: boolean) => void;
+  wakeFollowupS?: number;
+  setWakeFollowupS?: (v: number) => void;
+  wakeLightOn?: boolean;
+  setWakeLightOn?: (v: boolean) => void;
+  wakeLook?: WakeLook;
+  setWakeLook?: (v: WakeLook) => void;
 }) {
   const showAdminPasswordFields = setAdminPassword !== undefined;
   const showRotateField = setRotateAdminPassword !== undefined;
@@ -228,18 +366,11 @@ export function DeviceSection({
     !!adminPasswordConfirm &&
     !!adminPassword &&
     adminPassword !== adminPasswordConfirm;
-  // Description adapts to mode: setup (pick a new password) vs. edit (rotate an
-  // existing one). The rotate flow has no password fields visible until the
-  // operator clicks the pencil, so its copy points at that.
   const description = showAdminPasswordFields
     ? "Set an admin password — you'll use it to sign in from any browser after setup."
     : "Your device's identity and admin login.";
   return (
     <SectionCard id="device" title="Device" active={active} description={description} icon={<Cpu size={17} />}>
-      {/* The admin password is the only thing the operator actively does on
-          this step, so it leads. Device ID / MAC are read-only identifiers and
-          drop to a compact metadata footer — putting them first made the step
-          look like "nothing to do here" and operators skipped past the password. */}
       {showAdminPasswordFields && (
         <>
           <PasswordField
@@ -270,23 +401,80 @@ export function DeviceSection({
             onChange={setRotateAdminPassword!}
             placeholder={`New password (min ${ADMIN_PASSWORD_MIN} chars)`}
           />
-          {/* Same strength meter as the setup flow — only meaningful once the
-              operator starts typing a new password. Empty (the resting "keep
-              current password" state) renders nothing. */}
           <PasswordStrength value={rotateAdminPassword ?? ""} />
         </>
       )}
 
-      {setWakeWord && (
+      {setVoiceInputMode && (
+        <fieldset aria-describedby="voice-input-help" style={{ margin: "18px 0 0", padding: "14px 0 0", border: 0, borderTop: `1px solid ${C.border}` }}>
+          <legend style={{ ...LABEL_STYLE, padding: "0 8px 0 0" }}>How to talk</legend>
+          <div style={{ display: "flex", flexWrap: "wrap", gap: 10 }}>
+            {([
+              ["automatic", "Automatic"],
+              ["tap_to_talk", "Tap to talk"],
+            ] as const).map(([mode, label]) => (
+              <label key={mode} style={{ display: "flex", flex: "1 1 140px", alignItems: "center", gap: 8, padding: "10px 12px", borderRadius: 8, border: `1px solid ${voiceInputMode === mode ? C.amber : C.border}`, background: voiceInputMode === mode ? C.amberDim : C.surface, color: C.text, fontSize: 13, cursor: "pointer" }}>
+                <input type="radio" name="voice_input_mode" value={mode} checked={voiceInputMode === mode} onChange={() => setVoiceInputMode(mode)} />
+                {label}
+              </label>
+            ))}
+          </div>
+          <p id="voice-input-help" style={{ margin: "8px 0 0", fontSize: 11.5, lineHeight: 1.45, color: C.textMuted }}>
+            {voiceInputMode === "automatic"
+              ? "Your device detects speech and sends it when you finish speaking."
+              : "Tap once to start speaking, then tap again to send. Pauses won't send your message. While your device is speaking, tap to stop it, then tap again to start recording."}
+          </p>
+          {voiceInputMode === "tap_to_talk" && (
+            <p style={{ margin: "5px 0 0", fontSize: 11.5, lineHeight: 1.45, color: C.textMuted }}>
+              No wake phrase or gaze needed. Your automatic wake preference is kept. The physical mic switch still applies.
+            </p>
+          )}
+        </fieldset>
+      )}
+
+      {setWakeWord && voiceInputMode === "automatic" && (
         <div style={{ marginTop: 18, paddingTop: 14, borderTop: `1px solid ${C.border}` }}>
           <label style={{ display: "flex", alignItems: "center", gap: 8, cursor: "pointer", fontSize: 13, color: C.text }}>
-            <input type="checkbox" checked={wakeWord ?? false} onChange={(e) => setWakeWord(e.target.checked)} />
-            Require an attention trigger before handling speech
+            <input type="checkbox" checked={wakeWord ?? false} onChange={(e) => setWakeWord(e.target.checked)} style={{ flexShrink: 0 }} />
+            <span style={{ whiteSpace: "nowrap" }}>Require attention trigger</span>
           </label>
           <div style={{ marginTop: 5, marginLeft: 23, fontSize: 11.5, lineHeight: 1.45, color: C.textMuted }}>
-            When off, your device keeps its existing always-listening behavior.
+            Require an attention trigger before handling speech. When off, your device keeps its existing always-listening behavior.
           </div>
-          {!!wakePhrases?.length && (
+          {setWakePhrases ? (
+            <div style={{ marginTop: 10, marginLeft: 23, fontSize: 11.5, lineHeight: 1.45, color: C.textMuted }}>
+              <label htmlFor="wake_phrase_new" style={{ display: "block", marginBottom: 6 }}>
+                {wakeNameAnywhere ? (
+                  <>
+                    Names your device answers to (other triggers: tap, gaze, or a recognized person){agentName ? ` — current agent: ${agentName}` : ""}.
+                    {" "}Use a name anywhere in what you say: &quot;hey intern&quot;, &quot;hello intern, what&apos;s the weather?&quot; or &quot;what time is it, intern?&quot;.
+                    {" "}Say it on its own and wait for the chime, or together with your request.
+                  </>
+                ) : (
+                  <>
+                    Spoken wake phrases (other triggers: tap, gaze, or a recognized person){agentName ? ` — current agent: ${agentName}` : ""}.
+                    {" "}Say a phrase on its own and wait for the chime, then speak, or say it together with your request.
+                  </>
+                )}
+              </label>
+              <WakePhraseEditor phrases={wakePhrases ?? []} setPhrases={setWakePhrases} defaults={wakePhrasesDefault ?? []} nameAnywhere={wakeNameAnywhere} />
+              {setWakeChime && setWakeLightOn && setWakeLook ? (
+                <WakeCues
+                  chime={wakeChime ?? true} setChime={setWakeChime}
+                  lightOn={wakeLightOn ?? true} setLightOn={setWakeLightOn}
+                  look={wakeLook ?? WAKE_LOOK_DEFAULT} setLook={setWakeLook}
+                />
+              ) : setWakeChime && (
+                <label htmlFor="wake_chime" style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 12, cursor: "pointer", fontSize: 13, color: C.text }}>
+                  <input id="wake_chime" type="checkbox" checked={wakeChime ?? true} onChange={(e) => setWakeChime(e.target.checked)} style={{ flexShrink: 0 }} />
+                  Play a chime when a wake phrase is heard
+                </label>
+              )}
+              {setWakeFollowupS && (
+                <WakeFollowupSelect value={wakeFollowupS ?? WAKE_FOLLOWUP_DEFAULT_S} onChange={setWakeFollowupS} />
+              )}
+            </div>
+          ) : !!wakePhrases?.length && (
             <div style={{ marginTop: 10, marginLeft: 23, fontSize: 11.5, lineHeight: 1.45, color: C.textMuted }}>
               <div style={{ marginBottom: 6 }}>
                 Spoken wake phrases (other triggers: tap, gaze, or a recognized person){agentName ? ` — current agent: ${agentName}` : ""}:
@@ -303,10 +491,6 @@ export function DeviceSection({
         </div>
       )}
 
-      {/* Read-only identity metadata. Edit mode (Settings → General) groups
-          Device ID + MAC into a compact key/value card with copy/reveal — these
-          are server-set identifiers, never edited here. Setup mode keeps the
-          plain Field/MaskedReadField so the first-run flow is unchanged. */}
       {showRotateField ? (
         <DeviceMetaCard deviceId={deviceId} mac={mac} />
       ) : (

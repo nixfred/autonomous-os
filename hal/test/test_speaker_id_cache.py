@@ -3,14 +3,20 @@
 import time
 from unittest import mock
 
+import pytest
+
 from hal.drivers.voice._internal import speaker_decorate as sd
 from hal.drivers.voice._internal.speaker_decorate import UNKNOWN_LABEL, SpeakerDecorator
 
 
+@pytest.fixture(autouse=True)
+def _speaker_id_opted_in(monkeypatch):
+    # The cache only matters once the owner has opted into speaker ID.
+    monkeypatch.setattr(sd.hal_config, "SPEAKER_RECOGNITION_ENABLED", True)
+
+
 def _decorator():
-    with mock.patch.object(SpeakerDecorator, "_init_speaker", return_value=None), \
-         mock.patch.object(SpeakerDecorator, "_init_speech_emotion", return_value=None):
-        return SpeakerDecorator(wake_words=["lamp"], nudge_cooldown_s=0)
+    return SpeakerDecorator(wake_words=["lamp"], nudge_cooldown_s=0, enable_people_perception=False)
 
 
 def test_a_fresh_decorator_has_nothing_to_reuse():
@@ -31,8 +37,6 @@ def test_a_stale_verdict_is_not_reused(monkeypatch):
     assert d._cached_identity(in_followup=False) is None
 
 
-# Turns inside a follow-up window are one conversation, so the identity holds
-# for the whole window even once the ordinary TTL has passed.
 def test_the_follow_up_window_holds_a_verdict_the_normal_ttl_would_drop(monkeypatch):
     monkeypatch.setattr(sd, "SPEAKER_ID_CACHE_S", 10.0)
     monkeypatch.setattr(sd, "SPEAKER_ID_CACHE_FOLLOWUP_S", 300.0)
@@ -42,8 +46,6 @@ def test_the_follow_up_window_holds_a_verdict_the_normal_ttl_would_drop(monkeypa
     assert d._cached_identity(in_followup=True) == ("long", "Long")
 
 
-# The case most likely to repeat: retrying it every turn pays the full latency
-# for the same non-answer.
 def test_unknown_is_cached_too():
     d = _decorator()
     d._remember_identity(UNKNOWN_LABEL, None)
@@ -66,8 +68,6 @@ def test_forget_identity_clears_it():
     assert d._cached_identity(in_followup=False) is None
 
 
-# A cache hit must not call the recognizer, and must still decorate THIS
-# transcript with the remembered name.
 def test_a_cache_hit_decorates_without_running_recognition():
     d = _decorator()
     d._speaker = mock.Mock()
@@ -78,8 +78,6 @@ def test_a_cache_hit_decorates_without_running_recognition():
     d._speaker.recognize.assert_not_called()
 
 
-# A cached unknown has no WAV path to offer, so it returns the plain transcript
-# rather than the enrolment-nudge message.
 def test_a_cached_unknown_returns_the_plain_transcript():
     d = _decorator()
     d._speaker = mock.Mock()

@@ -17,19 +17,29 @@ When the OS server is not yet configured (`SetUpCompleted = false`), the device 
       goroutine publishes the STA LAN IP into setup state as soon as wlan0
       gets one (before internet is up), so the Web UI can read it while the
       AP is still briefly alive (see "AP→STA Auto-Redirect")
-   b. Wait for internet (poll 60s)
-   c. Save config
+   b. Wait for internet (up to 60s wall clock; ICMP to 8.8.8.8, falling back
+      to a TLS handshake with the cloud API host for networks that drop ICMP)
+   c. Save config, then resync the clock (no RTC: the device boots with a
+      stale time and every TLS call fails "certificate is not yet valid"):
+      chrony `online` + `refresh` (re-resolves NTP pool names that failed in
+      AP mode) + `burst`, or a systemd-timesyncd restart; wait up to 15s for
+      `NTPSynchronized`, else keep syncing in the background
+      (`system/lib/clocksync`). A later backend ping that fails on certificate
+      validity also starts a background resync, at most once a minute. The
+      OrangePi image seeds `/etc/fake-hwclock.data` with its build time, so a
+      fresh device boots no earlier than the image was built
    d. Early backend ping (fire-and-forget HTTP POST {llm_base}/ping, status
       "setting_up") — publishes the device's fresh LAN IP (local_ip) to the
       backend WITHOUT waiting for the agent setup below, so a page that
       opened the Setup popup can look the IP up and rescue the redirect
    e. Setup agent gateway
    f. Wait for agent ready (poll 120s)
-   g. SetUpCompleted = true; clear the temporary setup-white LED state so it
-      is not retained as a user LED preference and the strip returns to the
-      ambient resting look (currently dark/off)
+   g. Save SetUpCompleted = true; wait for runtime preparation (up to 5min):
+      stable agent, HAL restart if needed, HAL health, configured voice start.
+      Only then clear the temporary setup LED and restore the resting choice.
    h. Backend ping (status "working", setup_completed=true)
-7. On failure → return to AP mode
+7. On network/agent setup failure → return to AP mode; runtime preparation
+   failure keeps LAN connected and reports a setup error
 8. Web UI auto-redirects the browser to http://<lan_ip>/setup once the
    operator is back on home Wi-Fi (IP-first; mDNS .local is a last-resort
    discovery fallback when the AP died before lan_ip could be read)
@@ -41,15 +51,16 @@ When the OS server is not yet configured (`SetUpCompleted = false`), the device 
 
 ```json
 {
-  "network_ssid": "MyWiFi",
-  "network_password": "...",
-  "llm_provider": "anthropic",
+  "device_id": "lamp-a1b2",
+  "ssid": "MyWiFi",
+  "password": "...",
   "llm_api_key": "sk-...",
   "llm_base_url": "https://api.anthropic.com",
   "llm_model": "claude-haiku-4-5-20251001",
-  "channel_type": "telegram",
-  "channel_token": "...",
-  "channel_id": "...",
+  "channel": "telegram",
+  "telegram_bot_token": "...",
+  "telegram_user_id": "...",
+  "admin_password": "...",
   "mqtt_endpoint": "broker.example.com",
   "mqtt_port": 8883,
   "mqtt_username": "...",
@@ -60,15 +71,21 @@ When the OS server is not yet configured (`SetUpCompleted = false`), the device 
 }
 ```
 
+Fields come from `SetupRequest` in `system/domain/device.go`. `device_id`, `llm_api_key` and `llm_base_url` carry `validate:"required"`; everything else is optional. `ssid` may be empty (wired/ethernet path, see below). `channel` is `telegram` (default when empty), `slack`, `discord` or `imessage`; the matching credential fields are `telegram_bot_token`/`telegram_user_id`, `slack_bot_token`/`slack_app_token`/`slack_user_id`, `discord_bot_token`/`discord_guild_id`/`discord_user_id`, or `bluebubbles_server_url`/`bluebubbles_password`/`bluebubbles_user_address`. Optional voice overrides: `stt_api_key`, `tts_api_key`, `stt_base_url`, `tts_base_url`, `stt_language`, `tts_provider`, `tts_voice`.
+
+**Telegram sender policy.** A Telegram bot only accepts messages from `telegram_user_id`. With a bot token but no user ID, nobody can message it (OpenClaw `dmPolicy: allowlist` with an empty `allowFrom`, any old `"*"` removed; PicoClaw leaves the channel disabled; Hermes, Codex, Claude Code and OpenCode already reject every sender in that case). An open bot would let anyone who finds it command the device, camera snapshots included.
+
+Japanese uses `stt_language: "ja"`. Setup offers Japanese (日本語), Japanese voice enrollment phrases and six curated ElevenLabs voices; the default is Shizuka. See [Japanese voice catalog](realtime-voice.md#japanese-language-and-elevenlabs-voices).
+
 **Response:** Returns immediately `{"status": 1}`. Setup runs async in a goroutine after 2s delay.
 
-**Messaging channel:** The entire Telegram, Slack, or Discord configuration is optional during initial setup. Omitting it does not block setup; configure a channel later with `POST /api/device/channel`. Credentials supplied to `POST /api/device/setup` keep the existing setup path but are not channel-validated there; `POST /api/device/channel` validates the credentials required by its selected channel.
+**Messaging channel:** The entire Telegram, Slack, Discord, or iMessage configuration is optional during initial setup. Omitting it does not block setup; configure a channel later with `POST /api/device/channel`. Credentials supplied to `POST /api/device/setup` keep the existing setup path but are not channel-validated there; `POST /api/device/channel` validates the credentials required by its selected channel.
 
 **Admin password default:** `admin_password` is optional. When empty on a first-time setup (`SetUpCompleted=false` and no `AdminPasswordHash` on file), the handler defaults it to the 4-char hardware suffix from `device.GetDeviceMac()` — the same suffix `scripts/provision/setup-ap.sh` uses for the AP SSID (`<DEVICE_TYPE>-<xxxx>`). The suffix is printed on the sticker at the bottom of the device, so operators can sign into the admin UI without picking a password. The V2 Setup Web UI hides the DEVICE PASSWORD field entirely and relies on this default; V1's dedicated Device step still asks the operator to pick one. Fails 400 (`device hardware ID unreadable`) when `GetDeviceMac()` returns empty (no `DEVICE_TYPE` env, no serial, no eth MAC) — silent fallback would give every unidentified device the same well-known password.
 
 ### POST /api/device/channel
 
-Change messaging channel after setup is complete. Accepts `telegram`, `slack`, `discord`.
+Change messaging channel after setup is complete. Accepts `telegram`, `slack`, `discord`, `imessage`. A channel the active runtime cannot run is rejected with `400 <channel> not supported on the active runtime` (today `imessage` is Hermes-only).
 
 **WhatsApp is rejected here** (`400 whatsapp pairing not supported via HTTP; use MQTT add_channel`) — WhatsApp pairing streams a rotating QR back to the caller, which HTTP's fire-and-forget shape can't carry. The canonical path is the MQTT `add_channel` command (see `docs/mqtt.md`) which publishes one fd_channel message per pairing event. Re-pairing without re-bootstrapping uses the MQTT `whatsapp_pair` command.
 
@@ -83,8 +100,11 @@ an SSID. Everything after the network phase (LLM config, channel, agent setup,
 1. Call `connect-wifi` CLI tool with SSID + password
 2. Poll checks:
    - SSID match? (`iwgetid`)
-   - Internet OK? (`ping`)
-3. Timeout 60s → fail
+   - Internet OK? (`ping 8.8.8.8`, else a TLS handshake with the device's cloud
+     API host — `system/network/reachability.go`)
+3. Timeout 60s of wall-clock time → fail. (It used to count 60 attempts, and
+   each failed ping waits 5s, so a network that drops ICMP kept the device
+   trying for ~6 minutes after the web client gave up at 80s.)
 4. Success → save SSID + password to config
 
 `connect-wifi` ends by running `device-sta-mode`, which is what tears the AP down.
@@ -189,7 +209,7 @@ saved SSID (fresh, or previously set up wired) reach the wired path that way.
   avahi advertises on every interface, the setup page is reachable from the wired LAN at
   `http://<device_type>-<suffix>.local/` as well as at the AP's `192.168.100.1`.
   That wired address is also what makes the ethernet-only setup below possible.
-- **LED indicator:** once HTTP server is listening, if `SetUpCompleted == false` the OS server spawns a background goroutine (`waitAndPaintSetupReady` in `server/server.go`) that polls HAL `GET /health` once per second up to 30s. As soon as `health.led == true`, it sends `POST /led/status` with state `setup`; HAL resolves that state to a solid white strip. The poll exists because os-server typically binds :5000 before HAL's FastAPI is up on :5001 (Python loads `rpi_ws281x`, SPI, audio, camera) — a fire-and-forget paint would silently drop on `connection refused`. This white is a **temporary AP/pre-setup cue**, not a user preference: after a successful `POST /api/device/setup`, its saved LED state is cleared and the strip settles on the ambient resting look (currently dark/off). The booting blue-breathing still shows during init.
+- **LED indicator:** once HTTP server is listening, if `SetUpCompleted == false` the OS server spawns a background goroutine (`waitAndPaintSetupReady` in `system/server/config_watch.go`) for devices with a light capability. It calls HAL `POST /led/status` with state `setup` immediately, then retries after 1, 2, 4, 8 and at most 10 seconds between attempts, without a 30-second cutoff. The LED endpoint is available before full HAL health; HAL resolves state `setup` to a solid white strip. HTTP errors or missing `status: "ok"` acknowledgements are retried. The worker exits after acknowledgement, when setup completion is observed, or on server shutdown (which also cancels in-flight HTTP requests). Setup completion is checked before each LED request and after failed requests. The poll exists because os-server typically binds :5000 before HAL's FastAPI is up on :5001 (Python and the LED driver still need to initialize) — a fire-and-forget paint would silently drop on `connection refused`. This white is a **temporary AP/pre-setup cue**, not a user preference: after a successful `POST /api/device/setup`, HAL clears its saved `source: "status:setup"` LED cue on the existing `/led/off` call and restores the owner’s resting-light choice (or the device preset), instead of saving an explicit user OFF. The booting blue-breathing still shows during init.
 - **AP-mode LED suppression:** the openclaw WS reconnect loop (`runtimes/openclaw/service_ws.go`) skips `StateAgentDown` Set/Clear while `config.SetUpCompleted == false`, so the cyan disconnect overlay doesn't fight the setup-needed white during provisioning. WS still runs (`device.Setup` needs it ready to satisfy `WaitForAgentReady` before flipping `SetUpCompleted=true`), only the LED side-effect is gated.
 - **Wi-Fi association LED cue (`StateWifiConnecting`):** the moment the setup handler enters `device.Setup()`, it activates `statusled.StateWifiConnecting` (HAL preset `wifi_connecting` = blue `[0,135,255]` blink at speed 0.5) so the ring visibly switches from the setup-white to a blue blink while `wlan0` associates. A `defer` in `Setup()` clears it on every return path, so a failure that falls through to `SwitchToAPMode()` doesn't leave the strip blinking. Priority sits above `Booting` and below `OTA`/`Error`/`Connectivity` — the cue outranks residual boot state but never masks a real fault. Devices without the `light` capability short-circuit inside statusled (no-op).
 
@@ -509,14 +529,30 @@ Both still emit `setup_failed` on the bridge. The screen is hidden from the
 directly, since the effect that normally sends it is gated on `setupWorking`,
 which that path deliberately never raises.
 
-**Not covered.** The device's own reason is still coarse: `SetupNetwork` only
-polls `CheckInternet()` + SSID match, so a wrong password, a 5GHz-only network,
-and a router rejecting the client all surface as
-`"no internet or SSID did not match within 60s"` after a full 60s.
-`wpa_supplicant` knows the difference immediately (`4WAY_HANDSHAKE_FAILED`,
-`WRONG_KEY`); reading `wpa_cli status` in the poll loop would fail in ~5s with
-an exact cause — while the AP is still alive, so the phase poll would deliver it
-and the timeout above would become a rare fallback rather than the primary path.
+**Setup failure reasons.** Every failed setup is logged with a stable
+`setup_failure_reason` field — on `network setup failed` (component `network`)
+for the WiFi join, and on `setup failed` (component `device`) for every stage —
+so failed setups can be grouped by cause in Graylog
+(`_exists_:setup_failure_reason AND spooled:true` finds the ones replayed after the
+device came online). The WiFi join is classified from `wpa_supplicant`'s own log
+for the attempt plus the last observed state (`system/network/setup_failure.go`):
+
+| `setup_failure_reason` | Evidence | Setup-screen message |
+|---|---|---|
+| `wrong_password` | `4-Way Handshake failed` / `CTRL-EVENT-SSID-TEMP-DISABLED … reason=WRONG_KEY` | wrong WiFi password: the router rejected the key |
+| `association_rejected` | `CTRL-EVENT-ASSOC-REJECT`, `reason=AUTH_FAILED`/`CONN_FAILED` | the router refused the connection |
+| `ssid_not_found` | `CTRL-EVENT-NETWORK-NOT-FOUND`, or no association attempt at all | WiFi network not found: out of range or on a channel the device cannot use |
+| `no_dhcp` | `wpa_state=COMPLETED` but no address from the router | connected to WiFi but the router gave no IP address |
+| `no_internet` | address on the requested SSID, but neither ICMP nor the cloud TLS probe gets out | connected to WiFi but there is no internet (captive portal or firewall?) |
+| `ssid_too_long` / `wifi_connect_error` | SSID over 32 bytes / the `connect-wifi` helper failed | as before |
+| `agent_setup_failed` / `agent_timeout` | the agent runtime could not be set up / never became ready (after the WiFi join) | as before |
+| `unknown` | none of the above could be established | no internet or SSID did not match within 60s |
+
+A rejected key fails fast: once `wpa_supplicant` has rejected it twice the loop
+stops instead of waiting out the 60s window. The `network setup failed` line
+also carries `wpa_state`, `has_ip`, `ssid_matched`, `wrong_key_failures` and
+`elapsed_s`. 5 GHz networks are not a failure cause on Intern 2 hardware — the
+wrong-password capture above was on a 5745 MHz network.
 
 ### Marking the Wi-Fi step done after the reload
 
@@ -633,7 +669,24 @@ The continue-mode auto-scroll — which otherwise jumps the operator to the firs
 
 ## Post-Setup
 
-After `SetUpCompleted = true`:
+Onboarding saves `SetUpCompleted = true` when configuration is complete, which
+triggers the existing startup worker. The onboarding request then waits up to
+**5 minutes** for that worker to finish its HAL restart (when the configuration
+changed), HAL health check, and configured voice start. The public
+`/api/device/setup/status` reports `runtime_phase: "preparing"` and
+`set_up_completed: false` during this interval. Network `phase: "connected"`
+still means Wi-Fi is connected, not that voice is ready.
+
+The setup web page shows “Preparing your robot’s voice…” and preserves this
+screen across the AP-to-LAN redirect or reload. It allows the completed wizard
+only after `runtime_phase: "ready"`; a runtime failure reports
+`runtime_phase: "failed"` with an error and a return-to-setup action. A runtime
+failure retains the working LAN connection instead of switching back to the
+hotspot. Backend pings remain `setting_up` until readiness; only then does setup
+clear its temporary LED cue and report completion. Normal startup, OTA, and
+configuration-change restarts outside onboarding retain their existing behavior.
+
+The startup worker triggered by the saved flag performs:
 1. Connect OpenClaw WebSocket
 2. Connect MQTT (subscribe fa_channel)
 3. Start voice pipeline (if Deepgram key present)
@@ -642,21 +695,19 @@ After `SetUpCompleted = true`:
 
 ## Config
 
-Config stored at `config/config.json`. Managed by `server/config/config.go`.
+Config stored at `config/config.json`. Managed by `system/server/config/config.go`.
 
 | Field | Description |
 |-------|-------------|
-| `SetUpCompleted` | `true` when setup is done |
+| `SetUpCompleted` | Persisted configuration-complete flag; public onboarding completion also waits for runtime readiness |
 | `NetworkSSID` | WiFi SSID |
 | `NetworkPassword` | WiFi password |
-| `LLMProvider` | anthropic, openai, google, ... |
-| `LLMApiKey` | LLM API key |
-| `LLMBaseUrl` | LLM API base URL |
+| `LLMAPIKey` | LLM API key |
+| `LLMBaseURL` | LLM API base URL |
 | `LLMModel` | Model name |
-| `ChannelType` | telegram, slack |
-| `ChannelToken` | Channel bot token |
-| `ChannelID` | Channel/chat ID |
-| `DeepgramApiKey` | Deepgram STT API key |
+| `Channel` | telegram (default when empty), slack, discord, whatsapp, imessage |
+| `TelegramBotToken` / `TelegramUserID` | Telegram credentials (Slack/Discord/WhatsApp/BlueBubbles have their own `Slack*`, `Discord*`, `WhatsappUserID`, `Bluebubbles*` fields) |
+| `DeepgramAPIKey` | Deepgram STT API key |
 | `LocalIntent` | Enable/disable local intent matching (default: true) |
 | `MQTTEndpoint` | MQTT broker host |
 | `MQTTPort` | MQTT broker port |
@@ -731,3 +782,38 @@ full listener example lives in the file header of `lib/setupBridge.ts`.
 | `system/server/config/config.go` | Config load/save |
 | `scripts/imager/build-orangepi.sh`, `scripts/imager/build.sh`, `scripts/provision/setup.sh` | nginx config baked into the image (incl. `connect-src` CSP) |
 | `scripts/maintenance/patch-security.sh` | OTA security patch for already-provisioned devices (migrates CSP) |
+
+### iMessage setup credentials
+
+Setup and Wi-Fi provisioning accept the BlueBubbles server URL, password, and operator address for `channel=imessage`. These credentials must be persisted before runtime setup; Wi-Fi provisioning forwards the saved credentials into `SetupAgent`. Hermes consumes the saved config through presync.
+
+## Setup logs reach Graylog even when setup fails
+
+A first setup runs with no device key and, until WiFi joins, no internet, so a
+failed setup used to ship **nothing**: os-server and HAL armed the log relay
+only at process start, bootstrap never armed it, and a record that could not be
+sent was dropped. Now:
+
+- **Spool from boot.** os-server, bootstrap and HAL write records that cannot
+  ship yet — no key, no internet, relay or collector error — to a bounded
+  on-disk spool in `OS_GELF_SPOOL_DIR` (default `/var/lib/autonomous/gelf-spool` — on the
+  SD card, not `/var/log`, which devices keep in RAM (zram) — so a power cycle
+  keeps it): `<service>.jsonl` + `<service>.1.jsonl`, at most
+  1 MiB per service, oldest records dropped first.
+- **Armed as soon as a key exists.** os-server re-arms the relay from its
+  config-change listener (the moment setup saves the key, and again when a
+  re-setup replaces it); bootstrap and HAL re-read `config.json` every
+  minute / 30s. Only the device's Autonomous credential is used, never an
+  owner's own provider.
+- **Replayed in order.** Once a send succeeds the spool drains before live
+  records, paced (~10 records/s — the cloud relay drops silently past its
+  in-flight ceiling), each tagged `_spooled: "true"` and moved from the
+  pre-config host onto the device id, so a failed first attempt shows up under
+  the device next to the attempt that worked.
+- **Never another device's records.** Replay ships only records logged before
+  the device id was known or under the current device id; records under any
+  other id (a previous setup or a previous owner) are dropped, never sent with
+  the current key. Factory reset also wipes `OS_GELF_SPOOL_DIR`.
+
+A device that never gets online again cannot deliver its spool; it stays on the
+device until it does.

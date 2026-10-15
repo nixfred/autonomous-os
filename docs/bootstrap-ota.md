@@ -1,5 +1,46 @@
 # Bootstrap & OTA System
 
+## Update progress snapshots
+
+`software-update` atomically writes `/root/bootstrap/progress/<component>.json` for each accepted install (not manual rollback/recovery commands). The latest run survives frontend refresh and service restarts. Fields are `target`, `run_id`, `phase`, `pid`, `boot_id`, `updated_at` (Unix seconds), `downloaded_bytes`, `total_bytes`, and a short `message`. Writes are best effort and never change installer or rollback success.
+
+Phases are preparing, downloading, verifying, installing, restarting, checking, completed, failed, and rolling_back. `completed` is emitted only when the existing updater exits successfully after its component-specific validation; runtime installers do not all perform a gateway health probe. A pending rollback journal always makes the attempted update fail, even if recovery succeeds. A snapshot older than 30 seconds whose updater PID is gone (or boot ID changed) is exposed as `interrupted`, not success.
+
+Downloads through `download_verified` sample bytes written once per second and use Content-Length from the final HTTP 200 response. Redirect sizes, missing length, chunked transfers and inconsistent totals never produce a percentage. Checksum verification precedes installation. Package-manager/upstream installer steps expose phase only, without invented overall percentages. Progress tracking does not include manual rollback/recovery runs or downloads inside third-party installers.
+
+HAL installation additionally reports extraction, activation, and recognized `uv` activity: package download/build/install names and resolved/prepared/installed/audited counts. Optional `activity_at` is the Unix timestamp of the latest recognized activity (zero or absent otherwise). Only recognized names/counts reach the UI; raw output stays in installer logs. Activity writes are throttled to once per second plus the final observation. Unknown output falls back to the installation stage, and tracking preserves the `uv` exit code. Dependency activity is not a byte-based or overall installation percentage.
+
+`GET /api/system/ota-updating` retains `data.updating` and adds `data.progress` (component map, including the selected `agent` alias) and `data.bootstrap_available`. OS Server reads local snapshots even when bootstrap is unreachable; OS Server itself restarting still temporarily interrupts the API. The updater, OS Server and frontend must all be updated to expose the detailed view. Older workers remain supported via the updating list.
+
+
+Lamp device rootfs updates include an Orange Pi-only post-HAL LED blackout
+service (5-second delay). Device OTA reloads systemd after applying the overlay
+and after restoring a rollback, before restarting services; setup also reloads
+after applying a hardware override. Image builders already copy this rootfs.
+No HAL-only OTA installs this fallback. See the
+[LED shutdown lifecycle](../robots/lamp/docs/led-control.md#orange-pi-shutdown-fallback)
+for activation, limits and rollback.
+
+OrangePi images defer the vendor MOTD update-count job (`orangepi-apt-updates`) by 120 seconds after boot to avoid competing with HAL for storage reads. Only its exact `@reboot root /usr/lib/orangepi/orangepi-apt-updates` cron entry changes; the daily count and APT/security update schedules remain unchanged. Existing devices can apply the same tuning with `sudo python3 scripts/imager/lib/defer_orangepi_update_count.py` after copying the script onto the device. The helper is idempotent, skips missing/customized entries, and keeps the original at `/var/backups/autonomous/orangepi-updates.before-boot-delay`. Restore that file to `/etc/cron.d/orangepi-updates` to undo the tuning. This is an image/device configuration change, not part of a HAL-only OTA.
+
+OrangePi image builds use `golden-opi.img.building`, reject a source larger than
+`OUT_IMG_SIZE`, and run writable `e2fsck -fp` before resizing (only exit 0/1 is
+accepted). After final unmount, read-only `e2fsck -fn` must exit 0. Both loop
+devices are detached before the raw image is atomically
+published; compression also uses a staging file before rename. Failed builds can
+leave an older completed artifact, and `COMPRESS=0` does not refresh an existing
+compressed image. Select the intended build when flashing.
+
+For raw flashing, `make sd-card-flash-raw DEVICE_TYPE=lamp DISK=17 VERIFY=0` skips readback verification and its Python requirement; sync and eject still run. Verification remains enabled by default.
+
+Both Makefile flash targets require Python 3 and use
+`scripts/imager/lib/verify_flash.py` to compare every image byte against SD readback
+before success/ejection. Compressed flashing uses Bash `pipefail` so decompression
+errors fail the target; mismatches or truncated reads also fail. Ext4 checks assess
+filesystem structure, while readback checks the written bytes; neither guarantees
+boot success or establishes the source of filesystem corruption. See the
+[imager workflow](../scripts/imager/README.md#flashing-an-sd-card).
+
 ## 1. Overview
 
 The device runs **5 software components** on a supported board (Raspberry Pi 4, Pi 5, or OrangePi). All components are installed via an initial setup script and kept up-to-date by a background OTA worker.
@@ -90,23 +131,23 @@ never taken from the feed. Its decoded payload has this shape:
   "os-server": {
     "version": "1.2.3",
     "min_version": "1.2.0",
-    "url": "https://storage.googleapis.com/{BUCKET}/{PREFIX}/ota/os-server/1.2.3/os-server-1.2.3.zip",
+    "url": "https://storage.googleapis.com/{BUCKET}/{PREFIX}/ota/os-server/1.2.3.zip",
     "sha256": "<64 lowercase hex characters>"
   },
   "bootstrap": {
     "version": "1.0.5",
-    "url": "https://storage.googleapis.com/{BUCKET}/{PREFIX}/ota/bootstrap/1.0.5/bootstrap-1.0.5.zip"
+    "url": "https://storage.googleapis.com/{BUCKET}/{PREFIX}/ota/bootstrap/1.0.5.zip"
   },
   "web": {
     "version": "0.9.0",
-    "url": "https://storage.googleapis.com/{BUCKET}/{PREFIX}/ota/web/0.9.0/setup-0.9.0.zip"
+    "url": "https://storage.googleapis.com/{BUCKET}/{PREFIX}/ota/web/0.9.0.zip"
   },
   "openclaw": {
     "version": "2026.6.10"
   },
   "hal": {
     "version": "1.0.0",
-    "url": "https://storage.googleapis.com/{BUCKET}/{PREFIX}/ota/hal/1.0.0/hal-1.0.0.zip"
+    "url": "https://storage.googleapis.com/{BUCKET}/{PREFIX}/ota/hal/1.0.0.zip"
   }
 }
 ```
@@ -129,7 +170,7 @@ Override the path or ID when needed:
 make ota-keygen OTA_SIGNING_KEY_DIR=/secure/ota-keys OTA_SIGNING_KEY_ID=prod-2026-08
 ```
 
-**Domain types** — `domain/ota.go`:
+**Domain types** — `system/domain/ota.go`:
 
 ```go
 const (
@@ -154,6 +195,7 @@ type OTAMetadata map[string]OTAComponent
 type OTAComponent struct {
     Version    string `json:"version"`
     MinVersion string `json:"min_version,omitempty"`
+    MinVersionByDevice map[string]string `json:"min_version_by_device,omitempty"`
     URL        string `json:"url,omitempty"`
     SHA256     string `json:"sha256,omitempty"`
 }
@@ -170,6 +212,13 @@ automatic worker rolls the fleet up to. They decouple "published" from
   `version` (so the worker simply tracks the latest — legacy behavior).
 - **Manual `software-update <key>`** (run over SSH) ignores `min_version` and
   always installs `version` — for testing a build on a few devices first.
+- **Per-device floor:** `min_version_by_device` (e.g. `{"lamp": "0.1.285"}`)
+  overrides `min_version` for the listed `device_type`; unlisted types fall back
+  to `min_version`. Used when one device type must stay on an old floor (e.g.
+  `intern-v2` holding HAL back) while others roll forward. Bootstraps older than
+  this field ignore it and keep reading `min_version`, so leave `min_version` at
+  the held-back floor and promote the new bootstrap before relying on the map.
+  Set it with `make promote-hal FOR=lamp [V=<version>]` (works for any `promote-*`).
 
 Workflow:
 
@@ -212,57 +261,38 @@ curl -fsSL https://cdn.autonomous.ai/os/install.sh | sudo bash
 | 3 | Setup nginx | Download web bundle, configure reverse proxy + captive portal |
 | 4 | Setup WiFi AP | Configure hostapd, dnsmasq, start AP mode for provisioning |
 
-### Stage 2b: Install HAL Runtime (NEW)
+### Stage 2b: Install HAL Runtime (`stage_hal`)
 
 This stage installs the HAL Python runtime that provides hardware drivers for servos, LEDs, and audio.
 
 ```bash
-stage_install_hal() {
-    echo "=== Stage 2b: Install HAL Runtime ==="
+stage_hal() {
+    HAL_DIR="/opt/hal"
+    mkdir -p "$HAL_DIR"
 
-    # 1. Install Python dependencies
-    apt-get install -y python3 python3-pip python3-venv
+    # 1. Download the zip named by metadata .hal.url (checked against .hal.sha256)
+    curl -fsSL -o /tmp/hal.zip "$HAL_URL"
+    unzip -o -q /tmp/hal.zip -d "$HAL_DIR"
 
-    # 2. Create install directory
-    mkdir -p /opt/hal
+    # 2. Audio libs, PulseAudio AEC + anonymous socket, udev rule keeping PulseAudio off the speaker codec
 
-    # 3. Download from OTA metadata
-    HAL_URL=$(echo "$OTA_JSON" | jq -r '.hal.url')
-    HAL_VERSION=$(echo "$OTA_JSON" | jq -r '.hal.version')
+    # 3. Recreate the venv with uv (downloads a standalone Python 3.12)
+    rm -rf "$HAL_DIR/.venv"
+    cd "$HAL_DIR" && uv sync --python 3.12 --extra hardware --extra aec --extra pipecat
 
-    curl -fsSL "$HAL_URL" -o /tmp/hal.zip
-    unzip -o /tmp/hal.zip -d /opt/hal/
-    rm /tmp/hal.zip
+    # 4. Seed $HAL_DIR/.env (HAL_MODE=production, DEVICE_TYPE, DEVICES_DIR) if absent
 
-    # 4. Install Python dependencies in venv
-    python3 -m venv /opt/hal/venv
-    /opt/hal/venv/bin/pip install -r /opt/hal/requirements.txt
-
-    # 5. Create systemd service
-    cat > /etc/systemd/system/hal.service << 'UNIT'
-[Unit]
-Description=HAL Python Runtime — Hardware Drivers
-After=network.target
-
+    # 5. systemd unit
+    cat >/etc/systemd/system/hal.service <<EOF
 [Service]
-Type=simple
-User=root
-WorkingDirectory=/opt/hal
-ExecStart=/opt/hal/venv/bin/python -m hal.server
+WorkingDirectory=$HAL_DIR
+EnvironmentFile=$HAL_DIR/.env
+Environment="PYTHONPATH=/opt"
+ExecStart=$HAL_DIR/.venv/bin/uvicorn hal.server:app --host 127.0.0.1 --port 5001 --timeout-graceful-shutdown 5
 Restart=always
-RestartSec=5
-StandardOutput=journal
-StandardError=journal
-
-[Install]
-WantedBy=multi-user.target
-UNIT
-
-    systemctl daemon-reload
-    systemctl enable hal.service
-    systemctl start hal.service
-
-    echo "HAL $HAL_VERSION installed at /opt/hal/"
+...
+EOF
+    systemctl daemon-reload && systemctl enable hal && systemctl restart hal
 }
 ```
 
@@ -325,7 +355,11 @@ to restore it. The updater records the version it removed in
 `rollback_versions`; bootstrap then skips only that exact target, so the failed
 release is not reinstalled on the next poll. Publishing a different version
 automatically resumes OTA for that component. Rollback itself does not need the
-metadata URL or network access.
+metadata URL or network access. Bootstrap rereads `rollback_versions` before
+reconciling each component, so manual HAL/web/device rollback takes effect without
+a bootstrap restart. Unreadable or malformed rules stop that reconciliation.
+If HAL or os-server reconciliation fails, the automatic cycle skips the device
+profile to avoid applying declarations that require the failed core update.
 
 Before `os-server`, `web`, or `device` updates, the updater ensures the nginx
 Harness WebSocket route exists. It searches both `/etc/nginx/conf.d/*.conf` and
@@ -335,23 +369,32 @@ The route reuses the existing `/api/` HTTP upstream (`backend` or
 Symlinked sites are updated at their real target, preserving the enabled link.
 The updater validates with `nginx -t` and reloads nginx only after adding a route.
 
+For a manual repair of older images that already have `/api/buddy/ws`, run
+`scripts/maintenance/patch-nginx-harness-ws.sh` as root on the device. It resolves
+symlinked sites before editing, saves a separate copy of the original file under
+`/var/backups/nginx-harness-ws/`, and restores that file if `nginx -t` fails,
+preserving the enabled symlink. An existing Harness route is left unchanged.
+
 Directory installs have the same recovery contract. Before a web update, the
 updater stops nginx, swaps the fully unpacked staged bundle into place, and
 retains the previous bundle at `/root/bootstrap/rollback/web.previous` together
 with nginx's prior active/inactive state. It then requires `index.html`, a valid
-`nginx -t`, and—when nginx had been running—a successful loopback `GET /`.
+`nginx -t`, and—when nginx was active or is enabled—an active service before
+and after a successful loopback `GET /`. A required service that stopped or
+failed is an update failure, not a reason to skip health checks.
 Failure automatically restores the saved bundle and service state. An operator
 can also run `software-update rollback web`; the rejected version is recorded in
 `rollback_versions` just like a binary rollback.
 
-For a device profile, the updater stages the ZIP, stops only the `os-server` and
-`hal` services that were active, and retains the old profile at
+For a device profile, the updater stages the ZIP, stops `os-server` and
+`hal`, and retains the old profile at
 `/root/bootstrap/rollback/device.previous`. It also snapshots the exact files
 covered by the old or new `rootfs/` overlay in `device.previous.rootfs`; rollback
 therefore restores overwritten files and removes files introduced only by the
 rejected profile. Successful OTA replaces the generated `/opt/hal/.env`. The profile
-must contain `ROBOT.md`; each service that was active must recover and answer
-its loopback health endpoint. A failed check restores the known-good profile and
+must contain `ROBOT.md`; each service that was active or is enabled must be active
+before and after its loopback health probe. Failure of either HAL or os-server
+fails the profile update. A failed check restores the previous profile and
 its prior service state automatically. Use `software-update rollback device` for
 an operator rollback; the rejected device-profile version is then blocked.
 
@@ -374,6 +417,13 @@ top-level device JSON files in full, without merging their contents. The
 renderer validates these inputs before writing changes and rejects invalid
 capabilities or replacement files. Product-specific values live only in the
 device package. For example:
+
+Standard Lamp C-Media speaker gain is pinned to mixer step **9 (-28 dB)**,
+3 dB above the previous step 6. The `pro` rootfs override retains **6 (-31 dB)**;
+ReSpeaker profiles keep their own audio paths. The existing softvol slider
+(-30..0 dB) and saved user volume are unchanged. This is shipped in the device
+rootfs package; the pin is applied when `lamp-cmedia-speaker.service` next runs
+(e.g. reboot), not by a HAL-only update.
 
 | Profile | Voice microphone | Sensing microphone | Speaker | Startup / maximum volume | SEN63C |
 |---|---|---|---|---|---|
@@ -538,6 +588,15 @@ set up yet), `Serve()` does not start the poll loop or healthcheck server. It lo
 `/root/config/bootstrap.json` every 30s until a URL appears, then proceeds.
 Nothing is silent.
 
+**Log shipping**: bootstrap logs through the shared logger as
+`_service_name: "bootstrap"` (it used to be filed as `os-server`). It has no
+config-change signal, so `RunLogRelay` (`system/bootstrap/log_relay.go`) re-reads
+`/root/config/config.json` every minute and arms the relay with the device's
+Autonomous key (same rule as os-server). Until a key exists — a fresh device, or
+an OTA that runs during setup — its records wait in the spool
+(`/var/lib/autonomous/gelf-spool/bootstrap.jsonl`) and are replayed once it ships. See
+[setup-flow.md](setup-flow.md#setup-logs-reach-graylog-even-when-setup-fails).
+
 ### State (`/root/bootstrap/state.json`)
 
 Tracks last known installed version per component:
@@ -560,7 +619,7 @@ directory before renaming it into place. If an older state file is malformed
 `state.json.corrupt-<timestamp>`, logs a warning, and resumes with empty state
 instead of failing to start OTA polling.
 
-### Core Loop (`bootstrap/bootstrap.go`)
+### Core Loop (`system/bootstrap/bootstrap.go`)
 
 ```
 checkLoop():
@@ -570,15 +629,17 @@ checkLoop():
 
 checkOnce():
   1. Fetch OTA metadata JSON
-  2. For each key [os-server, bootstrap, web, hal]:
+  2. For each key [os-server, bootstrap, web, hal, buddy, openclaw, codex,
+     claudecode, opencode, picoclaw, hermes]:
      → reconcile(key, metadata[key])
-  NOTE: OpenClaw OTA is temporarily disabled (reconcileOpenClawFromNpm commented out)
-  3. Save state
+     (hermes only when its entry carries `commit` — hermesPinned)
+  3. reconcileDevice() for the nested devices.<device_type> entry
+  4. Save state (only when something changed)
 
 reconcile(key, target):
   1. Detect current installed version
   2. If current == "" AND the component is not installed → skip silently
-  3. floor = target.min_version (default target.version if empty)
+  3. floor = target.min_version_by_device[device_type], else target.min_version, else target.version
   4. If current >= floor → sync state, return (at/above approved floor)
   5. If current < floor →
      a. Set LED orange breathing (OTA in progress)
@@ -669,8 +730,12 @@ Two different acts, and mixing them up is what made the web button look broken:
 
 The web Versions card's `update` button is `force-update` (via
 `POST /api/system/software-update/:target`). Both are limited to the same target
-allowlist, including `bootstrap` and `device`; a Bootstrap update detaches its installer so
-the replacement worker can restart safely. `componentInstalled` still refuses a
+allowlist — `os-server`, `bootstrap`, `web`, `hal`, `device`, `openclaw`, `codex`,
+`claudecode`, `opencode`, `picoclaw`, `hermes` — kept in two places that must match:
+os-server's `ota.allowedTargets` and bootstrap's `forceTargetAllowed`. The `agent`
+alias resolves to the configured runtime first, so on an OpenClaw device the Agent
+row's button arrives as `openclaw`. A Bootstrap update detaches its installer so the
+replacement worker can restart safely. `componentInstalled` still refuses a
 component this device does not have.
 
 ### `GET /versions` (bootstrap, loopback)
@@ -695,7 +760,7 @@ the MQTT `data` kind `system.ota_versions` (both via `system/ota`; the cloud's
 | `web` | Read file `/usr/share/nginx/html/setup/VERSION` |
 | `device` | Read `/opt/devices/<device_type>/VERSION` |
 | `openclaw` | Run `openclaw --version`, extract semver with regex |
-| `hal` | Run `/opt/hal/venv/bin/python -m hal --version` OR read `/opt/hal/VERSION` file |
+| `hal` | Read file `/opt/hal/VERSION_HAL` |
 | `codex` / `claudecode` / `opencode` | Run `<cli> --version`, extract semver from line one (`cliSemver`) |
 | `picoclaw` | Read `/usr/local/lib/os-runtimes/picoclaw/installed-version` — its `version` output carries no semver |
 | `hermes` | Run `hermes --version` ("Hermes Agent v0.21.1 (2026.9.7)"), extract semver from line one (`cliSemver`) |
@@ -708,7 +773,7 @@ the MQTT `data` kind `system.ota_versions` (both via `system/ota`; the cloud's
 | `bootstrap` | Spawn detached `software-update bootstrap` (self-update, survives restart) |
 | `web` | Run `software-update web` |
 | `device` | Run `software-update device` for `devices.<device_type>`; apply any explicitly selected hardware override, then install rootfs including generated HAL `.env` |
-| `openclaw` | ~~Run `npm install -g openclaw@{version}` → `systemctl restart openclaw`~~ (temporarily disabled) |
+| `openclaw` | Run `software-update openclaw` (npm install of the metadata version → restart `openclaw`); only where the `openclaw` binary is on PATH |
 | `hal` | Run `software-update hal` → `systemctl restart hal` |
 | `codex` / `claudecode` / `opencode` / `picoclaw` | Run `software-update <key>` — only on the device whose `agent_runtime` IS that runtime |
 | `hermes` | Run `software-update hermes` — only when `agent_runtime` is hermes, the metadata entry carries `commit`, AND the on-device updater is the pinning one (`updaterSupportsHermesPin`: it reads `.hermes.commit`). An unpinned entry (no `commit`) is skipped by both the loop and `/versions`, so the web button never appears for it — `hermes update` would land on upstream HEAD and the floor could never be met. |
@@ -724,11 +789,11 @@ the OpenClaw install and restart. Node is a shared system dependency; a
 successful Node upgrade is not rolled back if the later OpenClaw install fails.
 This prerequisite handling does not change the automatic-update gate above.
 
-OrangePi image defaults match OTA metadata checked on 2026-09-11: OpenClaw
-`2026.9.3` and Hermes `0.21.1`. The builder installs the latest NodeSource 26.x
+OrangePi images default to OpenClaw `2026.9.3` and Hermes `0.21.5` (matching
+the Hermes OTA release published on 2026-10-01). The builder installs the latest NodeSource 26.x
 package even on reused base images and requires at least Node `26.8.2` (the
 current upstream release at that check). Hermes's installer and checkout are
-pinned to release `v2026.9.7`, commit `2237be355906fbe6065ce1815711eee52b2d646e`,
+pinned to release `v2026.9.24`, commit `f97608f178d1ffeca59860195ab7da295f7c8e5f`,
 and a different reported CLI version fails the build. These are image-build
 defaults; presync and subsequent `software-update` behavior are unchanged.
 
@@ -833,9 +898,46 @@ npm-installed per device rather than baked, and older provisioning may leave
 Bash script installed by setup.sh (and baked into the image by the imager).
 Called by bootstrap worker to apply updates.
 
-It reads the OTA metadata URL from `metadata_url` in `/root/config/bootstrap.json`
+For installation, it reads the OTA metadata URL from `metadata_url` in `/root/config/bootstrap.json`
 (an explicit `OTA_METADATA_URL` env var overrides it for manual/debug runs), and
 aborts with an error if neither is set — no compiled-in URL.
+
+### Interrupted updates and core binaries
+
+For HAL, web, device profiles, os-server and bootstrap, the updater writes and
+flushes `/root/bootstrap/rollback/pending-update.json` before publishing a
+replacement. The journal remains until the new installation passes its required
+health checks. A normal error or trapped signal restores the saved installation;
+failed recovery retains the journal for another attempt.
+
+Device profile updates keep a separate rootfs snapshot for the pending
+transaction. The snapshot for a later manual rollback is replaced only after
+the new profile passes health checks; recovery uses the journal's snapshot.
+
+`software-update recover` needs no OTA metadata or download. Every updater run
+recovers a pending transaction before starting another update. Bootstrap also
+runs recovery before metadata/version checks in automatic polls, component
+checks and force updates. It additionally detects the legacy case where
+`/opt/hal` is missing but `hal.previous` survives without a journal. This prevents
+the stored version from hiding a missing runtime. SIGKILL or power loss is
+recovered on the next updater invocation or running bootstrap poll; this does
+not guarantee recovery from arbitrary SD-card corruption or a machine that
+cannot boot far enough to run those services.
+
+If a first HAL installation had no prior runtime or backup, recovery removes the
+failed candidate from the live path and leaves HAL stopped. It does not claim to
+restore a nonexistent prior installation.
+
+Core binary updates stage the executable beside its destination, require a
+successful `--version` probe within 15 seconds, save the previous binary, and
+publish with an atomic rename. Restart alone is insufficient: os-server must
+answer `/api/health/live` on port 5000; bootstrap must answer `/health` on its
+configured `httpPort` (default 8080). Both checks require the service to remain
+active. Failure restores the saved binary and checks the restored service.
+
+Release these changes with **both** `make upload-setup` (the updater script) and
+`make upload-bootstrap` (Go recovery detection, refreshed rollback rules and
+core-failure gating). Uploading HAL alone does not distribute these changes.
 
 ### HAL Case
 
@@ -854,36 +956,21 @@ to retain the Pollen SDK; every other device uses `hardware + aec + pipecat`.
 > Measured on a lamp: **5-6 min → 41 s**, and `/opt/hal` shrank from ~4.8 GB to
 > 98 MB (the venv hardlinks into the shared cache).
 
-> **The publish window is crash-safe.** Between "move the live tree aside" and
-> "rename the staged tree into place" the component does not exist on disk. A
-> `trap` records that pending move and puts the tree back if the process exits
-> first — an interrupted SSH (HUP), a `systemctl restart bootstrap` killing the
-> cgroup (TERM), or any failure path. SIGKILL and power loss cannot be trapped;
-> those land on the reinstall path instead (a missing tree is installed fresh).
+HAL publication follows the journal contract above: preserve the complete
+previous runtime, create a fresh staging venv using the shared cache, preserve
+`.env`, rename the staged directory into `/opt/hal`, then restore the desired
+service state and check health. The journal is cleared only after success;
+staging, publication or health failures enter recovery. An operator can also
+run `software-update rollback hal`.
 
-```bash
-"hal")
-    # Preserve the complete runtime and prior service state.
-    systemctl stop hal
-    mv /opt/hal /root/bootstrap/rollback/hal.previous
-
-    # UV_BIN and HAL_EXTRA are resolved before stopping HAL.
-    # Build a fresh venv; preserve .env and use the external shared cache.
-    unzip -q "$ZIP" -d /opt/.hal.new
-    cp -a /root/bootstrap/rollback/hal.previous/.env /opt/.hal.new/
-    HAL_EXTRA_ARGS=(--extra "$HAL_EXTRA")
-    if [ "$HAL_EXTRA" != "reachy" ]; then
-        HAL_EXTRA_ARGS+=(--extra pipecat)
-    fi
-    (cd /opt/.hal.new && UV_CACHE_DIR=/opt/.uv-cache-hal "$UV_BIN" sync --python 3.12 --extra hardware "${HAL_EXTRA_ARGS[@]}")
-    mv /opt/.hal.new /opt/hal
-
-    systemctl restart hal
-    curl -fsS http://127.0.0.1:5001/health
-    # Any staging or health failure restores hal.previous and its old state.
-    # Operators can also run: software-update rollback hal
-    ;;
-```
+HAL runtime validation is required when HAL was active before the update or its
+service is enabled. An inactive/failed service then fails the update instead of
+skipping health checks. HAL must be active before and after a successful `/health`
+probe; failures trigger rollback. Only a previously inactive, disabled HAL skips
+the runtime probe. Rollback restores the previous installation, not a verified
+repair of corrupted dependency files or their shared cache.
+After recovery restarts HAL successfully, the updater disarms its exit cleanup
+so returning failure does not restart the recovered service a second time.
 
 ### Codex Case
 
@@ -961,21 +1048,30 @@ at a stable path, it does get a `.previous` backup: `software-update rollback
 opencode` works, unlike claudecode. Publish with `make upload-opencode
 <bare-semver>`, release with `make promote-opencode`.
 
-### Hermes Case (SSH-only — NOT pinnable, so never auto-applied)
+### Hermes Case (auto-applied only when the entry is commit-pinned)
 
 Hermes is a git install; `runtimes/hermes/install.sh` stamps
 `/usr/local/lib/hermes-agent/.install_method=git` precisely so the upstream
 updater recognizes it. That updater takes **no target version** — `hermes update`
-always moves to upstream HEAD. The published `hermes.version` therefore decides
-*when* the fleet updates (via `min_version`), not *which* build it gets.
+always moves to upstream HEAD — so the branch has the two modes described above:
+a **pinned** entry (`hermes.commit`) drives the upstream installer at that commit,
+an **unpinned** one falls back to `hermes update`. Bootstrap only auto-applies a
+pinned entry (`hermesPinned` + `updaterSupportsHermesPin` in
+`system/bootstrap/bootstrap.go`); an unpinned entry is skipped by the loop and
+`/versions`, and can only be applied by running `software-update hermes` over SSH.
 
 ```bash
 "hermes")
-    hermes update                       # no version arg exists upstream
-    hermes --version                    # abort if not runnable
-    # Landed version != metadata version → WARN, not fail: nothing on the
-    # device could have pinned it.
-    systemctl restart hermes-gateway    # unit is hermes-gateway.service, not hermes.service
+    HERMES_COMMIT=$(jq -r '.hermes.commit // empty' metadata)
+    if [ -n "$HERMES_COMMIT" ]; then
+        update_hermes_pinned "$HERMES_COMMIT"   # installer stages at the commit, --force-commit
+    else
+        hermes update                          # unpinned: upstream HEAD
+    fi
+    hermes --version                           # abort if not runnable
+    # Landed version != metadata version → pinned: FAIL (bad metadata pair);
+    # unpinned: WARN only.
+    systemctl restart hermes-gateway           # only if the unit exists; then os-server
     ;;
 ```
 
@@ -1034,10 +1130,10 @@ HAL runtime code is **copied** from the upstream open-source project into this m
 
 **Implementation steps:**
 1. Clone `humancomputerlab/lelamp_runtime` to a temp directory
-2. Copy driver code (`services/motors.py`, `services/rgb.py`, `services/audio.py`, `services/service_base.py`) into `hal/services/`
+2. Copy driver code (`services/motors.py`, `services/rgb.py`, `services/audio.py`, `services/service_base.py`) into `hal/drivers/` (now `hal/drivers/motors/`, `hal/drivers/rgb/`, `hal/drivers/voice/`, `hal/drivers/base.py`)
 3. Remove all LiveKit, OpenAI, and conversation code
 4. Add `hal/server.py` — new HTTP API server (FastAPI)
-5. Add `hal/services/display.py` — new DisplayService for GC9A01
+5. Add `hal/drivers/display/display_service.py` — new DisplayService for GC9A01
 6. Create `hal/UPSTREAM.md` with source commit hash and date
 7. Test on device with actual hardware
 
@@ -1046,55 +1142,61 @@ HAL runtime code is **copied** from the upstream open-source project into this m
 HAL lives inside this repo as a Python subfolder alongside Go and TypeScript:
 
 ```
-autonomous/
-├── system/          # Go code (forked from lobster)
-│   ├── cmd/              # Go entrypoints
+autonomous-os/
+├── system/               # Go os-server + bootstrap worker
+│   ├── cmd/              # Go entrypoints (os-server, bootstrap)
 │   ├── server/           # Go HTTP layer
-│   ├── internal/         # Go business logic
 │   ├── bootstrap/        # Go OTA worker
-│   └── domain/           # Shared structs
-├── system/web/      # TypeScript/React SPA (copied from lobster, renamed intern→lamp)
-├── hal/               # Python hardware drivers (NEW)
-│   ├── __init__.py       # Package init, exposes __version__
-│   ├── server.py         # HTTP API server (FastAPI) — NEW, not from upstream
-│   ├── system/
-│   │   ├── motors.py     # MotorsService — 5x Feetech servo (from upstream)
-│   │   ├── rgb.py        # RGBService — 64x WS2812 LED (from upstream)
-│   │   ├── audio.py      # Audio — amixer, playback (from upstream)
-│   │   ├── display.py    # DisplayService — GC9A01 LCD (NEW, not from upstream)
-│   │   └── service_base.py  # Event-driven ServiceBase (from upstream)
-│   ├── config.py         # Runtime config
-│   ├── requirements.txt  # Python dependencies
-│   ├── VERSION           # Plain text version string
+│   ├── domain/           # Shared structs
+│   └── web/              # TypeScript/React SPA
+├── runtimes/             # Swappable agent runtimes (openclaw, hermes, codex, …)
+├── hal/                  # Python hardware runtime
+│   ├── server.py         # FastAPI app (hal.server:app) — not from upstream
+│   ├── routes/           # FastAPI route modules (servo, led, camera, audio, display, …)
+│   ├── drivers/
+│   │   ├── base.py       # Event-driven ServiceBase (from upstream)
+│   │   ├── motors/       # MotorsService — Feetech servos (from upstream)
+│   │   ├── rgb/          # RGBService — WS2812 LEDs (from upstream)
+│   │   ├── voice/        # Audio, STT, TTS
+│   │   └── display/      # DisplayService — GC9A01 LCD (display_service.py, not from upstream)
+│   ├── config.py         # Runtime config (env vars)
+│   ├── pyproject.toml    # Python dependencies (uv; locked in uv.lock)
+│   ├── VERSION_HAL       # Plain text version string
 │   └── UPSTREAM.md       # Tracks source commit from humancomputerlab/lelamp_runtime
-├── resources/
-│   └── openclaw-skills/  # SKILL.md files
+├── skills/               # Agent SKILL.md files
 ├── scripts/
-│   └── setup.sh
+│   └── provision/setup.sh
 ├── go.mod
 ├── Makefile
 └── CLAUDE.md
 ```
 
-3 languages (Go, Python, TypeScript), 3 folders, 1 repo. Each has its own build, but managed together.
+3 languages (Go, Python, TypeScript), 1 repo. Each has its own build, but managed together.
 
 ### HAL OTA Package
 
-For OTA distribution, HAL is zipped from the `hal/` folder:
+For OTA distribution, `scripts/release/upload-hal.sh` zips the contents of `hal/` (excluding `.venv/`, `__pycache__/`, `.git/`, `*.pyc`, `.env`, `.python-version`, `test/`, `.coverage`, `drivers/voice/resources/ambernet.onnx`):
 
 ```
-hal-{version}.zip
-├── hal/                  # Full Python package
-├── requirements.txt
-└── VERSION
+hal-{version}.zip         # contents of hal/ at the zip root → unzipped into /opt/hal
+├── server.py, routes/, drivers/, …
+├── pyproject.toml, uv.lock
+└── VERSION_HAL
 ```
+
+The language-ID model (`ambernet.onnx`, ~117 MB) is not in the zip: OTA replaces
+`/opt/hal` on every update, so HAL downloads the release asset pinned in
+`drivers/voice/resources/ambernet.model.json` (URL + SHA-256) into
+`/opt/.models-hal`, which survives updates and is fetched once per model version
+(see `docs/realtime-voice.md`, "Language gate").
 
 ### HAL HTTP API (FastAPI on port 5001)
 
-The HAL Python runtime exposes its own HTTP API on `127.0.0.1:5001`. OS Server (Go, port 5000) bridges OpenClaw skill requests to this API. Nginx proxies `/hw/*` for same-machine callers only — external clients receive 403. Swagger UI at `/hw/docs` is not accessible from LAN.
+The HAL Python runtime exposes its own HTTP API on `127.0.0.1:5001`. Agent skills on the device call it directly on loopback; the web UI goes through OS Server's admin-gated `/api/hardware/*` reverse proxy (`system/server/proxy.go`). Nginx proxies `/hw/*` for same-machine callers only — external clients receive 403. Swagger UI at `/hw/docs` is not accessible from LAN.
 
 ```
-OpenClaw LLM → curl 127.0.0.1:5000/api/servo → OS Server → http://127.0.0.1:5001/servo → HAL Python → Hardware
+Agent skill → curl http://127.0.0.1:5001/servo/play → HAL Python → Hardware
+Web UI       → /api/hardware/servo/play → OS Server (admin auth) → http://127.0.0.1:5001/servo/play → HAL Python
 External     → http://<device-ip>/hw/docs    → nginx → 403 Forbidden
 ```
 
@@ -1122,46 +1224,15 @@ External     → http://<device-ip>/hw/docs    → nginx → 403 Forbidden
 
 ## 7. Upload / Publish Scripts
 
-### `scripts/release/upload-hal.sh` (NEW)
+### `scripts/release/upload-hal.sh`
 
-```bash
-#!/usr/bin/env bash
-# Upload HAL runtime to OTA
+Run via `make upload-hal`. It sources `ota-config.sh` / `ota-metadata.sh`, then:
 
-set -euo pipefail
-
-VERSION_FILE="VERSION_HAL"
-BUCKET="s3-autonomous-upgrade-3"
-OTA_PATH="os/ota/hal"
-METADATA_PATH="os/ota/metadata.json"
-
-# Auto-increment patch version
-CURRENT=$(cat "$VERSION_FILE" 2>/dev/null || echo "0.0.0")
-MAJOR=$(echo "$CURRENT" | cut -d. -f1)
-MINOR=$(echo "$CURRENT" | cut -d. -f2)
-PATCH=$(echo "$CURRENT" | cut -d. -f3)
-NEW_VERSION="$MAJOR.$MINOR.$((PATCH + 1))"
-echo "$NEW_VERSION" > "$VERSION_FILE"
-
-# Package
-echo "Packaging HAL $NEW_VERSION..."
-cd path/to/hal-source
-echo "$NEW_VERSION" > VERSION
-zip -r "/tmp/hal-${NEW_VERSION}.zip" hal/ requirements.txt VERSION
-
-# Upload zip
-gsutil cp "/tmp/hal-${NEW_VERSION}.zip" \
-    "gs://${BUCKET}/${OTA_PATH}/${NEW_VERSION}/hal-${NEW_VERSION}.zip"
-
-# Update metadata
-DOWNLOAD_URL="https://storage.googleapis.com/${BUCKET}/${OTA_PATH}/${NEW_VERSION}/hal-${NEW_VERSION}.zip"
-gsutil cp "gs://${BUCKET}/${METADATA_PATH}" /tmp/metadata.json
-jq --arg v "$NEW_VERSION" --arg u "$DOWNLOAD_URL" \
-    '.hal = {"version": $v, "url": $u}' /tmp/metadata.json > /tmp/metadata-updated.json
-gsutil cp /tmp/metadata-updated.json "gs://${BUCKET}/${METADATA_PATH}"
-
-echo "HAL $NEW_VERSION published."
-```
+1. `uv lock --project hal --python 3.12 --check` — refuses to publish a stale lockfile.
+2. Bumps the patch version in `hal/VERSION_HAL` (initializes `1.0.0` if missing).
+3. Zips the contents of `hal/` to `hal-<version>.zip` (excludes `.venv/`, `__pycache__/`, `.git/`, `*.pyc`, `.env`, `.python-version`, `test/`, `.coverage`, and a local `drivers/voice/resources/ambernet.onnx`, which would otherwise override the pinned model on every device).
+4. Uploads it to `gs://${GCS_BUCKET}/${BUCKET_PREFIX}/ota/hal/<version>.zip` (no-cache).
+5. Unpacks the signed `ota/metadata.json`, sets `hal.version`, `hal.url`, `hal.sha256`, `hal.updated_at` (an existing `min_version` is preserved — raise it with `promote-ota.sh`), re-signs and uploads it.
 
 ### All Upload Scripts
 
@@ -1170,7 +1241,7 @@ echo "HAL $NEW_VERSION published."
 | `scripts/release/upload-os-server.sh` | OS Server binary | Build → zip → GCS → update metadata |
 | `scripts/release/upload-bootstrap.sh` | Bootstrap Server binary | Build → zip → GCS → update metadata |
 | `scripts/release/upload-web.sh` | Web SPA bundle | Build → zip → GCS → update metadata |
-| `scripts/release/upload-hal.sh` | HAL Python runtime (NEW) | Package → zip → GCS → update metadata |
+| `scripts/release/upload-hal.sh` | HAL Python runtime | Lock check → zip → GCS → update metadata |
 | `scripts/release/upload-setup.sh` | Setup script | Upload to GCS |
 | `scripts/release/upload-setup-ap.sh` | AP setup script | Upload to GCS |
 | `scripts/release/upload-skills.sh` | OpenClaw skill files | Upload to GCS |
@@ -1218,9 +1289,9 @@ os-build:
 	GOOS=linux GOARCH=arm64 go build -ldflags "$(LDFLAGS_OS)" -o os-server ./cmd/os-server
 ```
 
-### HAL (VERSION file)
+### HAL (VERSION_HAL file)
 
-HAL version is a plain text `VERSION` file in the package root. Read by bootstrap via file or `python -m hal --version`.
+HAL version is the plain text file `hal/VERSION_HAL` (installed as `/opt/hal/VERSION_HAL`), which bootstrap reads directly. Do not edit it by hand for a release — `make upload-hal` (`scripts/release/upload-hal.sh`) auto-bumps the patch version.
 
 ---
 
@@ -1245,9 +1316,173 @@ HAL version is a plain text `VERSION` file in the package root. Read by bootstra
 - [x] **Bridge protocol**: Simple HTTP proxy. HAL runs FastAPI on `127.0.0.1:5001`, OS Server proxies from port 5000.
 - [x] **Python version**: Pinned to Python 3.12.x (`pyproject.toml`, `.python-version`, `setup.sh` uses `uv sync --python 3.12`).
 - [x] **HAL packaging**: On-device venv via `uv sync --python 3.12 --extra hardware` plus `--extra reachy` for Reachy Mini or `--extra aec --extra pipecat` for other devices. OTA builds a fresh venv using the shared cache, preserves `.env`, and retains the old runtime for rollback.
-- [x] **Display driver**: DisplayService (GC9A01) is part of HAL Python at `hal/service/display/display_service.py`.
+- [x] **Display driver**: DisplayService (GC9A01) is part of HAL Python at `hal/drivers/display/display_service.py`.
 - [x] **HAL config**: Environment variable-based (`config.py` reads from env vars). `.env` file support via `python-dotenv`. No separate config file needed.
 
 ---
 
 *This document describes the full OTA and bootstrap system. For architecture decisions, see [architecture-decision.md](../robots/lamp/docs/architecture-decision.md). For product vision, see [product-vision.md](../robots/lamp/docs/product-vision.md).*
+
+## Service replacement through the existing OTA feed
+
+Service-defined components use the existing signed metadata payload; there is no
+second release manifest and no architecture-specific `runtime`, `v2` or `v3` key.
+A component describes the actual service being shipped:
+
+```json
+{
+  "lamp-os": {
+    "version": "0.1.0",
+    "url": "https://updates.example/lamp-os/0.1.0.zip",
+    "sha256": "<artifact SHA-256>",
+    "min_version_by_device": {"lamp": "0.1.0"},
+    "activate_by_device": {"lamp": true},
+    "service": "lamp-os",
+    "replaces": ["hal", "os-server"]
+  }
+}
+```
+
+The component key and bare service name must match. `replaces` names existing
+`hal`/`os-server` or registered service-defined components, not arbitrary
+system services. Other legacy components are not replacement targets in this revision. Bootstrap itself cannot be replaced by this mechanism. Names,
+ownership and signed metadata are validated before a service transition. No
+command line or shell hook is accepted from these fields.
+
+Initial migration is automatic when the signed service entry explicitly sets
+`activate_by_device[device_type]` to `true` and has a nonempty, valid
+`min_version_by_device[device_type]` no greater than the published version.
+The release operator enables this through promotion; the device user does not
+need SSH or a CLI command:
+
+```bash
+make promote-service COMPONENT=lamp-os FOR=lamp V=0.1.0 ACTIVATE=1
+```
+
+Bootstrap discovers promoted service components and invokes
+`software-update lamp-os --activate-promoted`. The updater checks the freshly
+fetched signed metadata and actual device type again before using the existing
+service transition transaction. Unsigned metadata, missing device targeting,
+invalid promotion floors, conflicting ownership, and obsolete updater support
+cannot authorize a first installation. Compatible bootstrap and updater releases
+must reach devices before enabling activation in the feed.
+
+Publishing alone does not activate a service. Promotion without `ACTIVATE`
+preserves existing activation settings. `ACTIVATE=0 FOR=lamp` disables future
+first installations for Lamp; it does not uninstall or roll back an active
+service. The flag targets a device type, not a device ID or percentage rollout.
+
+Subsequent versions use ordinary bootstrap version reconciliation, including
+`min_version_by_device`. An installed service's topology cannot silently change:
+publish a new component naming its predecessor in `replaces`, then promote its
+activation. Independent service components can coexist. The manual operator
+command `sudo software-update lamp-os --activate` remains available for testing;
+it is not required for fleet migration.
+
+### Package adapter contract
+
+The ZIP contains `VERSION` matching the metadata version, executable
+`bin/service`, and its bundled workers/resources. The updater generates the
+systemd unit; packages do not supply arbitrary systemd units. The entrypoint
+supports fixed arguments:
+
+- `bin/service serve`: supervise this component and its child processes.
+- `bin/service health`: query the running component and return JSON containing
+  `ready: true`, the matching `version`, and its running supervisor `pid`. The
+  updater checks that PID against systemd's MainPID under a bounded deadline.
+
+The health adapter must not start a second runtime or move hardware. Readiness
+proves only the package's declared startup checks, not successful conversation,
+mechanical safety or compatibility with every external client. The V2 package
+team must implement and qualify this adapter; this OTA support alone does not
+make any existing V2 build installable.
+
+### Transition, data and rollback boundaries
+
+Download and validate the candidate before stopping current services. The updater
+records the previous ownership and recovery state, stops the declared old owners
+and verifies they have stopped before starting the replacement. On failure, or
+recovery of an interrupted transition, it restores the previous configuration.
+Persisted ownership also prevents legacy OTA paths or reboot from resurrecting
+superseded hardware owners. Rollback must not restart an ancestor while its
+replacement remains active.
+
+Each component has isolated writable state. Initial activation does not import
+V1 credentials, calibration, memory or configuration automatically. The package
+team must define that migration separately before deployment. Updates retain
+private state snapshots for rollback; rolling back can discard writes made since
+the snapshot. Packages must not mutate shared V1 data and then claim rollback is
+complete merely because the old binary starts.
+
+Bootstrap remains independent and updateable. A compatibility declaration prevents
+replacing it or the updater with an older implementation that does not understand
+service ownership and recovery. This compatibility check does not substitute for
+artifact authentication. Updater refresh and service activation share the installation
+lock; compatibility is rechecked under that lock after download. Real-device
+activation, reboot/power-loss recovery and
+voice/hardware acceptance remain required before rollout.
+
+### Publishing a service component
+
+Build and qualify the package separately, then publish using the existing signing
+credentials (`OTA_SIGNING_PRIVATE_KEY`, `OTA_SIGNING_KEY_ID`):
+
+```bash
+make upload-service COMPONENT=lamp-os V=0.1.0 PACKAGE=/path/lamp-os.zip REPLACES='hal os-server'
+make promote-service COMPONENT=lamp-os FOR=lamp V=0.1.0 ACTIVATE=1
+```
+
+The publisher requires signed metadata, validates the package, preserves existing
+promotion floors and other components, and rejects topology changes under an
+existing key. Package URLs include the content hash. A version cannot be reused
+with different content while it is the feed's current version. Serialize release
+publishing as with the existing release scripts; metadata publishing is not a
+concurrent multi-writer transaction. Promotion with `ACTIVATE=1` authorizes automatic first installation on the
+selected device type; later updates continue to follow the promotion floor.
+If an automatic activation fails after the transition starts, recovery restores
+the previous services and records the rejected version so polling does not keep
+retrying it. A pending recovery journal is retained if that rejection cannot be
+persisted. `ACTIVATE=0` preserves existing version floors.
+
+### Build the V2 supervisor from main
+
+From a checkout containing the release tooling, run:
+
+```bash
+make upload-lamp-os
+```
+
+This command fetches `refs/heads/lamp-voice` from the checkout's `origin` into a
+private temporary repository, freezes the fetched commit, and extracts only
+`lampOS/`. It does not switch the current branch or include dirty source files.
+Using that workspace's pinned Rust toolchain and lockfile, it runs
+`cargo zigbuild --locked --release --target aarch64-unknown-linux-gnu -p lamp-keeper`.
+Prerequisites are Cargo/rustup, cargo-zigbuild, Zig, the pinned toolchain's
+`aarch64-unknown-linux-gnu` target, and authenticated `gsutil`.
+
+The resulting supervisor is uploaded as `lamp-os`, with `build.json`, `VERSION` and
+`SHA256SUMS`, under
+`gs://${GCS_BUCKET}/${BUCKET_PREFIX}/services/lamp-os/builds/<version>/<commit>/<sha256>/`.
+The existing defaults are `s3-autonomous-upgrade-3` and `os`; environment overrides
+work as for other release commands. The command downloads the stored binary and
+checks its SHA-256 before reporting success. It validates an ARM64 ELF header
+before uploading. This is a build/provenance check, not a hardware qualification.
+
+This first-stage artifact is the `lamp-keeper` supervisor, intended to become
+`bin/service` in a later `lamp-os` service package. It is **not** the complete V2
+OTA ZIP: child binaries, models, device configuration/calibration and rendered
+units must be packaged and qualified separately. No OTA metadata, version floor,
+or activation setting is changed. Use `upload-service` only once that full
+package is ready; V1 and other device types remain unaffected by this upload.
+
+`system/VERSION_LAMP_OS` tracks this release stream independently of HAL and
+bootstrap. It starts at `0.0.0`; after a valid binary build, `upload-lamp-os`
+increments its patch version (first upload: `0.0.1`). That version is written to
+`build.json`, the uploaded `VERSION` file, and the GCS path. The keeper reads the
+release's `VERSION` file for OTA health; this command does not modify the Rust
+crate version. As with the existing release commands, a failed upload after the
+bump leaves the version file advanced. Keep release invocations serialized and
+retain the updated version file in the release history; do not hand-bump it.
+
+If Cargo is missing from the caller's PATH, the command also checks
+`${CARGO_HOME:-$HOME/.cargo}/bin` for an existing installation. It does not install Rust.

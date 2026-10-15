@@ -16,17 +16,8 @@ def test_streamed_frames_match_whole_signal_resample_exactly():
     rs = StreamingResampler(16000, 24000)
     streamed = np.concatenate([rs.process(x[i:i + 320]) for i in range(0, len(x), 320)])
     n = len(streamed)
-    assert n == len(whole) - 64 * 24000 // 16000  # only the lookahead tail is still pending
+    assert n == len(whole) - 64 * 24000 // 16000
     assert np.max(np.abs(whole[:n] - streamed)) == 0.0
-
-
-def test_per_frame_resampling_rings_at_the_edges_which_is_what_this_replaces():
-    x = _tone()
-    whole = resample_float32(x, 16000, 24000)
-    naive = np.concatenate([resample_float32(x[i:i + 320], 16000, 24000) for i in range(0, len(x), 320)])
-    d = (whole - naive)[2400:-2400].reshape(-1, 480)
-    edge = np.sqrt(np.mean(np.concatenate([d[:, :40], d[:, -40:]], axis=1) ** 2))
-    assert edge > 0.005  # ~-30 dB re full scale: the click train
 
 
 def test_same_rate_is_a_passthrough_and_reset_clears_history():

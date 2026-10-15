@@ -19,10 +19,15 @@
         11
       ],
       "touch_threshold": 6,
-      "release_threshold": 3,
+      "release_threshold": 4,
       "autoconfig": true,
       "poll_ms": 10,
-      "debounce_ms": 30,
+      "debounce_ms": 10,
+      "chip_debounce": 2,
+      "tap_min_electrodes": 3,
+      "ffi": 34,
+      "sfi": 10,
+      "esi_ms": 1,
       "swipe_axis": [
         11,
         10,
@@ -36,7 +41,11 @@
         2,
         1,
         0
-      ]
+      ],
+      "gesture_actions": {
+        "hold": "toggle_voice_input_mode"
+      },
+      "hold_action_s": 2
     }
   }
 }

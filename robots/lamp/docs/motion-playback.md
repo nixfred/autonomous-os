@@ -96,6 +96,60 @@ clips is not. Re-derive the constant if the body's mass distribution changes.
 
 [#271]: https://github.com/autonomous-ai/autonomous-os/issues/271
 
+## Overload cut-off
+
+Playback is also where a blocked arm shows up: the trajectory keeps advancing while a
+joint cannot follow, and the servo pushes at full drive. `AnimationService` therefore
+samples every joint's `Present_Load` at 20 Hz (`hal/drivers/motors/overload.py`).
+
+- **Contact stop.** `base_yaw` at 55 %, `wrist_roll` at 75 % or `wrist_pitch` at 65 %
+  for 0.05 s halts the recording where it is, pins the pose with torque on (the arm
+  does not drop), silently, and blocks goal writes for 3 s. Then it eases back
+  into idle from the pose it stopped at. A hand still holding the arm 1 s into that
+  pause (`release_after_s`), the stopped joint still at the load or lag floor that
+  stopped it or pushed 1° off its pinned pose (`base_pitch`/`elbow_pitch` only on their `off_playback` floor or the
+  cut-off: they hold the arm's weight even untouched), releases torque instead, like the overload cut-off. On lamp-52e6 these joints peak at 52 % in free
+  motion and a hand on `base_yaw` drives it to 94-100 %. `base_pitch` and `elbow_pitch`
+  carry the arm's weight and reach 83-100 % in free motion, so they get no fixed floor;
+  they and `base_yaw` are capped at 60 % torque (`torque_limit`; 70 % cost the worst
+  recording, `shock`, 1° of extra lag, 50 % cost 7°).
+- **Learned envelope.** During playback every joint, the weight-bearing ones included,
+  is held to what a free run loaded at that frame plus 12 % (`contact.profile_margin`),
+  and to how far it trailed its goal there plus 3.5° (`contact.lag_margin`), which
+  still sees a hand on a joint already at its torque cap.
+  The envelope is learned per unit by `POST /servo/contact/learn`, or the **Learn**
+  button on the web Monitor Servo page (each recording
+  played free twice, the per-frame max kept, saved to
+  `/var/lib/hal/contact_profile.json`), and kept current passively from every clean
+  play of a recording (see [safety](../../../docs/safety.md)). The frame index it looks up is the playback
+  frame, so the envelope follows the recording after speed-cap resampling; re-learn
+  after recalibration. A `torque_limit` change drops the envelope, and a recording
+  whose length changed starts its passive runs over. Outside playback
+  (gaze, tracking, `/servo/move`, holds) the fixed `contact.off_playback` floors apply,
+  except during a direct move and 0.5 s after it (a fast move outruns the servo's ramp).
+  Settled idle uses this unit's own envelope when it has learned idle, else `off_playback`.
+- **Overload cut-off.** A joint at 80 % or more for 1.5 s (the arm is still forced while
+  held) cuts torque on all servos, plays the ack chime and blocks every goal write for
+  120 s. Afterwards the body resumes into idle from wherever the arm ended up.
+
+Recording frames sent while goals are blocked are dropped, not queued. The thresholds
+(`contact.load`/`hold_s`/`pause_s`, `load`, `hold_s`, `retry_s`, `torque_limit`) are device-owned in
+`robots/lamp/servo_overload.json`;
+the full behaviour is in the fail-safe section of
+[`docs/safety.md`](../../../docs/safety.md).
+
+## Aim hold
+
+`POST /servo/aim` stops the playback loop, moves the head, and restarts the loop on a
+one-frame recording, `__aim_hold__`: the turned pose, kept for 5 s (`_hold_until`)
+before idle resumes (longer while a servo hold is active). The aim also drops any blend
+left from before it (`_interpolation_frames` / `_interpolation_target`). The loop runs a
+pending blend before any recording frame and does not check the hold while blending, so
+an idle blend started just before the aim (e.g. idle resuming after a voice capture)
+used to swing the head back toward idle and then snap it to the turned pose, about 1.5 s
+into the hold; a turn-and-look photo taken in that window showed the front instead of
+the requested side. `move_and_hold` and `halt` already drop the blend the same way.
+
 ## The range demo — computed, not recorded
 
 `POST /servo/demo` (`hal/drivers/motors/range_demo.py`) performs a narrated tour

@@ -97,7 +97,7 @@ User nói "Lamp, nhìn xem" / "look at me" / "camera on" → agent gọi `[HW:/c
 
 ### 7. Telegram/web chat cần visual context
 
-Agent cần snapshot (camera skill) → một lệnh shell kiểm `GET /camera` trước: `disabled` → agent trả lời "camera đang tắt" rồi dừng (không tự bật, không chụp); `has_frame: false` → "camera không hoạt động" rồi dừng; còn lại `POST /api/vision/look` chụp và mô tả. Bước kiểm nằm chung tool call nên không thêm vòng model.
+Agent cần snapshot (camera skill) → một lệnh shell kiểm `GET /camera` trước: `disabled` → agent trả lời "camera đang tắt" rồi dừng (không tự bật, không chụp); `has_frame: false` → "camera không hoạt động" rồi dừng; còn lại `POST /api/vision/look` chụp và trả lời câu hỏi (thinking tắt; `"read_text": true` chỉ dùng khi đọc chữ/nhãn/hãng, chụp 1280px và bật thinking). Bước kiểm nằm chung tool call nên không thêm vòng model. Ở lượt voice, `/api/vision/look` nói một câu ngắn trước khi chụp ("Để mình nhìn thử.") và một câu khi đã chụp xong ("Chụp xong rồi, đợi mình chút nha."), để người dùng biết lúc nào ảnh đã chụp trong khoảng chờ mô tả khá lâu. Với "quay trái/phải và cho mình biết bạn thấy gì", cùng một lệnh shell đó sẽ aim sau bước kiểm và trước khi look (skill `servo-control`), nên camera đang tắt thì không có chuyển động. `/api/vision/look` giữ thân đứng yên dưới owner `look` nội bộ của HAL từ câu báo đầu tiên đến hết lúc chụp, rồi thả ra. Agent không bao giờ gọi `/servo/hold` trong một lượt quay-rồi-nhìn ("giữ nguyên đó" ở đây là hold riêng của look); agent chỉ hold khi user yêu cầu giữ tư thế mà không kèm nhìn.
 
 ## Manual Override
 
@@ -259,6 +259,6 @@ Cả hai watchdog ISP (freeze và loạn màu) dùng chung một thang leo qua `
 
 - **Guard mode + camera off**: ✅ Done — guard SKILL.md bước 1: `[HW:/camera/enable:{}]` trước khi enable guard. Override manual disable.
 - **Face enroll khi camera off**: `/face/enroll` dùng uploaded image, không dùng live camera. Không conflict.
-- **Snapshot request khi camera off**: Trả 503 "Camera disabled". Agent xử lý gracefully.
+- **Snapshot khi camera bị tắt thủ công hoặc khóa riêng tư**: Trả 409. Camera tạm dừng tự động vẫn cho phép chụp tạm; các request snapshot đồng thời được xử lý tuần tự để không dừng camera của nhau.
 - **Nhiều trigger liên tiếp**: Debounce camera start/stop. `camera_capture.start()` đã handle "already started".
 - **Sound spike false positive loop**: Sau auto-on, nếu không detect face trong 30s → auto-off lại.

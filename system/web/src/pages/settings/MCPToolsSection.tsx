@@ -1,14 +1,10 @@
 import { useEffect, useState } from "react";
 import { toast } from "sonner";
 import { C, SectionCard, LABEL_STYLE, INPUT_STYLE } from "@/components/setup/shared";
-import { listMCPTools, addMCPTool, removeMCPTool } from "@/lib/api";
-import type { MCPTool } from "@/lib/api";
+import { listMCPTools, addMCPTool, removeMCPTool, startFoConnect, finishFoConnect, getFoStatus } from "@/lib/api";
+import type { MCPTool, FoStatus } from "@/lib/api";
 
-// MCP Tools section — manages remote MCP tool endpoints (HF Spaces,
-// community tools, authenticated services). Not part of the main form Save
-// flow; each add/remove hits its own API endpoint and takes effect immediately
-// (gateway restart). OAuth-authenticated connectors (Notion, GitHub, …) are
-// managed separately via the MQTT connector.set flow.
+import "./settings-lists.css";
 
 type HeaderRow = { key: string; value: string };
 
@@ -20,12 +16,17 @@ export function MCPToolsSection({ active }: { active: boolean }) {
   const [name, setName] = useState("");
   const [url, setUrl] = useState("");
   const [headers, setHeaders] = useState<HeaderRow[]>([]);
+  const [foAuthURL, setFoAuthURL] = useState("");
+  const [foCallback, setFoCallback] = useState("");
+  const [foBusy, setFoBusy] = useState(false);
+  const [foStatus, setFoStatus] = useState<FoStatus>({ connected: false, needs_reconnect: false });
 
   useEffect(() => {
     listMCPTools()
       .then(setTools)
       .catch(() => {})
       .finally(() => setLoading(false));
+    getFoStatus().then(setFoStatus).catch(() => {});
   }, []);
 
   function addHeaderRow() { setHeaders((prev) => [...prev, { key: "", value: "" }]); }
@@ -69,11 +70,41 @@ export function MCPToolsSection({ active }: { active: boolean }) {
     try {
       await removeMCPTool(toolName);
       setTools((prev) => prev.filter((t) => t.name !== toolName));
+      if (toolName === "fo") setFoStatus({ connected: false, needs_reconnect: false });
       toast.success(`Removed "${toolName}".`);
     } catch (err) {
       toast.error(err instanceof Error ? err.message : "Failed to remove tool.");
     } finally {
       setRemoving(null);
+    }
+  }
+
+  async function handleFoStart() {
+    setFoBusy(true);
+    try {
+      const { auth_url } = await startFoConnect();
+      setFoAuthURL(auth_url);
+      window.open(auth_url, "_blank", "noopener");
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "Failed to start Fo sign-in.");
+    } finally {
+      setFoBusy(false);
+    }
+  }
+
+  async function handleFoFinish() {
+    setFoBusy(true);
+    try {
+      await finishFoConnect(foCallback.trim());
+      setTools(await listMCPTools());
+      setFoStatus(await getFoStatus());
+      setFoAuthURL("");
+      setFoCallback("");
+      toast.success("Fo connected.");
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "Failed to connect Fo.");
+    } finally {
+      setFoBusy(false);
     }
   }
 
@@ -86,7 +117,7 @@ export function MCPToolsSection({ active }: { active: boolean }) {
   };
 
   const SMALL_BTN: React.CSSProperties = {
-    padding: "3px 8px", borderRadius: 6, fontSize: 11, fontWeight: 500,
+    padding: "3px 8px", borderRadius: 6, fontSize: 12, fontWeight: 500,
     cursor: "pointer", border: `1px solid ${C.border}`, background: C.surface,
     color: C.textDim,
   };
@@ -100,39 +131,40 @@ export function MCPToolsSection({ active }: { active: boolean }) {
       </div>
 
       {loading ? (
-        <div style={{ fontSize: 12, color: C.textMuted }}>Loading…</div>
+        <div style={{ fontSize: 12, color: C.textDim }}>Loading…</div>
       ) : (
         <>
-          {/* Configured tools list */}
           {tools.length > 0 && (
             <div style={{ marginBottom: 16 }}>
               {tools.map((t) => (
                 <div
                   key={t.name}
+                  className="lm-settings-list-row"
                   style={{
                     display: "flex", alignItems: "center", justifyContent: "space-between",
                     gap: 8, padding: "10px 12px", marginBottom: 6,
                     background: C.surface, border: `1px solid ${C.border}`, borderRadius: 8,
                   }}
                 >
-                  <div style={{ overflow: "hidden", minWidth: 0 }}>
-                    <div style={{ fontSize: 13, fontWeight: 600, color: C.text, display: "flex", alignItems: "center", gap: 6 }}>
-                      {t.name}
+                  <div style={{ minWidth: 0, flex: 1 }}>
+                    <div style={{ fontSize: 13, fontWeight: 600, color: C.text, display: "flex", flexWrap: "wrap", alignItems: "center", gap: 6 }}>
+                      <span className="lm-settings-list-name">{t.name}</span>
                       {headerCount(t) > 0 && (
-                        <span style={{ fontSize: 10, color: C.amber, fontWeight: 400 }}>
+                        <span style={{ fontSize: 12, color: C.amber, fontWeight: 400 }}>
                           {headerCount(t)} header{headerCount(t) > 1 ? "s" : ""}
                         </span>
                       )}
                     </div>
                     <div style={{
-                      fontSize: 11, color: C.textMuted,
-                      overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap",
+                      fontSize: 12, color: C.textDim,
+                      overflowWrap: "anywhere",
                     }}>
                       {t.url}
                     </div>
                   </div>
                   <button
                     type="button"
+                    aria-label={`Remove MCP tool ${t.name}`}
                     onClick={() => handleRemove(t.name)}
                     disabled={removing === t.name}
                     style={{ ...BTN, color: "#ef4444", flexShrink: 0, opacity: removing === t.name ? 0.5 : 1, cursor: removing === t.name ? "not-allowed" : "pointer" }}
@@ -144,13 +176,67 @@ export function MCPToolsSection({ active }: { active: boolean }) {
             </div>
           )}
 
+          <div style={{
+            marginBottom: 16, padding: "10px 12px", background: C.surface,
+            border: `1px solid ${C.border}`, borderRadius: 8,
+          }}>
+            <div style={{ fontSize: 13, fontWeight: 600, color: C.text, marginBottom: 4, display: "flex", gap: 8, alignItems: "center" }}>
+              Fo (Wajo)
+              {foStatus.connected && !foStatus.needs_reconnect && (
+                <span style={{ fontSize: 12, fontWeight: 400, color: "#22c55e" }}>Connected</span>
+              )}
+              {foStatus.needs_reconnect && (
+                <span style={{ fontSize: 12, fontWeight: 400, color: C.amber }}>Sign-in expired</span>
+              )}
+            </div>
+            {foStatus.needs_reconnect && (
+              <div role="alert" style={{ fontSize: 12, color: C.amber, lineHeight: 1.6, marginBottom: 8 }}>
+                Wajo no longer accepts this device&apos;s sign-in, so the agent cannot reach Fo.
+                Press Reconnect and sign in again; the agent keeps running meanwhile.
+              </div>
+            )}
+            <div style={{ fontSize: 12, color: C.textDim, lineHeight: 1.6, marginBottom: 8 }}>
+              Let the agent hand errands (email, calendar, calls, purchases) to your Fo
+              assistant. Needs a Wajo account with Fo Pro.
+            </div>
+            {!foAuthURL ? (
+              <button type="button" onClick={handleFoStart} disabled={foBusy} style={{ ...BTN, opacity: foBusy ? 0.5 : 1 }}>
+                {foBusy ? "Opening…" : foStatus.connected ? "Reconnect" : "Connect Fo"}
+              </button>
+            ) : (
+              <>
+                <div style={{ fontSize: 12, color: C.textDim, lineHeight: 1.6, marginBottom: 6 }}>
+                  1. <a href={foAuthURL} target="_blank" rel="noopener noreferrer" style={{ color: C.amber }}>Open the Wajo sign-in</a> and allow access.<br />
+                  2. Your browser then lands on a <b>localhost</b> page that does not load. That is expected:
+                  copy the full address from the address bar and paste it below.
+                </div>
+                <label htmlFor="fo-callback" style={LABEL_STYLE}>Address after sign-in</label>
+                <input
+                  id="fo-callback"
+                  type="text"
+                  value={foCallback}
+                  onChange={(e) => setFoCallback(e.target.value)}
+                  placeholder="http://localhost:5000/oauth/fo/callback?code=…"
+                  style={INPUT_STYLE}
+                />
+                <button
+                  type="button"
+                  onClick={handleFoFinish}
+                  disabled={foBusy || !foCallback.trim()}
+                  style={{ ...BTN, marginTop: 8, opacity: foBusy || !foCallback.trim() ? 0.5 : 1 }}
+                >
+                  {foBusy ? "Connecting…" : "Finish"}
+                </button>
+              </>
+            )}
+          </div>
+
           {tools.length === 0 && (
-            <div style={{ fontSize: 12, color: C.textMuted, marginBottom: 14 }}>
+            <div style={{ fontSize: 12, color: C.textDim, marginBottom: 14 }}>
               No MCP tools configured yet.
             </div>
           )}
 
-          {/* Add form */}
           <div style={{ marginBottom: 6 }}>
             <label htmlFor="mcp-name" style={LABEL_STYLE}>Name</label>
             <input
@@ -174,29 +260,41 @@ export function MCPToolsSection({ active }: { active: boolean }) {
             />
           </div>
 
-          {/* Headers (key-value pairs) */}
           <div style={{ marginBottom: 10 }}>
             <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6 }}>
-              <span style={LABEL_STYLE}>Headers <span style={{ color: C.textMuted, fontWeight: 400 }}>(optional)</span></span>
+              <span style={LABEL_STYLE}>Headers <span style={{ color: C.textDim, fontWeight: 400 }}>(optional)</span></span>
               <button type="button" onClick={addHeaderRow} style={SMALL_BTN}>+ Add</button>
             </div>
             {headers.map((h, i) => (
-              <div key={i} style={{ display: "flex", gap: 6, marginBottom: 4 }}>
-                <input
-                  type="text"
-                  value={h.key}
-                  onChange={(e) => updateHeader(i, "key", e.target.value)}
-                  placeholder="Authorization"
-                  style={{ ...INPUT_STYLE, flex: 1 }}
-                />
-                <input
-                  type="password"
-                  value={h.value}
-                  onChange={(e) => updateHeader(i, "value", e.target.value)}
-                  placeholder="Bearer sk-..."
-                  style={{ ...INPUT_STYLE, flex: 2 }}
-                />
-                <button type="button" onClick={() => removeHeaderRow(i)} style={{ ...SMALL_BTN, color: "#ef4444" }}>×</button>
+              <div key={i} className="lm-mcp-header-row">
+                <div>
+                  <label htmlFor={`mcp-header-key-${i}`} style={LABEL_STYLE}>Header name</label>
+                  <input
+                    id={`mcp-header-key-${i}`}
+                    type="text"
+                    value={h.key}
+                    onChange={(e) => updateHeader(i, "key", e.target.value)}
+                    placeholder="Authorization"
+                    style={INPUT_STYLE}
+                  />
+                </div>
+                <div>
+                  <label htmlFor={`mcp-header-value-${i}`} style={LABEL_STYLE}>Header value</label>
+                  <input
+                    id={`mcp-header-value-${i}`}
+                    type="password"
+                    value={h.value}
+                    onChange={(e) => updateHeader(i, "value", e.target.value)}
+                    placeholder="Bearer sk-..."
+                    style={INPUT_STYLE}
+                  />
+                </div>
+                <button
+                  type="button"
+                  aria-label={`Remove header ${i + 1}`}
+                  onClick={() => removeHeaderRow(i)}
+                  style={{ ...BTN, color: "#ef4444" }}
+                >Remove</button>
               </div>
             ))}
           </div>

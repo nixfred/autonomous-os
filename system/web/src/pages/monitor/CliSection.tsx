@@ -2,11 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import "@xterm/xterm/css/xterm.css";
-
-// Multi-tab interactive shell. Each tab owns its own xterm + WebSocket + PTY,
-// so backgrounded tabs keep their bash running (history, env, current dir).
-// Tabs are kept mounted (hidden via display:none) so switching is instant
-// and doesn't trigger a reconnect.
+import "./technical-panels.css";
 
 interface SessionMeta {
   id: string;
@@ -15,10 +11,7 @@ type Status = "connecting" | "open" | "closed";
 
 const MAX_TABS = 6;
 
-// Stable id generator — used only as React key. Display name is derived from
-// tab position at render time so the sequence stays 1..N (e.g. close shell 2
-// → shell 3 renumbers to "shell 2"). Counter lives in a ref so React 18
-// StrictMode's double-invoke of state initializers doesn't skip numbers.
+// Random id used only as a React key.
 function newId() { return Math.random().toString(36).slice(2, 9); }
 
 export function CliSection() {
@@ -47,7 +40,6 @@ export function CliSection() {
 
   return (
     <div style={{ display: "flex", flexDirection: "column", height: "100%", gap: 8 }}>
-      {/* Tab bar */}
       <div style={{
         display: "flex", alignItems: "center", gap: 4, flexShrink: 0,
         flexWrap: "wrap",
@@ -63,10 +55,11 @@ export function CliSection() {
         ))}
         <button
           onClick={addTab}
+          aria-label="New shell"
           disabled={sessions.length >= MAX_TABS}
           title={sessions.length >= MAX_TABS ? `Max ${MAX_TABS} sessions` : "New shell"}
           style={{
-            fontSize: 12, padding: "4px 10px", borderRadius: 5,
+            fontSize: 16, minWidth: 40, minHeight: 40, padding: "8px 12px", borderRadius: 5,
             background: "var(--lm-surface)", border: "1px solid var(--lm-border)",
             color: sessions.length >= MAX_TABS ? "var(--lm-text-muted)" : "var(--lm-amber)",
             cursor: sessions.length >= MAX_TABS ? "not-allowed" : "pointer",
@@ -74,12 +67,11 @@ export function CliSection() {
           }}
         >+</button>
         <span style={{ flex: 1 }} />
-        <span style={{ fontSize: 9.5, fontFamily: "monospace", color: "var(--lm-text-muted)" }}>
+        <span style={{ fontSize: 12, fontFamily: "monospace", color: "var(--lm-text-dim)" }}>
           Ctrl+C/Z · arrows · tab-complete
         </span>
       </div>
 
-      {/* Stacked terminals — only the active one is visible. */}
       <div style={{ flex: 1, minHeight: 0, position: "relative" }}>
         {sessions.map((s) => (
           <TerminalSession
@@ -99,44 +91,22 @@ function TabPill({ name, active, onSelect, onClose }: {
   onClose: () => void;
 }) {
   return (
-    <div
-      onClick={onSelect}
-      style={{
-        display: "flex", alignItems: "center", gap: 6,
-        padding: "4px 4px 4px 10px", borderRadius: 5,
-        border: active ? "1px solid var(--lm-amber)" : "1px solid var(--lm-border)",
-        background: active ? "rgba(245,158,11,0.12)" : "var(--lm-surface)",
-        color: active ? "var(--lm-amber)" : "var(--lm-text-dim)",
-        cursor: "pointer", fontSize: 11, fontWeight: active ? 700 : 500,
-        userSelect: "none",
-      }}
-    >
-      <span style={{ fontFamily: "'JetBrains Mono', monospace" }}>{name}</span>
-      <button
-        onClick={(e) => { e.stopPropagation(); onClose(); }}
-        title="Close session"
-        style={{
-          fontSize: 11, lineHeight: 1, padding: "1px 6px", borderRadius: 3,
-          background: "transparent", border: "none",
-          color: active ? "var(--lm-amber)" : "var(--lm-text-muted)",
-          cursor: "pointer",
-        }}
-      >×</button>
+    <div className="lm-cli-tab" data-active={active}>
+      <button type="button" onClick={onSelect} aria-pressed={active}>{name}</button>
+      <button type="button" onClick={onClose} aria-label={`Close ${name}`} title="Close session">×</button>
     </div>
   );
 }
 
-// TerminalSession owns one xterm + WS lifecycle. Mounted once; hidden via
-// display:none when not active so the underlying PTY (with its scrollback +
-// shell state) keeps running in the background.
+// TerminalSession owns one xterm + WS lifecycle.
 function TerminalSession({ visible }: { visible: boolean }) {
   const hostRef = useRef<HTMLDivElement>(null);
   const termRef = useRef<Terminal | null>(null);
   const fitRef = useRef<FitAddon | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
   const [status, setStatus] = useState<Status>("connecting");
+  const [connectionAttempt, setConnectionAttempt] = useState(0);
 
-  // Refit + resize signal — used on tab switch (visible flip) AND on container resize.
   const refit = useCallback(() => {
     const f = fitRef.current;
     const t = termRef.current;
@@ -214,16 +184,20 @@ function TerminalSession({ visible }: { visible: boolean }) {
       window.removeEventListener("resize", onWinResize);
       ro.disconnect();
       dataDisposable.dispose();
+      // A retired socket must not change the status of a replacement session.
+      ws.onopen = null;
+      ws.onmessage = null;
+      ws.onclose = null;
+      ws.onerror = null;
       try { ws.close(); } catch { /* Unmount teardown: close() throws on an already-closing socket, which is the state we want anyway. */ }
       term.dispose();
       termRef.current = null;
       wsRef.current = null;
       fitRef.current = null;
     };
-  }, [refit]);
+  }, [refit, connectionAttempt]);
 
-  // When the tab becomes visible, re-fit and focus — xterm computes geometry
-  // wrong when measured inside a display:none container.
+  // xterm mis-measures inside display:none, so re-fit when visible.
   useEffect(() => {
     if (!visible) return;
     const t = setTimeout(() => {
@@ -239,7 +213,6 @@ function TerminalSession({ visible }: { visible: boolean }) {
       display: visible ? "flex" : "none",
       flexDirection: "column", gap: 6,
     }}>
-      {/* Per-session status row + reconnect when closed */}
       <div style={{
         display: "flex", alignItems: "center", gap: 8, flexShrink: 0,
         fontSize: 11, color: "var(--lm-text-muted)",
@@ -264,6 +237,25 @@ function TerminalSession({ visible }: { visible: boolean }) {
           }} />
           {status.toUpperCase()}
         </span>
+        {status === "closed" && (
+          <button type="button" className="lm-cli-key" onClick={() => {
+            setStatus("connecting");
+            setConnectionAttempt((attempt) => attempt + 1);
+          }}>Reconnect</button>
+        )}
+      </div>
+      <div className="lm-cli-mobile-keys" aria-label="Terminal keys">
+        {[
+          ["Ctrl+C", "\x03"], ["Tab", "\t"], ["Esc", "\x1b"],
+          ["↑", "\x1b[A"], ["↓", "\x1b[B"], ["←", "\x1b[D"], ["→", "\x1b[C"],
+        ].map(([label, sequence]) => (
+          <button key={label} type="button" className="lm-cli-key" disabled={status !== "open"}
+            aria-label={label === "↑" ? "Arrow up" : label === "↓" ? "Arrow down" : label === "←" ? "Arrow left" : label === "→" ? "Arrow right" : label}
+            onClick={() => {
+              if (wsRef.current?.readyState === WebSocket.OPEN) wsRef.current.send(sequence);
+              termRef.current?.focus();
+            }}>{label}</button>
+        ))}
       </div>
       <div
         ref={hostRef}

@@ -8,8 +8,7 @@ import (
 	"time"
 )
 
-// mockSender records what the pipe hands the transport. Tests NEVER touch the
-// real analytics endpoint.
+// mockSender records what the pipe hands the transport.
 type mockSender struct {
 	mu     sync.Mutex
 	events []struct {
@@ -52,8 +51,6 @@ func withPipe(t *testing.T, m *mockSender) {
 	origGlobal := global
 	global = newReporter(m.send)
 	t.Cleanup(func() { global = origGlobal })
-	// No endpoint configured = nothing is sent; these tests exercise the
-	// sending path, so give it one.
 	t.Setenv("AUTONOMOUS_ANALYTICS_URL", "http://127.0.0.1:1/test")
 }
 
@@ -111,20 +108,20 @@ func TestEmptyIDIsNotDeduped(t *testing.T) {
 	m.wait(t, 2)
 }
 
-// Delivery failure must be counted and reported onward, never swallowed into
-// a silently-inflated success rate.
+// Delivery failures must be counted, never swallowed.
 func TestDeliveryFailureIsCounted(t *testing.T) {
 	m := newMock(errors.New("network down"), 2)
 	withPipe(t, m)
 
-	Report(Event{Name: "voice_metrics_interaction", ID: "f1"})
-	m.wait(t, 1)
+	// The mock's notification precedes the worker's counter update. Exercise
+	// delivery synchronously so the assertions wait for all delivery bookkeeping;
+	// the other Report tests cover asynchronous queueing and transport calls.
+	global.send(context.Background(), Event{Name: "voice_metrics_interaction", ID: "f1"})
 	if _, failed, _ := Stats(); failed != 1 {
 		t.Fatalf("failed = %d, want 1", failed)
 	}
 
-	Report(Event{Name: "voice_metrics_interaction", ID: "f2"})
-	m.wait(t, 1)
+	global.send(context.Background(), Event{Name: "voice_metrics_interaction", ID: "f2"})
 	if got := m.events[1].params["telemetry_failed_total"]; got != int64(1) {
 		t.Errorf("telemetry_failed_total = %v, want 1", got)
 	}
@@ -134,8 +131,7 @@ func TestDeliveryFailureIsCounted(t *testing.T) {
 func TestFullQueueDropsInsteadOfBlocking(t *testing.T) {
 	m := newMock(nil, 0)
 	withPipe(t, m)
-	// Block the worker inside the transport so the queue actually fills, the
-	// way a stalled uplink would.
+	// Block the worker so the queue actually fills.
 	release := make(chan struct{})
 	global = newReporter(func(ctx context.Context, name string, params map[string]any) error {
 		<-release

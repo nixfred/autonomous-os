@@ -60,6 +60,176 @@ skipped: [buddy]
 — `companion` được khai nhưng optional, và HAL không có driver `buddy` nào, nên
 route đó bị skip chứ không làm sập boot.
 
+## Deploy: cài chồng, không bao giờ flash
+
+Reachy Mini ship kèm **OS Pollen** trên Pi, chứa daemon own serial bus, control
+loop, inverse kinematics và safety clamp. **Flash golden image = xoá daemon =
+cục gạch.** Autonomous luôn được cài chồng lên.
+
+Bộ script spike **chạy trên chính robot**, không chạy từ máy dev. Copy nguyên thư
+mục sang rồi gọi một lệnh:
+
+```bash
+scp -r robots/reachy-mini pollen@reachy-mini.local:~/
+ssh pollen@reachy-mini.local 'sudo bash ~/reachy-mini/spike.sh'
+```
+
+Không có gì được build ở máy dev. Mọi artifact tải từ **OTA metadata**
+(`https://cdn.autonomous.ai/os/ota/metadata.json`) — đúng nguồn mà
+`scripts/imager/build-orangepi.sh` và `scripts/provision/setup.sh` đọc, nên robot
+spike chạy đúng build cả fleet đang chạy, và bug tái hiện ở đây mới nói được điều
+gì đó về máy người khác. Đổi feed bằng `OTA_METADATA_URL=…` hoặc field
+`metadata_url` trong `/root/config/bootstrap.json`.
+
+Ký OTA là tuỳ chọn. Khi `/root/config/bootstrap.json` có
+`signing_public_key` Ed25519 base64 đã được pin, `install.sh`, các spike script
+và `software-update` sẽ xác thực envelope `signed` của feed và `sha256` của mỗi
+ZIP trước khi giải nén. Không có field này thì luồng metadata và tải legacy vẫn
+được giữ nguyên, nên robot đã provision trước đó vẫn update bình thường.
+Để fresh install có xác thực, truyền key vào one-liner, ví dụ
+`curl -fsSL …/install.sh | sudo env OTA_SIGNING_PUBLIC_KEY=… bash`; key được pin
+trong `bootstrap.json` trước khi bất kỳ component script OTA nào chạy.
+
+Trước khi thay `os-server` hoặc `bootstrap-server`, `software-update` giữ binary
+cũ tại `/root/bootstrap/rollback/`. Dùng `sudo software-update rollback
+os-server` (hoặc `bootstrap`) để khôi phục; version lỗi bị chặn tới khi feed có
+version khác.
+
+Web OTA cũng theo cùng model recovery. Nó stage và xác thực bundle mới trước khi
+thay `/usr/share/nginx/html/setup`, giữ bundle trước đó tại
+`/root/bootstrap/rollback/web.previous`, và ghi lại nginx có đang chạy hay không.
+Update yêu cầu có `index.html`, `nginx -t`, và `GET /` loopback khi nginx đang
+active; check lỗi sẽ tự khôi phục bundle known-good. Dùng
+`sudo software-update rollback web` khi operator cần rollback chủ động.
+
+Device-profile OTA stage package trước khi swap
+`/opt/devices/reachy-mini`, lưu profile trước đó và mọi rootfs target bị ảnh
+hưởng, sau đó phục hồi trạng thái service `os-server` và HAL cũ. Nó giữ file
+tuning local `/opt/hal/.env`. Profile mới phải có `ROBOT.md`; mỗi service trước
+đó active phải qua health endpoint loopback, nếu không profile known-good sẽ tự
+được phục hồi. Dùng `sudo software-update rollback device` để recovery thủ công.
+
+HAL OTA giữ toàn bộ runtime `/opt/hal` trước đó—`.env`, virtual environment và
+uv cache—tại `/root/bootstrap/rollback/hal.previous`. Runtime mới được giải nén
+và sync trong thư mục staging kề bên, chỉ sau đó mới swap vào vị trí chạy. HAL
+trở về trạng thái active/inactive trước đó và service đang active phải trả về
+`http://127.0.0.1:5001/health`. Mọi lỗi staging hoặc health sẽ tự phục hồi
+runtime known-good. Dùng `sudo software-update rollback hal` để recovery thủ công.
+
+Layout là **layout production**, không phải cây riêng cho spike:
+
+| Thành phần | Đường dẫn |
+|------------|-----------|
+| HAL | `/opt/hal` (venv `/opt/hal/.venv`, `.env` do device package ship) |
+| Device profile | `/opt/devices/reachy-mini` |
+| Binary Go | `/usr/local/bin/os-server`, `/usr/local/bin/bootstrap-server` |
+| Config | `/root/config/config.json`, `/root/config/bootstrap.json` |
+| Web bundle | `/usr/share/nginx/html/setup` |
+
+`spike.sh` cố ý chỉ là **orchestrator mỏng**: nó gọi lần lượt sáu script con và
+không làm lại việc của script nào. Bản trước đó chép lại logic của chúng, lệch
+nhau trong vòng một tuần, và kết cục là chạy os-server trên sai thư mục config
+trong khi mọi service vẫn báo healthy.
+
+| Bước | Script | Làm gì |
+|------|--------|--------|
+| 1 | `spike-device.sh` | Tải `devices.reachy-mini` từ OTA về `/opt/devices/reachy-mini` **và** đắp `rootfs/` của gói đó lên `/` — đây là nguồn của `/etc/asound.conf` và `/opt/hal/.env`. Thiếu `ROBOT.md` thì HAL không boot |
+| 2 | `spike-hal.sh` | Tải component `hal` về `/opt/hal`, `uv sync --python 3.12 --extra hardware --extra reachy`, chạy uvicorn ở `127.0.0.1:5001` |
+| 3 | `spike-os.sh` | Tải binary `os-server` về `/usr/local/bin`, seed `/root/config/config.json` tối thiểu, chạy **dưới root với `WorkingDirectory=/root`** |
+| 4 | `spike-web.sh` | Cài nginx, tải bundle `web` về `/usr/share/nginx/html/setup`, viết vhost `reachy-spike` |
+| 5 | `spike-agent.sh` | Node.js tương thích (cài từ NodeSource 24.x khi cần) + `openclaw` đúng version OTA pin, seed `/root/.openclaw`, chạy gateway ở loopback `18789` |
+| 6 | `spike-bootstrap.sh` | Worker OTA: seed `/root/config/bootstrap.json`, cài `software-update` được `upload-device.sh` stage sẵn ở gốc device package (bản canonical `scripts/provision/software-update`) → `/usr/local/bin/software-update` (worker exec script này để áp update; thiếu nó thì mọi lần apply đều fail `executable file not found in $PATH` trong khi mọi unit vẫn báo healthy), poll feed mỗi `5m` |
+
+Trước khi cài OpenClaw, `spike-agent.sh` đọc `engines.node` từ npm của đúng
+phiên bản cần cài và kiểm tra toàn bộ dải semver bằng thư viện semver đi kèm npm.
+Node tương thích được giữ nguyên; nếu thiếu Node/npm thì cài từ NodeSource
+24.x, còn Node không tương thích sẽ được nâng cấp qua cùng kênh rồi kiểm tra
+lại. Ví dụ OpenClaw `2026.9.3` yêu cầu `>=24.16.0 <25 || >=26.1.0`, nên
+Node 22, Node 24 đời đầu và Node 25 đều không đạt.
+Metadata thiếu/không hợp lệ, lỗi bộ kiểm tra, hoặc Node vẫn không tương thích
+sau nâng cấp sẽ dừng installer trước khi cài OpenClaw hay khởi động gateway;
+kiểm tra apt pin và PATH nếu Node cũ vẫn được ưu tiên sau nâng cấp.
+
+`config.json` mà bước 3 seed **bắt buộc phải có `openclaw_config_dir`**. Key
+thiếu trong file KHÔNG rơi về giá trị `Default()` ở
+`system/server/config/config.go` — cả `Load` lẫn `ProvideConfig` đều unmarshal
+vào struct zero-value, nên thiếu key nghĩa là `""` chứ không phải
+`/root/.openclaw`. os-server tìm gateway token bằng
+`filepath.Join(OpenclawConfigDir, "openclaw.json")`; dir rỗng cho ra đường dẫn
+*tương đối* `openclaw.json` → `/root/openclaw.json`. File đó không bao giờ tồn
+tại: token không đọc được, websocket của agent reconnect 5s/lần vô hạn,
+`WaitForAgentReady` không bao giờ xong — và log không có lỗi nào, vì phép join
+trả về một path hợp lệ, chỉ là sai chỗ. Lỗi này chỉ lộ khi cài sạch hoàn toàn,
+do `config.json` bình thường vẫn sống sót qua uninstall.
+
+Thứ tự có lý do. `device` phải chạy trước vì mọi thứ khác đọc file nó cài.
+`bootstrap` để **cuối cùng**: nó có thể restart os-server và hal ngay khi thấy
+build mới hơn, làm việc đó giữa lúc đang cài dở biến một lượt bring-up sạch thành
+race.
+
+Mỗi bước cài một **systemd unit** (`hal`, `os-server`, `openclaw`, `bootstrap`),
+nên cả stack sống qua reboot. Không còn tmux.
+
+```bash
+sudo bash spike.sh                  # bring-up đầy đủ
+sudo bash spike.sh --no-deps        # bỏ `uv sync` của HAL (chạy lại nhanh)
+sudo bash spike.sh --skip agent     # bỏ một hoặc nhiều bước (lặp lại được)
+sudo bash spike.sh --stop           # dừng tất cả, thứ tự ngược
+sudo bash spike.sh --uninstall      # dừng + gỡ unit và artifact
+```
+
+Mọi script con đều nhận `--stop` và `--uninstall`. Cờ riêng: `spike-hal.sh
+--no-deps`, `spike-device.sh --keep-env` (giữ nguyên `/opt/hal/.env` đang có),
+`spike-bootstrap.sh --no-start` (cài và enable, không start).
+
+Nếu một bước cài đặt thất bại, `spike.sh` thoát với trạng thái lỗi và in các lệnh
+chạy lại từ bước đó đến các bước còn lại không bị `--skip`. Sau khi xử lý lỗi,
+chạy các lệnh này theo thứ tự và dừng nếu bất kỳ lệnh nào lỗi; không cần chạy
+lại các bước đã thành công. Các lệnh được in chỉ giữ `--no-deps` cho HAL, và
+script không tự chạy các bước tiếp theo sau lỗi.
+
+`spike-lib.sh` là thư viện dùng chung mà mọi script source vào — fetch metadata,
+`ota_unpack` / `ota_install_binary`, `write_unit` / `start_unit`, `wait_http`.
+Snapshot metadata cache ở `/tmp/.spike-ota-metadata.json`; `spike.sh` xoá nó ở
+đầu mỗi lượt rồi để sáu bước dùng chung **một** snapshot, nên một bản publish rơi
+vào giữa lượt không thể đẩy os-server và hal sang hai build lệch nhau. Chạy lại
+một script con lẻ thì cache không tự xoá — xoá tay hoặc mở shell mới.
+
+Các guard đáng nhớ:
+
+- `spike-os.sh` **từ chối cài** nếu `set_up_completed` chưa `true` **và**
+  `/usr/local/bin/device-ap-mode` tồn tại: bật os-server lúc boot khi đó sẽ gọi
+  `SwitchToAPMode()`, phá WiFi station và mất robot qua SSH.
+- `spike-hal.sh` đòi tối thiểu **4 GiB** trống trên `/` khi tạo môi trường mới,
+  hoặc **1 GiB** nếu `/opt/hal/.venv/bin/uvicorn` đã có quyền thực thi.
+  `--no-deps` bỏ qua kiểm tra dung lượng và đồng bộ dependency nhưng vẫn yêu cầu
+  executable này tồn tại.
+- `spike-agent.sh` kiểm tra riêng, yêu cầu **1.5 GiB** trống cho Node và OpenClaw.
+  Lỗi hiển thị dung lượng hiện có, yêu cầu và còn thiếu bằng MiB kèm số KiB chính
+  xác, tránh thông báo GB làm tròn gây hiểu nhầm.
+
+Qua kiểm tra HAL không bảo đảm đủ chỗ cho toàn bộ stack. Số ~1.8 GB trống sau
+cài đặt là quan sát trước đây, không phải bảo đảm cho image gốc hoặc package
+hiện tại; [issue #627](https://github.com/autonomous-ai/Physical-AI-Operating-System/issues/627)
+báo chỉ còn ~1.4 GB sau HAL. Các ngưỡng này giữ nguyên; bản sửa chưa đo dung lượng
+đỉnh khi cài trên Reachy hiện tại. HAL giữ cache uv trong `/opt/hal/.uv-cache`
+và vẫn chạy `uv cache prune` sau khi sync thành công. Bản sửa không thêm dọn dẹp
+tự động; kích thước cache được báo không bảo đảm lượng dung lượng có thể thu hồi.
+
+Vhost spike **không phải** vhost production — bản thật do
+`scripts/provision/setup.sh` viết vào `/etc/nginx/conf.d/<type>.conf`, bản spike
+nằm ở `/etc/nginx/sites-available/reachy-spike`. `/hw/` trong đó **chỉ loopback**
+(`allow 127.0.0.1; deny all`), giống production: trình duyệt chạm phần cứng qua
+proxy có auth `/api/hardware/*` của os-server, không bao giờ gọi thẳng HAL.
+
+`spike-agent.sh` cố tình lệch bản cài của Lamp hai chỗ: không chromium/xvfb (chỉ
+phục vụ skill computer-use — tiết kiệm ~600 MB trên eMMC 14 GB), và không seed
+skills (os-server tự sync + prune lúc boot). Version openclaw lấy từ
+`ota_field openclaw version` — component duy nhất trong feed không có `url` vì nó
+là package npm — rồi bỏ số 0 đệm (`2026.06.10` → `2026.6.10`) trước khi
+`npm install`, nếu không npm đọc spec như dist-tag và chết với "No matching
+version found". `OPENCLAW_VERSION=…` override được pin đó.
+
 ## Recon Máy Thật (đo ngày 2026-07-29)
 
 Các số liệu dưới đây đo trên con Wireless đầu tiên (`hardware_id
@@ -192,148 +362,6 @@ không đi dò `/dev/video*` cho node sẽ không bao giờ mở.
 đủ dài để làm nhoè vật thể chuyển động. Nâng idle rate hoặc chặn trần
 `--shutter` khi cần ảnh tĩnh nét hơn là cần tiết kiệm CPU.
 
-## Deploy: cài chồng, không bao giờ flash
-
-Reachy Mini ship kèm **OS Pollen** trên Pi, chứa daemon own serial bus, control
-loop, inverse kinematics và safety clamp. **Flash golden image = xoá daemon =
-cục gạch.** Autonomous luôn được cài chồng lên.
-
-Bộ script spike **chạy trên chính robot**, không chạy từ máy dev. Copy nguyên thư
-mục sang rồi gọi một lệnh:
-
-```bash
-scp -r robots/reachy-mini pollen@reachy-mini.local:~/
-ssh pollen@reachy-mini.local 'sudo bash ~/reachy-mini/spike.sh'
-```
-
-Không có gì được build ở máy dev. Mọi artifact tải từ **OTA metadata**
-(`https://cdn.autonomous.ai/os/ota/metadata.json`) — đúng nguồn mà
-`scripts/imager/build-orangepi.sh` và `scripts/provision/setup.sh` đọc, nên robot
-spike chạy đúng build cả fleet đang chạy, và bug tái hiện ở đây mới nói được điều
-gì đó về máy người khác. Đổi feed bằng `OTA_METADATA_URL=…` hoặc field
-`metadata_url` trong `/root/config/bootstrap.json`.
-
-Ký OTA là tuỳ chọn. Khi `/root/config/bootstrap.json` có
-`signing_public_key` Ed25519 base64 đã được pin, `install.sh`, các spike script
-và `software-update` sẽ xác thực envelope `signed` của feed và `sha256` của mỗi
-ZIP trước khi giải nén. Không có field này thì luồng metadata và tải legacy vẫn
-được giữ nguyên, nên robot đã provision trước đó vẫn update bình thường.
-Để fresh install có xác thực, truyền key vào one-liner, ví dụ
-`curl -fsSL …/install.sh | sudo env OTA_SIGNING_PUBLIC_KEY=… bash`; key được pin
-trong `bootstrap.json` trước khi bất kỳ component script OTA nào chạy.
-
-Trước khi thay `os-server` hoặc `bootstrap-server`, `software-update` giữ binary
-cũ tại `/root/bootstrap/rollback/`. Dùng `sudo software-update rollback
-os-server` (hoặc `bootstrap`) để khôi phục; version lỗi bị chặn tới khi feed có
-version khác.
-
-Web OTA cũng theo cùng model recovery. Nó stage và xác thực bundle mới trước khi
-thay `/usr/share/nginx/html/setup`, giữ bundle trước đó tại
-`/root/bootstrap/rollback/web.previous`, và ghi lại nginx có đang chạy hay không.
-Update yêu cầu có `index.html`, `nginx -t`, và `GET /` loopback khi nginx đang
-active; check lỗi sẽ tự khôi phục bundle known-good. Dùng
-`sudo software-update rollback web` khi operator cần rollback chủ động.
-
-Device-profile OTA stage package trước khi swap
-`/opt/devices/reachy-mini`, lưu profile trước đó và mọi rootfs target bị ảnh
-hưởng, sau đó phục hồi trạng thái service `os-server` và HAL cũ. Nó giữ file
-tuning local `/opt/hal/.env`. Profile mới phải có `ROBOT.md`; mỗi service trước
-đó active phải qua health endpoint loopback, nếu không profile known-good sẽ tự
-được phục hồi. Dùng `sudo software-update rollback device` để recovery thủ công.
-
-HAL OTA giữ toàn bộ runtime `/opt/hal` trước đó—`.env`, virtual environment và
-uv cache—tại `/root/bootstrap/rollback/hal.previous`. Runtime mới được giải nén
-và sync trong thư mục staging kề bên, chỉ sau đó mới swap vào vị trí chạy. HAL
-trở về trạng thái active/inactive trước đó và service đang active phải trả về
-`http://127.0.0.1:5001/health`. Mọi lỗi staging hoặc health sẽ tự phục hồi
-runtime known-good. Dùng `sudo software-update rollback hal` để recovery thủ công.
-
-Layout là **layout production**, không phải cây riêng cho spike:
-
-| Thành phần | Đường dẫn |
-|------------|-----------|
-| HAL | `/opt/hal` (venv `/opt/hal/.venv`, `.env` do device package ship) |
-| Device profile | `/opt/devices/reachy-mini` |
-| Binary Go | `/usr/local/bin/os-server`, `/usr/local/bin/bootstrap-server` |
-| Config | `/root/config/config.json`, `/root/config/bootstrap.json` |
-| Web bundle | `/usr/share/nginx/html/setup` |
-
-`spike.sh` cố ý chỉ là **orchestrator mỏng**: nó gọi lần lượt sáu script con và
-không làm lại việc của script nào. Bản trước đó chép lại logic của chúng, lệch
-nhau trong vòng một tuần, và kết cục là chạy os-server trên sai thư mục config
-trong khi mọi service vẫn báo healthy.
-
-| Bước | Script | Làm gì |
-|------|--------|--------|
-| 1 | `spike-device.sh` | Tải `devices.reachy-mini` từ OTA về `/opt/devices/reachy-mini` **và** đắp `rootfs/` của gói đó lên `/` — đây là nguồn của `/etc/asound.conf` và `/opt/hal/.env`. Thiếu `ROBOT.md` thì HAL không boot |
-| 2 | `spike-hal.sh` | Tải component `hal` về `/opt/hal`, `uv sync --python 3.12 --extra hardware --extra reachy`, chạy uvicorn ở `127.0.0.1:5001` |
-| 3 | `spike-os.sh` | Tải binary `os-server` về `/usr/local/bin`, seed `/root/config/config.json` tối thiểu, chạy **dưới root với `WorkingDirectory=/root`** |
-| 4 | `spike-web.sh` | Cài nginx, tải bundle `web` về `/usr/share/nginx/html/setup`, viết vhost `reachy-spike` |
-| 5 | `spike-agent.sh` | Cài Node.js 22 (NodeSource) + `openclaw` đúng version OTA pin, seed `/root/.openclaw`, chạy gateway ở loopback `18789` |
-| 6 | `spike-bootstrap.sh` | Worker OTA: seed `/root/config/bootstrap.json`, cài `software-update` được `upload-device.sh` stage sẵn ở gốc device package (bản canonical `scripts/provision/software-update`) → `/usr/local/bin/software-update` (worker exec script này để áp update; thiếu nó thì mọi lần apply đều fail `executable file not found in $PATH` trong khi mọi unit vẫn báo healthy), poll feed mỗi `5m` |
-
-`config.json` mà bước 3 seed **bắt buộc phải có `openclaw_config_dir`**. Key
-thiếu trong file KHÔNG rơi về giá trị `Default()` ở
-`system/server/config/config.go` — cả `Load` lẫn `ProvideConfig` đều unmarshal
-vào struct zero-value, nên thiếu key nghĩa là `""` chứ không phải
-`/root/.openclaw`. os-server tìm gateway token bằng
-`filepath.Join(OpenclawConfigDir, "openclaw.json")`; dir rỗng cho ra đường dẫn
-*tương đối* `openclaw.json` → `/root/openclaw.json`. File đó không bao giờ tồn
-tại: token không đọc được, websocket của agent reconnect 5s/lần vô hạn,
-`WaitForAgentReady` không bao giờ xong — và log không có lỗi nào, vì phép join
-trả về một path hợp lệ, chỉ là sai chỗ. Lỗi này chỉ lộ khi cài sạch hoàn toàn,
-do `config.json` bình thường vẫn sống sót qua uninstall.
-
-Thứ tự có lý do. `device` phải chạy trước vì mọi thứ khác đọc file nó cài.
-`bootstrap` để **cuối cùng**: nó có thể restart os-server và hal ngay khi thấy
-build mới hơn, làm việc đó giữa lúc đang cài dở biến một lượt bring-up sạch thành
-race.
-
-Mỗi bước cài một **systemd unit** (`hal`, `os-server`, `openclaw`, `bootstrap`),
-nên cả stack sống qua reboot. Không còn tmux.
-
-```bash
-sudo bash spike.sh                  # bring-up đầy đủ
-sudo bash spike.sh --no-deps        # bỏ `uv sync` của HAL (chạy lại nhanh)
-sudo bash spike.sh --skip agent     # bỏ một hoặc nhiều bước (lặp lại được)
-sudo bash spike.sh --stop           # dừng tất cả, thứ tự ngược
-sudo bash spike.sh --uninstall      # dừng + gỡ unit và artifact
-```
-
-Mọi script con đều nhận `--stop` và `--uninstall`. Cờ riêng: `spike-hal.sh
---no-deps`, `spike-device.sh --keep-env` (giữ nguyên `/opt/hal/.env` đang có),
-`spike-bootstrap.sh --no-start` (cài và enable, không start).
-
-`spike-lib.sh` là thư viện dùng chung mà mọi script source vào — fetch metadata,
-`ota_unpack` / `ota_install_binary`, `write_unit` / `start_unit`, `wait_http`.
-Snapshot metadata cache ở `/tmp/.spike-ota-metadata.json`; `spike.sh` xoá nó ở
-đầu mỗi lượt rồi để sáu bước dùng chung **một** snapshot, nên một bản publish rơi
-vào giữa lượt không thể đẩy os-server và hal sang hai build lệch nhau. Chạy lại
-một script con lẻ thì cache không tự xoá — xoá tay hoặc mở shell mới.
-
-Hai guard đáng nhớ:
-
-- `spike-os.sh` **từ chối cài** nếu `set_up_completed` chưa `true` **và**
-  `/usr/local/bin/device-ap-mode` tồn tại: bật os-server lúc boot khi đó sẽ gọi
-  `SwitchToAPMode()`, phá WiFi station và mất robot qua SSH.
-- `spike-hal.sh` đòi tối thiểu **4 GB** trống trên `/` trước khi `uv sync` (venv
-  ~2 GB, cache uv chừng đó nữa, trên eMMC 14 GB đã đầy ~60%). Với `--no-deps` thì
-  bỏ qua kiểm tra này.
-
-Vhost spike **không phải** vhost production — bản thật do
-`scripts/provision/setup.sh` viết vào `/etc/nginx/conf.d/<type>.conf`, bản spike
-nằm ở `/etc/nginx/sites-available/reachy-spike`. `/hw/` trong đó **chỉ loopback**
-(`allow 127.0.0.1; deny all`), giống production: trình duyệt chạm phần cứng qua
-proxy có auth `/api/hardware/*` của os-server, không bao giờ gọi thẳng HAL.
-
-`spike-agent.sh` cố tình lệch bản cài của Lamp hai chỗ: không chromium/xvfb (chỉ
-phục vụ skill computer-use — tiết kiệm ~600 MB trên eMMC 14 GB), và không seed
-skills (os-server tự sync + prune lúc boot). Version openclaw lấy từ
-`ota_field openclaw version` — component duy nhất trong feed không có `url` vì nó
-là package npm — rồi bỏ số 0 đệm (`2026.06.10` → `2026.6.10`) trước khi
-`npm install`, nếu không npm đọc spec như dist-tag và chết với "No matching
-version found". `OPENCLAW_VERSION=…` override được pin đó.
-
 ## Motion Driver
 
 Reachy chọn motion backend của HAL qua:
@@ -372,6 +400,28 @@ Joint keys của Reachy trong HAL dùng độ/mm, dù SDK dùng radian/mét:
 - chuyển động: `/servo/move`, `/servo/aim`, `/servo/nudge`
 - recovery/mode: `/servo/zero`, `/servo/hold`, `/servo/release`, `/servo/resume`
 - expression moves: `/servo/play` khi recorded-move library của Reachy sẵn sàng
+
+### Emotion → HF Move Mapping
+
+Tên emotion của HAL (CSV stem trên Lamp) được map sang HF move của Pollen trong
+`_MOVE_MAP` (reachy\_service.py). Map dùng hằng số preset từ `hal/presets.py` và
+nhắm tới các move trong
+[pollen-robotics/reachy-mini-emotions-library](https://huggingface.co/datasets/pollen-robotics/reachy-mini-emotions-library)
+(85 move). Ví dụ:
+
+| HAL emotion | HF move |
+|-------------|---------|
+| `curious` | `curious1` |
+| `happy_wiggle` | `cheerful1` |
+| `sad` | `sad1` |
+| `greeting` | `welcoming1` |
+| `nod` | `yes1` |
+| `headshake` | `no1` |
+| `music_groove` | `dance1` |
+
+Tên chưa map sẽ được thử nguyên văn (caller có thể gửi thẳng tên HF). 8 style
+nhạc được chia cho 3 dance move của Pollen. Test bảo vệ việc phủ đủ preset và
+kiểm tra mọi giá trị trong map có trong thư viện HF.
 
 `GET /servo` trả `available_recordings` cùng vốn từ với field `current`: move đã
 map thì liệt kê theo tên HAL (`music_groove`, không phải `dance1`), phần còn lại

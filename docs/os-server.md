@@ -1,5 +1,54 @@
 # OS Server API — Documentation
 
+Opening feedback is one short acknowledgment sound: English "Uhm.", Vietnamese
+"Ừm.", Japanese "うん。", and Simplified/Traditional Chinese "嗯。". Ordinary
+main-agent voice turns request it immediately before forwarding; delegated turns
+skip it. Continuation fillers use one short thinking sound (English "Hmm...",
+Vietnamese "Ừm...") and wait 3.5 seconds after turn start (after the first tool starts for delegated
+turns). Tool-end rearming adds any remaining 2.5-second cooldown to that delay.
+This timer does not delay opening feedback. Each turn permits at most one automatic continuation; later tool calls do not trigger more.
+The previous opening and continuation phrase pools have been removed. Automatic
+waiting fillers do not select tool-specific phrases. Explicit realtime/tool cues
+are unchanged.
+
+For Standard and Pro lamp Automatic follow-ups, HAL may send optional sensing metadata
+`suppress_auto_fillers: true`. OS skips opening feedback and scheduled automatic
+continuation fillers for that run, including delegated resumes; it retains this
+policy for a bounded 4096 runs. Actual replies and tool execution are
+unaffected. Explicit action cues (`SayInVoiceRun`, e.g. the `/api/vision/look`
+"Taking a look." / "Got it — give me a sec.") still play: a suppressed turn gets
+a cue-only record when it starts, which never arms automatic fillers, stays quiet
+while the reply streams, and ends with the turn. HAL sets the policy from wake-window state at capture
+start, not from whether the final transcript contains a wake phrase. See
+[opening-only automatic fillers](realtime-voice.md#opening-only-automatic-fillers-on-standard-and-pro-lamps).
+
+Named internal-tool pools use a single short cue per language. Search/read/media
+cues describe an action shared by their aliases; broad or mixed-action pools
+(`exec`, `process`, `memory_store`, `apply_patch`, `session_status`, `update_plan`,
+`pdf`, `canvas`, `nodes`, `subagents`) use a neutral thinking sound rather than
+claiming a specific action or success. Video cues say "Processing video" because
+the pool also covers editing. Camera `look_*` and movement-demo `demo_*` phrases
+are unchanged. These content changes do not re-enable automatic tool overrides
+or change filler scheduling.
+
+`GET /api/system/ota-updating` returns `updating`, persisted per-component `progress`, and `bootstrap_available`. It remains readable from local snapshots when bootstrap is unavailable; see [update progress](bootstrap-ota.md#update-progress-snapshots). Progress may include optional `activity_at` (Unix seconds) for recognized HAL dependency installation activity; older snapshots without it remain valid.
+
+## Japanese language support
+
+`stt_language: "ja"` selects Japanese. Japanese regional aliases such as `ja-JP`
+and `ja_JP` resolve to the same localized phrase pools. OS-server includes Japanese
+system notices, greetings, device-name prompts, chitchat and filler phrases; the
+agent receives Japanese language context. The ElevenLabs default for Japanese is
+`Shizuka`, with six native Japanese voices available in the shared voice catalog.
+Local Japanese chitchat requires a complete phrase after punctuation and wake-word
+normalization; questions such as `何している？` continue to the agent. If HAL cannot
+list voices, the ElevenLabs fallback still filters by the requested language,
+using Rachel for English and Shizuka for Japanese. An empty language returns all
+42 curated voices; unknown languages use the English pool.
+See [Japanese voice selection](realtime-voice.md#japanese-language-and-elevenlabs-voices).
+
+Ambient LED restoration delegates to HAL `/led/restore` after the quiet window. OS does not choose a fallback color or breathing effect; each device declares `ambient_led.resting` in `presets.json`. HAL preserves explicit user off/color and active overlay ownership.
+
 > OS Server (Go, Gin framework) runs on port 5000.
 
 ## OS Server Endpoints (Go, :5000)
@@ -9,7 +58,7 @@
 | Method | Endpoint | Description |
 |--------|----------|-------------|
 | GET | `/api/health/live` | Liveness probe |
-| GET | `/api/health/readiness` | Readiness probe (agent gateway connected?) |
+| GET | `/api/health/readiness` | Readiness probe — currently always `200 "OK"` (does not check the agent gateway) |
 
 ### System
 
@@ -21,6 +70,10 @@
 | GET | `/api/system/ota-security` | OTA trust posture from the bootstrap worker: `legacy` vs `verified`, pinned key fingerprint, last metadata fetch (see `bootstrap-ota.md`) |
 | POST | `/api/system/reboot` | Admin-gated: acknowledge, then ask HAL to announce and reboot the OS |
 | POST | `/api/system/shutdown` | Admin-gated: acknowledge, then ask HAL to announce, release servos, and shut down the OS |
+| POST | `/api/system/software-update/:target` | Admin-gated: install the published version of one component now via bootstrap `POST 127.0.0.1:8080/force-update/<target>` (`agent` resolves to the configured runtime's key). Rate-limited per target |
+| POST | `/api/system/factory-reset` | Admin or loopback: soft factory reset (wipe config/keys/enrollments/WiFi creds/connector credentials, reset the active agent backend) then reboot into AP setup. `202`; `409` if already running, `429` inside the cooldown |
+| POST | `/api/system/exec` | Loopback-only: run `{cmd}` with `sh -c` (30 s timeout), returns `{stdout, stderr, exit_code}` |
+| GET | `/api/system/shell` | Admin-gated WebSocket: `/bin/bash` PTY for the web xterm.js terminal |
 | POST | `/api/system/restart/:target` | Admin-gated service restart for `hal` or `os-server` only. Returns `202` with `{target, scheduled: true}` after systemd accepts the restart timer; unsupported targets return `400`, scheduling failures return `500`. |
 
 Service restart uses `systemd-run --collect --on-active=2s systemctl restart <target>`
@@ -148,6 +201,17 @@ for defaults, validation, payloads and use cases.
 |--------|----------|-------------|
 | POST | `/api/device/setup` | Configure WiFi + LLM + channel + MQTT (async, returns immediately) |
 | POST | `/api/device/channel` | Change messaging channel |
+| GET / PUT | `/api/device/config` | Admin-gated. GET returns the device config with secrets reduced to `Has*` booleans; PUT updates individual fields (saved to disk) |
+| GET / POST | `/api/device/agent-runtime` | Admin-gated. GET: `{current, options, ready, …}`; POST switches the agentic backend (`409` while another switch runs; see Device Ops Alerts below) |
+| GET / POST | `/api/device/mcp-tools` | Admin-gated: list / add remote MCP tool endpoints |
+| DELETE | `/api/device/mcp-tools/:name` | Admin-gated: remove a remote MCP tool (removing `fo` also signs out of Wajo) |
+| GET | `/api/device/fo/status` | Admin-gated: `{connected, needs_reconnect}`. `needs_reconnect` is true when tool `fo` exists but Wajo rejected the refresh token (a 4xx from its token endpoint clears the stored tokens; 5xx and network errors keep them and retry on the next call) |
+| POST | `/api/device/fo/connect` | Admin-gated: register with Wajo once (dynamic client registration) and return `{auth_url}`, the PKCE sign-in URL for Fo |
+| POST | `/api/device/fo/connect/finish` | Admin-gated: body `{callback_url}`, the `http://localhost:5000/oauth/fo/callback?code=…` URL the browser landed on (it fails to load; Wajo only accepts https or loopback redirects). Exchanges the code, stores tokens in `fo_auth`, and adds MCP tool `fo` pointing at `/api/fo-mcp`. When `fo` already exists (Reconnect) it only replaces the tokens: the MCP entry is not rewritten, so the runtime does not restart |
+| ANY | `/api/fo-mcp` | Local proxy the agent calls for Fo. Guarded by the `X-Fo-Proxy-Key` header (in the `tool_fo` MCP entry), not admin auth. Adds a live Wajo bearer token, refreshing it within 5 min of expiry and storing the rotated refresh token, so the MCP entry is never rewritten and the runtime never restarts on refresh |
+| POST | `/api/device/connectors/pat` | Admin-gated: save a static-credential (PAT) connector through the same writer as MQTT `connector.set.<code>` |
+| GET / DELETE | `/api/device/connectors/:code` | Admin-gated: connected state + non-secret identity fields (credential keys that hold a secret, such as a client secret or token, are never returned) / remove the connector |
+| GET / PUT / DELETE | `/api/device/connectors/shopify` | Admin-gated: the Shopify connection, linked with the customer's own Shopify app. GET returns `{connected, shop, client_id, has_secret, scopes, obtained_at}` (never the secret or a token). PUT takes `{shop, client_id, client_secret}`, normalizes the store domain to `<handle>.myshopify.com`, checks the values once with a client-credentials token request sent only to that store host (no redirects followed, short timeout, 64 KB response cap), then saves them through the same writer as MQTT `connector.set.shopify` and reports the connected status upstream (never the secret). A rejected check returns 400, an unreachable store 502. DELETE removes the entry and the skill helper's cached token (`shopify.token.json`) |
 
 ### Device Timezone
 
@@ -188,8 +252,11 @@ Config field: `timezone` in `config/config.json` (IANA zone string, omitempty) �
 
 **Connectivity monitor** (`system/network/service.go` and `recovery.go`, active
 when `SetUpCompleted` is true). Internet checks run on a 5s monitor tick; 5
-consecutive failed pings to `8.8.8.8` raise the `Connectivity` LED state, and a
-successful ping clears it. Internet status is separate from WiFi recovery:
+consecutive failed checks raise the `Connectivity` LED state, and a successful
+one clears it. A check is a ping to `8.8.8.8`, falling back to a TLS handshake
+with the device's cloud API host when ICMP fails, so networks that drop ICMP are
+not reported offline. The monitor page's Overview uses the same fallback
+(`CheckInternetRTT`), showing no ping time when only TLS got through. Internet status is separate from WiFi recovery:
 association and a usable station IPv4 address keep WiFi active even without
 Internet. The monitor no longer reboots the device.
 
@@ -242,7 +309,7 @@ Config field: `guard_mode` in `config/config.json` (bool, default `false`). The 
 | POST | `/api/mood/log` | Log user mood (called by agent via Mood skill) |
 | POST | `/api/monitor/event` | Push an event directly to the monitor bus (used by HAL for sound tracker state) |
 
-> **Note:** Stranger visit tracking (stats, persistence) is handled by **HAL** (port 5001) at `GET /face/stranger-stats`. See [sensing-behavior.md](../robots/lamp/docs/sensing-behavior.md#stranger-visit-tracking) for details.
+> **Note:** Stranger visit tracking (stats, persistence) is handled by **HAL** (port 5001) at `GET /face/stranger-stats`. `DELETE /face/strangers` (all) and `DELETE /face/strangers/{stranger_id}` (one) forget unknown faces (embeddings, visit stats and snapshots together); strangers not seen for 30 days (`HAL_FACE_STRANGER_RETENTION_S`) are forgotten automatically. See [sensing-behavior.md](../robots/lamp/docs/sensing-behavior.md#stranger-visit-tracking) for details.
 
 **Request body:**
 ```json
@@ -268,12 +335,14 @@ Config field: `guard_mode` in `config/config.json` (bool, default `false`). The 
 | `presence.away` | PresenceService (15 min without motion or voice/touch activity) | No | No one around for 15+ min — device going to sleep |
 | `motion.activity` | MotionPerception (while PRESENT) | No | Activity detected while user is present — emotional actions logged via Mood skill |
 
+**Source marker (`[via:…]`):** every message os-server sends the agent ends with one line naming its origin, so a turn's origin stays readable after it leaves the device, even though a voice command, a monitor chat and a phone chat all reach the model as `[user] <text>`. `sensingmsg.Build` stamps sensing turns from `sensingmsg.TurnSource`: `[via:web]` (`web_chat`), `[via:mobile]` (`mqtt_chat`), `[via:voice]` (`voice_command` / `voice_followup`), `[via:voice_ambient]` (`voice`), `[via:voice_handoff]` (a `[voice-instruction]` turn from the realtime voice agent), `[via:voice_history]` (`voice_agent_handled`), `[via:sensing]` (everything else). Other senders stamp their own: `[via:schedule]` (schedule runner), `[via:system]` (wake greeting, skill updates, rename), `[via:slack]` (Hermes Slack relay), `[via:voice_history]` / `[via:external]` (external history copies). The line is appended after the text, so the leading `[user]` / `[sensing:…]` prefixes skills key on are unchanged; slash commands are left verbatim. Device calls that are not agent turns (realtime summarizer `voice_summary`, Harness announcer `harness_announce`, outcome classifier `voice_outcome`, vision describe `vision`) send the same value as an `X-Auto-Source` header instead. Helpers: `domain.AppendVia` / `domain.ViaMarker`. Telegram/Discord messages that Hermes receives directly never pass through os-server and carry no marker.
+
 **Processing flow:**
 1. `voice_command`, `voice_followup`, or `voice` + local intent enabled → match local rules → execute directly (~50ms); unmatched requests may use the Jev fallback described below before reaching the main runtime. `voice_followup` has the same user priority as `voice_command`; Text-only `web_chat` / `mqtt_chat` also try local rules and Jev, without TTS. Requests with images or files retain the agent path. Local replies return `handler: "local"`, `response`, `handledLocally: "true"`, and `localRunId` (no agent `runId`); web chat renders the immediate reply, while MQTT uses `localRunId` for its acknowledgement and final `chat.event`.
 2. Ambient turn floor: `motion.activity`, `emotion.detected`, `speech_emotion.detected`, `sound`, `presence.away`, `light.level` are dropped when the last agent turn created by this handler (any type) was less than `sensing_turn_floor_s` seconds ago (config key, default `120`, `0` disables; guard mode bypasses). One cross-type floor on top of HAL's independent per-type gates — a burst of different event types costs at most one agent turn per window. Dropped events surface as `sensing_drop` (reason `ambient_floor`) in the Flow Monitor.
 3. No match → forward to OpenClaw via WebSocket `chat.send`
 4. If event has `images` → call `SendChatMessageWithImages` → send every attached photo with the text for AI vision analysis. A LIST, not a single field: a chat client can attach several at once and every wire format behind the gateway already carries `attachments[]`; a camera event simply sends one entry. For chat types (`web_chat` / `mqtt_chat`), each image is saved to `/tmp/web-chat-<ms>-<i>.jpg` (indexed so photos attached to the SAME turn cannot collide) and tagged `[image: <path>]` so the agent can reference it (e.g. for face enrollment). When the main model is text-only, the describe-first gate runs once PER image, **concurrently** (`safego`), and the descriptions are numbered `(image N of M)`. Concurrency is not an optimisation here: the gate runs inside the HTTP handler, so the caller's POST does not return until every describe finishes — a single describe measured 8-38 s, so two photos in series left the web chat silent for ~53 s, long enough that reloading the page (which cancels the request and loses the turn) is the natural move. Fanning out makes the wait the slowest image instead of their sum.
-5. The describe-first gate above covers only images entering a turn from OUTSIDE (chat/Telegram attachment, HAL's realtime look-frame handoff). A frame the agent captures MID-TURN with `/camera/snapshot` never passes through it — the shell tool returns only `{"path": ...}`, which a text-only main model cannot see. For that path the `camera` skill calls `POST /api/vision/look` (loopback-only, `system/server/vision.go`) instead of HAL directly: os-server takes the snapshot itself (`hal.Snapshot`, 768px/q75 fixed server-side) and returns `{"path": ..., "description": ...}`. The vision-capability branch lives here, not in the skill — when `vision.ModelSupportsVision` says the main model reads images itself, describe is SKIPPED entirely (no vision-model call, no 8-38s wait) and only `path` comes back for the agent to open. Describe failure returns 502 so the agent admits it could not see instead of guessing
+5. The describe-first gate above covers only images entering a turn from OUTSIDE (chat/Telegram attachment, HAL's realtime look-frame handoff). A frame the agent captures MID-TURN with `/camera/snapshot` never passes through it — the shell tool returns only `{"path": ...}`, which a text-only main model cannot see. For that path the `camera` skill calls `POST /api/vision/look` (loopback-only, `system/server/vision.go`) instead of HAL directly: os-server takes the snapshot itself (`hal.Snapshot`, 768px/q75 fixed server-side) and returns `{"path": ..., "description": ...}`. The description is a 1-3 sentence answer to `question` from the vision model with thinking disabled (~3 s on the lamp instead of 15-40 s). `"read_text": true` (the skill sets it only when the user asks to read text, a label, a sign or a brand) takes a 1280px frame and leaves thinking on: slower, but the model says small text is unreadable instead of inventing it. A look makes a single attempt so the agent can say it could not see rather than go silent for 80 s: 30 s for a plain look, 45 s for a `read_text` look (attached-image describe keeps 45 s + 35 s). A retry would be as slow as the first try when the gateway is slow. The vision-capability branch lives here, not in the skill — when `vision.ModelSupportsVision` says the main model reads images itself, describe is SKIPPED entirely (no vision-model call) and only `path` comes back for the agent to open. Describe failure returns 502 so the agent admits it could not see instead of guessing; the error message starts with an instruction to say so and stop, without another snapshot or `vision_analyze` (same vision model). A rule in the camera skill alone did not stop the agent from re-snapshotting into `vision_analyze` (112.8 s to the reply on lamp-52e6 with a forced failure, 11 s with the instruction in the error). On a voice turn the endpoint also speaks two cached cues through `FillerManager.SayInVoiceRun` (pools `look_capturing_main` before the photo — the shutter waits up to 2.5 s for it to finish — and `look_analyzing` after it, e.g. "Taking a look." / "Got it — give me a sec."); each cue pushes back that turn's dead-air filler by its cooldown and does not count toward `MaxFillersPerTurn`. Around the cue and the photo the endpoint holds the body still: it claims HAL's internal `look` hold (`POST /servo/hold/claim {"owner":"look"}`) before the first cue, and releases it (`POST /servo/hold/release`) after the second cue, or right after a failed snapshot, so idle resumes while the photo is described. The hold adds no request field: for "turn left and tell me what you see" the agent aims first (`camera` / `servo-control` skills), in the same bash call. Releasing `look` never drops a user's explicit hold. An older HAL without these routes returns 404, and the look runs unheld, as before. Non-voice turns (Telegram, web chat, cron) stay silent. The realtime `look` tool captures inside HAL and is unaffected.
 6. Chat runs (`web_chat` / `mqtt_chat`) are tagged via `MarkWebChatRun(runID)` so the SSE handler suppresses TTS at lifecycle end — reply is rendered in the chat UI only (web SSE, or MQTT `chat.event` stream).
 
 ### Unknown-speaker enrollment routing
@@ -286,10 +355,74 @@ An `Unknown Speaker:` label is identity metadata, not a prerequisite for answeri
 |--------|----------|-------------|
 | GET | `/api/agent/status` | WS connection status; includes `uptime` (OS server WS uptime) and `agentUptime` (OpenClaw process uptime, survives OS server restarts) |
 | GET | `/api/agent/events` | SSE stream real-time events |
-| GET | `/api/agent/recent` | 100 most recent events (ring buffer) |
+| GET | `/api/agent/recent` | Last 500 flow events read from today's JSONL (`local/flow_events_<date>.jsonl`) |
 | POST | `/api/agent/speech/cancel` | Physical cancel gesture (single click, called by HAL — loopback-only auth so the button works without a login). Silences every turn currently in flight and stops HAL playback (`StopTTS`, which also clears the pre-synthesised speak-queue). The turns are **not** aborted: they keep running, their tools still fire, and their text still reaches web chat and history — they only lose the speaker. Implemented as a monotone unix-ms watermark (`speechWatermarkMs`): `deliverTTS` drops any reply whose turn was created at or before the mark and logs a `tts_cancelled` flow event. Turn age comes from the runID — device ids end in their creation stamp (`device-chat-7-<unix-ms>`, 13 digits), channel ids (`tg-<messageID>`) have none and fall back to the first time speech was requested for that run. Because new turns are always on the far side of the mark, the user can click and immediately speak again while an older backlog drains silently; the watermark never needs clearing. The same mark also drops the turn's `[HW:]` markers in `fireHWCall` — servos and LEDs stop too, since a device that keeps moving after being told to stop reads as ignoring the user. The run id is put through `resolveRunID` first: the TTS path already holds the device id while HW dispatch may still carry the raw backend UUID for the same turn, and judging them separately muted the reply while the markers fired anyway. `/dm`, `/broadcast` and `/speak` are exempt (the gate sits after them): the click means "stop talking to me" and must not swallow a reply addressed to a Telegram user. A **second** watermark (`autoSpeechWatermarkMs`) works the same way but is stamped by the system: it moves forward whenever HAL reports `voice_agent_handled` — the realtime voice agent has answered a newer utterance out loud — so the main-agent turn still working on the question before it loses the speaker instead of answering it afterwards in a different voice. `deliverTTS` drops a reply older than **either** mark; `fireHWCall` consults **only** the click mark, since a machine judgement must not silently cancel an action the user did ask for. Opt-in per body: set `OS_REALTIME_SUPERSEDES_MAIN_REPLY=1` in the body's `/opt/hal/.env`. Default OFF, so a body that has never heard of the switch is unaffected. The click also calls `FillerManager.CancelAllActive()`. Fillers speak straight to HAL and never pass through `deliverTTS`, so the watermark alone cannot reach them — and because a muted turn keeps running, every tool boundary it crossed re-armed another "one moment" for a reply the user had just cancelled. Every run holding filler state at that instant is on the old side of the mark, so all of them are dropped; the Opening filler for whatever the user says next is armed afterwards and is unaffected. A dropped reply is still posted to HAL's `POST /voice/realtime/history`: the click takes the speaker, not the answer, and the realtime agent's record of what the main agent replied otherwise rides on TTS completion (see `docs/realtime-voice.md`). |
 | POST | `/api/agent/restart` | "Start + enable + restart" recovery for the active runtime. Steps: (1) best-effort `systemctl enable <unit>` — where `<unit>` is picked from a runtime→unit map (`openclaw`, `hermes-gateway`, `picoclaw`, `codex`, `claudecode`, `opencode`) — so the fix survives a reboot; (2) `agentGateway.RestartAgent()` which resolves to `systemctl restart <unit>` and thus STARTS the service even if it was stopped. Response `{backend, enabled}`. Used by the Overview's Agent Gateway card to recover a gateway that was stopped+disabled, without SSH. Internal restart callers (config refresh, migration) still bypass the enable step. |
 | POST | `/api/agent/memory/reset` | Admin. No-SSH recovery for self-poisoned memory (#421): for **every** installed runtime, copies `USER.md`, `MEMORY.md`, `KNOWLEDGE.md` and `realtime/{summary.md,device_summary.md,memory.jsonl,memory_raw.jsonl}` into `<workspace>/.memory-reset-<stamp>-<rand>/`, resets `USER.md` to the blank form (emptied for Hermes) and removes the rest, then re-runs onboarding so `KNOWLEDGE.md` is re-seeded. Returns `{backup_dirs, cleared, skipped}`. Files only — session history (OpenClaw sessions, Hermes `state.db`) is untouched; follow with `/new`. Emits a `memory_reset` flow event. |
+
+
+### Auth
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| POST | `/api/login` | `{password}` → bcrypt-verifies `admin_password_hash` and sets the signed session cookie; `401` on any failure |
+| POST | `/api/logout` | Clears the session cookie |
+| POST | `/api/login/exchange` | Admin-gated (Bearer): mints a session cookie on the current origin (AP → `.local` post-setup redirect) |
+
+### Schedules
+
+Admin-gated. Create/update/delete do not write `schedules.json` directly: each queues a proposal the backend must confirm (MQTT `schedule.mutate` / `schedule.mutate.ack`, see `mqtt.md`).
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| GET | `/api/schedule/list` | Schedules from `schedules.json` plus the store timezone |
+| POST | `/api/schedule/:id/run` | Run one schedule now (same path as MQTT `schedule.run`; cadence untouched) |
+| POST | `/api/schedule` | Propose a new schedule |
+| PATCH | `/api/schedule/:id` | Propose an update |
+| DELETE | `/api/schedule/:id` | Propose a delete |
+
+### Plugins
+
+Admin-gated. `GET /api/plugin/browse` is parked (commented out in `system/server/server.go`).
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| POST | `/api/plugin/install` | Clone a plugin from a git URL, set up its venv and systemd unit (async; poll the list) |
+| GET | `/api/plugin` | Installed plugins |
+| POST | `/api/plugin/:name/start` · `/api/plugin/:name/stop` | Start / stop a plugin |
+| DELETE | `/api/plugin/:name` | Uninstall a plugin |
+
+### Buddy
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| POST | `/api/buddy/pair/start` | Admin-gated: issue a fresh 6-digit pairing code |
+| POST | `/api/buddy/pair/confirm` | Anonymous (the code is the credential): exchange a valid code for a long-lived token |
+| GET | `/api/buddy/status` | Admin-gated: pairing + connection state |
+| DELETE | `/api/buddy` | Admin-gated: revoke the pairing |
+| DELETE | `/api/buddy/self` | Buddy's own Bearer token: unpair from inside the app |
+| GET | `/api/buddy/ws` | Buddy WebSocket (Bearer token validated against `buddies.json`) |
+| POST | `/api/buddy/command` · `observe` · `suggest` · `exec/:action` | Loopback-only (agent skills / `[HW:]` markers) |
+
+### Harness (pairing and status)
+
+See [Harness integration](harness.md) for payloads. Voice-mode, request, select-agent and results routes are described elsewhere in this doc.
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| GET | `/api/harness/status` | Admin or loopback: connection/pairing status (pairing code stripped) |
+| GET | `/api/harness/pair/status` | Admin-gated: pairing status |
+| POST | `/api/harness/pair` | Admin-gated: start pairing (`202`; `409` on conflict) |
+| POST | `/api/harness/pair/cancel` | Admin-gated: cancel pairing |
+| DELETE | `/api/harness` | Admin-gated: unpair (also turns Harness-only voice off) |
+| GET | `/api/harness/ws` | Harness WebSocket |
+| GET | `/api/harness/voice-followup` | Loopback-only: `{active}` — true for 2 minutes after a Harness reply/result, so a short spoken clarification stays with the paired agent |
+
+### Misc
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| GET | `/openapi.json` | Admin-gated proxy of HAL's OpenAPI spec (for the HAL Swagger UI at `/api/hardware/docs`) |
 
 ---
 
@@ -312,7 +445,7 @@ action outcome below.
 
 | Event | Trigger |
 |-------|---------|
-| Runtime switch | `hermes.setup` / `picoclaw.setup` (starting / success / failure) |
+| Runtime switch | any `<runtime>.setup` — `openclaw`, `hermes`, `picoclaw`, `claudecode`, `codex`, `opencode` (starting / success / failure) |
 | Channel add / refresh | `add_channel`, `channel.refresh_config` (success / failure) |
 | Connector set / remove | `connector.set.*`, `connector.remove.*` (success / failure) |
 | OAuth refresh | refresh loop — alerted only on ok↔fail state change per provider |
@@ -320,6 +453,7 @@ action outcome below.
 | Device soft reset | `device.soft_reset` |
 | Claude Code login / WhatsApp pair | terminal pairing outcome (paired / failure / timeout) |
 | Default model swap | model sync — only when the version-gated primary/image model actually changes |
+| Software update (remote) | MQTT `system.software_update` — started (with `<current> → <published>`), done (installed version + duration), failed or rejected (reason) |
 
 Runtime switches are exclusive. While a backend install or switch is running,
 another `POST /api/device/agent-runtime` receives `409 Conflict` rather than
@@ -360,7 +494,7 @@ Passive sensing also consults HAL rather than assuming a fresh Go process is
 awake; ambient output checks HAL before resuming idle movements or speech.
 
 Once the greeting is sent, os-server calls HAL `POST /voice/wake-focus?source=boot_greeting`
-to open the wake-word follow-up window (`HAL_WAKEWORD_FOLLOWUP_TIMEOUT_S`), so the
+to open the wake-word follow-up window (`wake_followup_s`, else `HAL_WAKEWORD_FOLLOWUP_TIMEOUT_S`), so the
 user can answer the greeting without a wake phrase. HAL no-ops when wake word is
 off or the follow-up timeout is 0.
 
@@ -389,6 +523,10 @@ Accessed via nginx proxy: `/hw/*` → `127.0.0.1:5001`
 | POST | `/servo/track/stop` | Stop current tracking session |
 | GET | `/servo/track` | Get tracking status (active, target, bbox, confidence) |
 | POST | `/servo/track/update` | Re-initialize tracker with new bounding box |
+
+`/servo/move`, `/servo/aim`, `/servo/nudge`, `/servo/resume`, and `/servo/track` return HTTP 409 while sleeping, without starting motion or waking the device. `/servo/play` retains its `ignored` response. Movement limits remain driver-specific.
+
+Move responses separate `requested` from `actual` readback. `clamped` is `null` unless SAFETY.md `motion.max_cog_offset_mm` cut the move short (the pose would have leaned the lamp back too far); then it holds the target actually sent. `/servo/nudge` is cut the same way. Aim/nudge return command targets in `requested` and observed readback in `positions`. These values come from the driver, not proof the target was reached: some drivers move asynchronously, and Reachy can return its cached target when a hardware read fails. Readback failures exposed by the driver populate `errors.read_position` and leave observations partial or empty; they do not repeat the command. Clients must tolerate `clamped: null` and use readback for observed positions.
 
 ### LED (64 WS2812, 8x5 grid)
 
@@ -458,6 +596,9 @@ Requires sensing with camera (InsightFace). Enrolled person JPEGs persist under 
 | GET | `/face/owners` | `enrolled_count`, `persons[]` with photos, voice samples, Telegram identity and per-user log days (mood / wellbeing / music-suggestions / posture / audio_history). A folder is a person only if it holds a face photo, a voice sample or `metadata.json`; log-only folders are skipped. The shared `unknown/` bucket is listed (so its logs are browsable) but not counted in `enrolled_count`. |
 | POST | `/face/remove` | Body: `label` — remove one person (404 if unknown) |
 | POST | `/face/reset` | Clear all enrolled persons and photos on disk |
+| GET | `/face/stranger-stats` | Visit stats per unknown face: `count`, `first_seen`, `last_seen` |
+| DELETE | `/face/strangers` | Forget every unknown face (embeddings, visit stats, snapshots); returns `forgotten[]` |
+| DELETE | `/face/strangers/{stranger_id}` | Forget one unknown face — 400 if not `stranger_<n>`, 404 if it has no visit stats |
 
 ### User (per-user data)
 
@@ -630,7 +771,8 @@ they were sold with.
 `autonomous_defaults` is a top-level object in `config.json` holding
 `base_url` / `api_key` / `model`. It is written **once**, by
 `captureAutonomousDefaults`, immediately before the first save that carries any
-credential — LLM, TTS, STT, or realtime key/URL — and never written again.
+credential — LLM, TTS, STT, or realtime key/URL — or an explicit LLM ownership
+choice, and never written again.
 Capturing twice would store the operator's own key under the Autonomous name
 and lose the real one for good, which is the exact failure it exists to prevent.
 A save touching nothing credential-shaped (wifi, rename, channels) does not
@@ -804,7 +946,7 @@ make web-dev      # web UI on :5173 (optional)
 ```
 
 os-server serves no HTML: on a board nginx serves `web/dist` and proxies `/api`
-and `/hw` to it. `make web-dev` puts Vite in nginx's place, with `LAMP_PROXY`
+to it (and `/hw/` to HAL on `127.0.0.1:5001`, loopback-only). `make web-dev` puts Vite in nginx's place, with `LAMP_PROXY`
 (default `http://127.0.0.1:5000`) naming the device the SPA talks to — a `.env`
 in `web/` still wins, so pointing at a real Pi is unchanged. Open
 **`http://localhost:5173/monitor`**; Vite binds `[::1]` only, so `127.0.0.1:5173`
@@ -905,13 +1047,51 @@ OS Server, and bootstrap. Allowed values are `DEBUG`, `INFO` (the default),
 and the rotating local file `/var/log/os-server.log` (2 MB per file, retaining
 the 10 newest backups).
 
-When `GELF_URL` is configured, OS Server ships records at the same configured
-level and higher to that central collector through one worker with a bounded queue
-of 256 records. Logging never blocks the request path or creates a goroutine per
-record: when the collector is slow or unavailable and the queue is full, newly
-produced GELF records are dropped (with rate-limited stderr notices) while console
-and local rotating-file logging continue. On shutdown, the worker flushes queued
-records for up to five seconds before cancelling any remaining delivery.
+Records at the same level and higher are also shipped to Graylog through one
+worker with a bounded queue of 256 records; logging never blocks the request
+path or creates a goroutine per record.
+
+- **Relay (shipped devices).** Without `GELF_URL` the worker POSTs each record
+  to `{llm_base_url}/logs/gelf` on the cloud API with the device key as a Bearer
+  token (`config.GELFRelayCredentials`: the Autonomous credential only). It is
+  (re)armed from the config-change listener, not only at startup, so it starts
+  the moment setup saves the key and follows a re-setup's new key; the same
+  target is a no-op. Records that cannot ship — relay not armed yet, network
+  error, 401/403/408/429/5xx — go to the on-disk spool in `OS_GELF_SPOOL_DIR`
+  (default `/var/lib/autonomous/gelf-spool`, 1 MiB per service, oldest dropped first) and
+  are replayed in order, paced, tagged `_spooled`, once a send succeeds; other
+  4xx answers drop the record. Backoff between failed replays is 5s to 5 min. On
+  shutdown or re-target the worker stops after its in-flight send and its queue
+  goes to the spool; a re-target starts the new worker only once the old one has
+  stopped, so the spool is never replayed twice. Replay skips records logged
+  under another device id, and factory reset wipes the spool. See [setup-flow.md](setup-flow.md#setup-logs-reach-graylog-even-when-setup-fails).
+- **Direct collector.** When `GELF_URL` is configured the worker ships straight
+  to it with basic auth and no spool: when the collector is slow or unavailable
+  and the queue is full, newly produced records are dropped (with rate-limited
+  stderr notices) while console and local rotating-file logging continue. On
+  shutdown it flushes queued records for up to five seconds.
+- **User data stays on the device (GELF is default-deny).** Log calls are
+  written as usual and the console and the local file get every record in full;
+  only the GELF copy is filtered, inside the handler:
+  - Numbers, booleans, durations, times and errors ship. Telegram bot tokens
+    and URL query strings in error text are replaced (`<redacted-token>`,
+    `?<redacted>`).
+  - A string ships only under a technical key in the allowlist (`gelfSafeKeys`
+    in `system/lib/logger/private.go`, `SAFE_KEYS` in `hal/log_redact.py`):
+    ids, enumerations, providers, models, versions, hardware and network
+    configuration. Every other string becomes `<redacted N chars>`.
+  - Go: the key is the `slog` attribute key, and the `slog` message ships as is
+    (a test rejects messages built by a formatting call). A std `log` line
+    arrives already formatted, so only its `[component]` tag ships.
+  - HAL: the handler reads the log call from the source file (HAL runs from
+    source) to tell literal text from values. Literal text ships; each value of
+    a `%`-template, f-string or `+` chain is checked by the name of the
+    expression passed (`self.model`, `e`), or for an unnamed expression by the
+    word before it (`provider=%s`). A message the source does not show as a
+    literal ships as `<redacted N chars>`.
+  - `logger.Private(...)` (Go) or `private(...)` (HAL) redacts a value even
+    under an allowlisted key. Never add a key that can hold what a person said,
+    who they are or what the device observed about them.
 
 ## Local Intent Matching
 
@@ -926,7 +1106,7 @@ When receiving a text-only `voice_command`, `voice_followup`, `voice`, `web_chat
 | "relax" | scene:relax |
 | "movie mode" | scene:movie |
 | "goodnight" | scene:night + sleepy emotion |
-| "brighter" | scene:energize |
+| "brighten the light" | relative brightness increase; bare "brighter" defers for context |
 | "happy" | emotion:happy |
 | "sad" | emotion:sad |
 | "volume up" | volume 100 |
@@ -998,9 +1178,33 @@ configuration shared by LLM/STT/TTS. Requests identify the client with `User-Age
 the Hermes plugin. It never falls back to a direct OpenRouter call. Disabled or missing-credential requests make no Jev HTTP call and retain
 the existing main-runtime fallback immediately.
 
+The shared classification rules (`jevBoundary`) are sent once, in
+`state.rules`; every question starts with `Apply state.rules.` instead of
+repeating them. Repeating them in all 24 questions made each request about
+89 KB and 18,100 input tokens; once, it is about 8,600. Two interleaved runs
+of the 162-case live corpus on lamp-52e6 (2026-10-14) cut the decision p50
+from 1,598 to 845 ms and from 804 to 542 ms, with 154 instead of 152 cases
+right, no wrong action and the same single false fire. The shipped client
+then scored 153 with p50 488 ms and p90 535 ms. The `state` field
+order (`candidates`, `prompt`, `rules`) is part of that result: with `rules`
+before `candidates` the same corpus scored 144. Harness session selection
+still repeats its own, shorter boundary per question.
+
 Core inference code lives in `system/intent/jev/` (`client`, `resolver`, and
 `catalog`). `system/intent/semantic.go` connects it to local rules and execution,
 keeping the model decision separate from HAL side effects.
+
+A local keyword pre-filter (`MayBeDeviceCommand` in `catalog.go`) runs before the
+Jev request. Text that is pure ASCII and shares no word prefix with the catalog
+vocabulary (light, lamp, bright, dim, volume, loud, colors, scene/mode names,
+music, stop, speak, time, follow, track, camera, ...) makes no Jev call and goes
+straight to the main runtime, saving the ~1-2 s decision that would only abstain.
+It logs `intent Jev decision outcome=skipped reason=no_device_keyword`. Any
+non-ASCII text (for example Vietnamese) always reaches Jev. A paraphrase using none
+of these words is still served by the main runtime. When adding a catalog intent,
+extend `jevKeywordStems`; `TestMayBeDeviceCommandKeepsLiveCorpus` fails if a
+positive live-corpus example would be filtered out. Harness session selection does
+not use this filter.
 
 The decision budget defaults to **3,000 ms**, capped at **3,000 ms** (nonpositive
 values use the default). Each decision makes one request without retries. A
@@ -1010,9 +1214,9 @@ subsequent misses during cooldown continue to the main runtime. Provider
 abstention also continues to the main runtime. This adds latency on unmatched
 requests when enabled; there is no live latency benchmark or accuracy guarantee.
 
-The catalog covers all **20 local intents**, plus `none` to defer:
+The catalog covers all **21 local intents**, plus `none` to defer:
 
-- Light: `led_on`, `led_off`, `dim`, and `led_color`.
+- Light: `led_on`, `led_off`, `dim`, `brighten`, and `led_color`.
 - Scenes: `scene_off`, `scene_reading`, `scene_focus`, `scene_relax`,
   `scene_movie`, `scene_night`, and `scene_energize`.
 - Audio/media: `volume_up`, `volume_down`, `mute_speaker`, `unmute_speaker`,
@@ -1041,7 +1245,14 @@ accepted enum values into code-owned text for the existing rule executor.
 Neither raw user speech nor model-generated HAL payloads reach that executor.
 HAL safety limits remain authoritative. `dim` reads `/led/color`, halves each RGB
 channel (integer rounding), and writes `/led/solid`, then verifies the readback.
-Repeating the request dims again, and an already-dark light stays off. Effects
+Repeating the request dims again, and an already-dark light stays off.
+`brighten` raises the current RGB peak by 25% (at least one level, capped at 255),
+scaling the other channels proportionally with integer rounding. From off it starts
+at warm RGB [32,27,20]. It shares the dim adjustment lock and sleeping-state guard.
+HAL still clamps to its safety ceiling; readback must confirm an increase with the
+expected hue, including proportional safety clamping, before saying “Brighter now.”
+An unchanged or unexpected readback returns a failure rather than claiming success.
+This step is a product default, not a calibrated perceptual brightness increment. Effects
 and scenes become a solid color based on the reported effect base or brightest
 pixel; animation/pattern preservation is not supported. `volume_down` halves
 current speaker volume; `volume_up` adds 10% of the safe range (at least one
@@ -1050,6 +1261,11 @@ honest failure, not a success acknowledgement. Color stops the LED effect before
 setting a solid color. Night activates its scene and may add the sleepy expression.
 Stopping speech, stopping music and muting the speaker remain distinct actions.
 Candidate descriptions separate accepted user intent from execution effects.
+Scene selection also applies configured servo/camera/mic/speaker changes; it defers
+requests that explicitly require those peripherals to remain unchanged. `energize`
+is a configured scene, not maximum brightness; its acknowledgment is “Energize mode!”.
+Maximum-brightness requests defer to the agent. Dark-room complaints without an
+external source can select `brighten`; this does not measure ambient illuminance.
 Reading/work needs may select a lighting scene: “need focus to read book” selects
 reading because the specific activity takes precedence over generic focus; an
 explicit focus-mode request still selects focus. Book recommendations defer.
@@ -1099,7 +1315,7 @@ with the revised prompt/catalog. All 34 rejection-case runs deferred. One
 "Reduce the brightness of this lamp now" run deferred at fit 0.94 versus the
 unchanged 0.95 cutoff; the live suite therefore passed once and failed once.
 These are small-sample observations, not a calibrated accuracy estimate or
-results for the expanded catalog. The expanded live suite contains 65 English
+results for the expanded catalog. The 2026-09-23 expanded live suite contained 65 English
 cases covering all intent families, required parameters and rejection cases;
 the final expanded run on 2026-09-23 passed 62/65 cases (29/32 positive
 requests and all 33 rejection cases). Warm-white lighting, following the speaker
@@ -1121,6 +1337,18 @@ and never invokes HAL. Live model output can vary; a passing fixture set is not
 proof of microphone/STT performance or universal classification accuracy.
 
 <a id="jev-bff-contract"></a>
+
+### English intent regression corpus
+
+The opt-in `TestJevLiveNaturalLanguage` corpus covers every catalog intent with at
+least two positive English examples, plus negation, future/conditional requests,
+external devices, unsupported parameters and multi-action requests. It logs decision
+latency per case without executing hardware. The offline coverage check validates
+case IDs and enum parameters; passing it does not establish live classifier accuracy.
+Context-dependent fragments are also tested at the sensing routing layer, before
+JEV. Run live evaluation with `JEV_EVAL_CONFIG` pointing to a private OS config;
+ordinary `go test` skips it when credentials are not explicitly supplied.
+
 
 #### BFF Decisions contract
 
@@ -1287,7 +1515,7 @@ They cost differently, so they are bounded differently.
 
 | | In the system prompt? | Billed | Cap |
 |---|---|---|---|
-| `USER.md` | **yes** — a bootstrap file | **every turn** | 12000 chars (`bootstrapMaxChars`), then truncated tail-first |
+| `USER.md` | **yes** — a bootstrap file | **every turn** | 24000 chars per file (`bootstrapMaxChars`), also subject to the shared 48000-character bootstrap budget |
 | `KNOWLEDGE.md` | **no** — OpenClaw does not know the file | once per session, when the agent reads it | none by construction |
 
 `KNOWLEDGE.md` had no cap at all: the daily synthesis appends a `## YYYY-MM-DD`
@@ -1330,8 +1558,8 @@ Rules the agent is given, and why each one is load-bearing:
 |---|---|
 | One bullet per person under `## Users`, as `- **<label> (friend)** — call: …; notes: …` | `<label>` is the enrollment label from `[context: current_user=…]`, which is what the OS reconcile keys on. The `(friend)` parenthetical is what distinguishes a person from a form field — without it, `**Notes:** …` would parse as a person named "Notes:" and get deleted. |
 | Short `key: value` segments, not prose; `call:` first | The template's own fields are singular (one `**Name:**`, one `**Timezone:**`) and cannot describe two people, but nesting them per person does not survive the file: `parseEntries` → `serialize` flattens every bullet to `- …`, so indented sub-fields detach from their person. Segments keep the form's *idea* — separated, labelled facts — in one prunable entry. The first attempt was flowing prose and produced a ~600-char paragraph with the address form buried in sentence four. |
-| Never guess `call:`, pronouns or timezone | The agent sees a face label and a voiceprint. Neither says anything about how someone wants to be addressed. Record them only when the person has said so; otherwise omit the segment. |
-| Each entry under ~400 chars | `USER.md` is billed on every turn, and past `bootstrapMaxChars` (12000) OpenClaw truncates with `text.slice(0, cutPoint)` — head kept, **tail cut** — and `## Users` is the tail. An oversized profile silently loses exactly the person data. `ReconcileUserProfiles` warns at 9000. |
+| Never guess `call:`, pronouns or timezone | The agent sees a face label and a voiceprint. Neither says anything about how someone wants to be addressed. Record them only when the person has said so; otherwise omit the segment. A title or honorific heard in a voice turn (Mr, Ms, Miss, Mrs, anh, chị…) does not count: speech recognition invents them (2026-10-05, green-lamp: "…is Lee" heard as "Miss Lee" became `call: Lee (Ms Lee)`). Write the bare name and never infer gender; keep a title only when the person explicitly asks for it. Same rule in `face-enroll` for labels and read-backs. |
+| Each entry under ~400 chars | `USER.md` is billed on every turn, and past the per-file `bootstrapMaxChars` (24000) or total bootstrap budget (48000), OpenClaw can truncate injected content. An oversized profile can lose person data from the prompt. `ReconcileUserProfiles` warns at 9000. |
 | Strangers get no entry | `## Users` is keyed by enrollment label; a passing face has none. Desk traffic belongs in `KNOWLEDGE.md`. |
 | Only write what was observed about **that** person | The original failure was two people fused into one profile (`Long/Leo`). Never move one person's habits onto another. |
 | Update and add only — **never delete** | Absence is not departure. Retiring a person is the OS's job (`ReconcileUserProfiles`, keyed on enrollment), not the agent's. |
@@ -1590,7 +1818,135 @@ Their completed/rejected receipts close only the answer command UI, without TTS.
 The explicit original task binding owns the later summary; receipt reconciliation
 uses the original answer key and never resends the command.
 
+### iMessage configuration updates
+
+For `PUT /api/device/config`, omitted or null `bluebubbles_server_url`, `bluebubbles_user_address`, and `bluebubbles_caller_context` preserve their saved values. An explicit empty string clears only that field. An omitted or empty `bluebubbles_password` preserves the saved secret. Changing unrelated settings must not reset the channel or its caller context.
+
+When `PUT /api/device/config` changes the saved Wi-Fi SSID, the reconnect is scheduled with a two-second grace period after synchronous config side effects finish. This allows the save response to reach the client before AP/STA teardown. HTTP success confirms config persistence, not successful Wi-Fi association; clients must check `/api/network/current` after reconnecting. A transport interruption alone does not establish that saving failed.
 
 ### HAL startup timing
 
+`hal.server:app` is the lightweight HTTP entrypoint; `hal/runtime.py` retains the full hardware runtime. Startup validates the device/board and loads safety bounds and LED presets first, then starts one RGB service and exposes the existing `/led/*` routes with the existing HTTP security middleware. Full runtime imports and initialization run in a background thread of the same process. Until that finishes, other HTTP endpoints (including `/health`) return `503` with `Retry-After: 1`. Requests then pass to the full app; it reuses the RGB instance without reopening the strip. There is no new service, port, setup mode or UI flow. Required-runtime startup failure exits the process nonzero so the service supervisor can recover.
+
+Runtime CLI version probes wait for full HAL `/health` readiness at OS startup, then run one at a time across all runtimes. The gate has a 60-second fallback so an absent or failed HAL does not prevent version reporting indefinitely. Both initial population and refreshes triggered by Web/MQTT reads use the same admission path; API/agent startup continues independently, and version fields may initially be empty. After the gate opens, binary changes still trigger refreshes without another HAL wait. Probe waits, retry backoff, and child commands respect OS shutdown cancellation.
+
+Speaker-ID and SER initialization runs in separate background workers and does not gate full HAL readiness or basic voice. Until ready, speaker metadata is omitted and SER skips sessions. See [SER startup](speech-emotion.md) for retries and lifecycle.
+
+The setup-white worker calls `/led/status` directly and retries failures; it does not wait for full `/health`. LED command acknowledgement means the command was accepted; physical timing should also verify strip output. Measure from systemd process start to that acknowledgement, separately from full-health readiness. `[startup] led_ready` marks driver initialization, while `[startup] full HTTP API ready` marks the handoff.
+
 HAL overlaps motion-driver imports with independent audio, camera, sensing and voice imports. It resolves the motion class only after those imports, before route availability checks and lifespan initialization, preserving required-driver failures. Startup logs `[startup] driver_imports_complete` (including `motion_wait_ms`), `lifespan_begin`, and `lifespan_ready` separate module-loading time from device initialization. Elapsed time starts inside `hal.server`, so it excludes interpreter/Uvicorn setup. Background vision warm-up can continue after lifespan readiness; this is not a guarantee that every subsystem or an intentionally muted microphone is ready.
+
+### Sensing event authentication
+
+`POST /api/sensing/event` requires admin authentication for every remote event type, including passive events: any event can reach the agent. Direct loopback HAL producers remain permitted when forwarding headers also identify loopback or are absent. LAN membership and Origin/Referer headers do not grant access. Web chat continues using its login cookie; internal MQTT dispatch is unchanged.
+
+All ingestion endpoints (telemetry, mood, wellbeing, posture, music suggestion, monitor) use the same admin-or-loopback boundary; guard already uses it. Sensing accepts at most four attachments, 10 MiB each and 20 MiB decoded total; the JSON body is capped at 29 MiB before parsing. Invalid base64 is rejected before any file write or agent dispatch.
+
+### Voice mutation authentication
+
+`POST /api/sensing/filler` uses the admin-or-direct-loopback gate, preserving HAL's internal realtime wait cues while blocking unauthenticated LAN calls. `POST /api/voice/file/remove` requires admin authentication even on loopback; the web UI's existing session cookie remains valid. Removal rejects profile/sample traversal and symlink escapes using directory-scoped `os.Root` operations. Valid sample/embedding deletion and last-WAV profile cleanup keep their existing behavior.
+
+### LLM configuration ownership
+
+`PUT /api/device/config` accepts `llm_config_mode: "os" | "runtime"`;
+`GET /api/device/config` returns the saved value. An absent/empty value retains
+legacy behavior, including Codex/Claude Code auth detection. An explicit `os`
+selection reapplies the OS provider even if key, URL and model have not changed;
+`POST /api/device/restore-defaults` with `section: "llm"` also selects `os`.
+
+`runtime` leaves native LLM provider/model/auth configuration to the operator for
+all six local runtimes. Gateway, workspace, skills and channel reconciliation
+continue. Saved OS credentials remain available to voice/backend services.
+Incoming LLM fields are ignored while runtime management is selected. Unchanged
+thinking settings no longer trigger runtime reconciliation on unrelated saves.
+
+Ownership applies across runtime switches; the target needs its own native
+login and provider/model selection. Credential migration is skipped in runtime
+mode and its baseline advances, preventing a deferred migration after returning
+to OS management. Mode changes synchronously apply config and refresh the
+runtime environment; an apply failure is returned after saving the mode, so the
+same selection can be retried. This does not verify subscription validity or
+successful model inference. Open a new terminal after changing ownership; an
+already-open shell retains its old environment.
+
+### Runtime account sign-in over HTTP
+
+The OS-owned `system/runtimeauth/` package runs native login commands and stages account files; `system/device/runtime_login.go` owns session lifecycle and activation. `runtimes/` remains the home of agent backends.
+
+Settings → Runtime uses these admin-authenticated endpoints. Responses use the
+standard OS envelope and `Cache-Control: no-store`:
+
+| Method | Endpoint | Request / result |
+|--------|----------|------------------|
+| GET | `/api/device/runtime-login` | Returns `{runtime, providers: [{id, label}], session?}` for the active runtime |
+| POST | `/api/device/runtime-login` | `{runtime, provider}` starts a native sign-in and returns its session |
+| POST | `/api/device/runtime-login/code` | `{id, code}` submits the complete authorization code or callback URL requested by that session |
+| DELETE | `/api/device/runtime-login/:id` | Cancels a pending sign-in; cancellation is unavailable once activation starts |
+
+A session contains `id`, `runtime`, `provider`, `status`, and optional
+`login_url`, `user_code`, `input_required`, `error`. Status progresses through
+`starting`, `waiting`, `applying`, then `success`, `error`, or `cancelled`.
+`login_url` opens the provider's own sign-in page. `user_code` is a device code
+to enter on that page; `input_required` instead asks for a code/callback to
+submit to the OS. These are different directions of input. Invalid requests
+return HTTP 400; a conflicting operation, expired session ID, or unavailable
+input/cancellation returns 409.
+
+Sign-in sessions live in memory, have a 15-minute login deadline, and do not
+survive an OS-server restart. One login holds the runtime-switch lock, preventing
+concurrent runtime changes or LLM configuration changes. The active AI
+configuration continues serving chat while the native CLI authenticates in an
+isolated temporary home. CLI authentication/provider environment variables are
+removed. HTTP exposes only allowlisted provider links, short device codes and
+sanitized status; raw CLI output and saved access/refresh tokens are never
+returned. Cancel/timeout terminates the login process group and removes staging.
+
+Only after native authentication is verified does the OS enter `applying`:
+save runtime-managed mode, install the staged native account/provider settings,
+restart the runtime and wait for stable gateway readiness. Native files and
+the previous mode are restored if activation fails; a failed restoration is
+reported explicitly instead of claiming success. No account password is
+collected by the OS web UI. `success` confirms login and gateway readiness,
+not a successful model response or available subscription quota. Completing
+the real provider login and a chat turn still require account/device validation;
+isolated process tests do not establish that those live checks passed.
+
+### Turning the camera back on after a manual off
+
+When the user turned the camera off (Camera page, or "don't watch me" through the
+agent), HAL `POST /camera/enable` only turns it back on when the owner can be the
+one asking: the request carries `X-OS-Owner-Action: 1`, or someone spoke to the lamp
+within the last 60 s (a voice "camera on" relayed by the agent). Otherwise it returns
+403, so sensing events, schedules, remote chat channels and an agent acting on its
+own cannot undo the user's choice. The `/api/hardware/*` proxy always drops a
+client-supplied `X-OS-Owner-Action` and sets it only for a logged-in owner (session
+cookie or session token); a Bearer LLM key does not count. An automatic pause (idle,
+sleep) is not guarded.
+
+### Cloud camera perception
+
+`GET /api/device/config` always returns `cloud_perception: { "motion", "emotion", "pose", "fire_hazard", "speaker_id", "speech_emotion" }` (booleans; an unset config reads as all `false`). `PUT /api/device/config` accepts the same object; keys it names are changed and omitted keys (or an omitted object) keep their value. Each key opts into a perception that uploads to the DL backend (`llm_base_url`), so all default off: the four camera keys upload frames or face crops, `speaker_id` uploads a clip of each utterance (and enrollment samples) for voice recognition, and `speech_emotion` uploads the audio of each turn for speech emotion. A change is applied live and synchronously: under one lock shared by HTTP and MQTT, os-server merges the request into the latest saved value, saves `config.json`, calls HAL `POST /sensing/cloud-perception` with the six booleans (30-second timeout), refreshes the HAL config hash and only then responds, so HAL receives changes in save order and a success means HAL applied it. HAL creates the enabled processors and unregisters and retires the disabled ones: a check still waiting in the worker queue is dropped, and an upload already inside a check finishes, then its connection closes. If the live call fails, os-server restarts HAL (which reads `cloud_perception` from `config.json` at boot, so an opt-out still takes effect) and then repeats the apply call every second until the new HAL answers it, for up to 90 s: `systemctl restart` returning is not treated as confirmation. If the restart fails or HAL does not confirm in time, the request returns an error and an identical retry re-applies. Only the saved setting can turn a perception on: a missing key is off and HAL does not read env flags for these, so an old default in a device `.env` never counts as consent. Motion, emotion and pose also require people perception (the `presence` capability). HAL reads the two voice keys at each use, so turning one off stops the next upload and turning one on takes effect from the next utterance. With `speaker_id` off, enrolling a voice fails and every speaker is unknown. Over MQTT, `cloud_perception.set` can only turn perceptions off, and `info` reports the saved state ([mqtt.md](mqtt.md#cloud_perceptionset)). See [Sensing Behavior](../robots/lamp/docs/sensing-behavior.md#cloud-camera-perceptions-are-off-by-default).
+
+### Voice input mode
+
+`GET /api/device/config` returns `voice_input_mode`: `automatic` (default when absent) or `tap_to_talk`. `PUT /api/device/config` accepts the optional field; empty or unknown strings are rejected before mutation. Omission preserves the setting. `automatic` uses the existing `wakeword` flag; `tap_to_talk` bypasses wake and preserves that flag for switching back. MQTT `voice.input_mode` shares the persistence/apply path. Mode-only changes call HAL `POST /voice/input-mode` with a 30-second timeout; neither process restarts. HAL cancels pending capture and reconfigures its voice worker/session while preserving privacy and sleep. Save/apply failures allow same-value retries. Combined changes involving restart-required fields still restart HAL once. Config responses and BE ping report the configured mode; failed application still returns an error rather than success.
+
+`POST /api/device/voice-input-mode/toggle` takes no body and atomically toggles the saved mode under the same apply lock. Loopback callers bypass admin authentication; remote callers require it. Success returns `{"status":1,"data":{"mode":"tap_to_talk"},"message":null}` (or `automatic`) after HAL application. It is a non-idempotent physical-gesture operation: do not automatically retry on timeout; use an explicit mode set to retry a known desired state.
+
+`POST /api/agent/speech/cancel` keeps its empty-body behavior (global physical stop). Optional `{ "before_ms": <Unix milliseconds> }` suppresses speech/fillers from older turns without a delayed global HAL stop or cancelling hardware actions. HAL uses this same-device cutoff before admitting a replacement manual recording. Device sensing may include `captured_at_ms` alongside a Harness-off snapshot; validated voice-command/handled turns retain that capture age in their unique run ID so delayed dispatch cannot escape suppression.
+
+### Passive sensing TTS admission
+
+Before sensing dispatch and runtime replay, `RegisterTurnSpeechPolicy` retains
+the original event admission policy by run ID. All six built-in runtimes carry
+it into turn-aware TTS. First registration wins across internal retries; lookups
+do not consume the entry, so streamed segments retain their origin. The registry
+is in-memory, limited to 4096 runs and one hour. Unknown/expired runs and legacy
+non-turn-aware TTS retain existing admission behavior.
+
+HAL accepts optional `passive_sensing` on `/voice/speak` and `/voice/speak-queue`.
+During automatic user capture it returns `suppressed_capture` for passive speech;
+OS handles this as intentional cancellation rather than a TTS failure. Cached
+quota notices and intercepted agent TTS tools retain the run policy. Voice/chat
+and fire-hazard events remain exempt according to `speakergate.WaitsForSpeaker`.
+See [capture admission](realtime-voice.md#passive-sensing-speech-yields-to-automatic-capture).

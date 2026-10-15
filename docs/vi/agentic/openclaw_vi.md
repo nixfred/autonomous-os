@@ -15,15 +15,19 @@ giữ ở local và được thêm vào yêu cầu hiện tại trong runtime.
 
 Plugin đọc snapshot skill do native tạo, kiểm tra ID session đang chạy, rồi lấy
 giao giữa các skill đã resolve và danh sách native quảng bá. Sau khi chọn, plugin
-kiểm tra lại cấu hình và file. Bản đầu chỉ hỗ trợ skill đơn giản trong thư mục
-`skills/` của workspace hiện tại. Skill có metadata dependency/platform, policy
+kiểm tra lại cấu hình và file. Skill đơn giản từ workspace, bundled, managed và
+plugin đều có thể tham gia qua đường dẫn `SKILL.md` canonical chính xác do snapshot
+native cung cấp, không giới hạn thư mục workspace. Thứ tự snapshot native quyết
+định ưu tiên khi trùng tên. Skill có metadata dependency/platform, policy
 invocation riêng, tool policy chưa hỗ trợ, sandbox đang bật, symlink hoặc file quá
 lớn được giao cho cơ chế nạp native. Snapshot thiếu hoặc không tương thích cũng
 bỏ qua, kể cả runtime không cung cấp accessor session cần thiết. Không quét skill
 trên toàn filesystem.
 
-Tối đa 32 ứng viên được gửi tới provider. Có hơn 32 thì bỏ qua, không cắt danh sách
-tùy ý. Ngưỡng choice ít nhất 0.70, margin ít nhất 0.20 và fit độc lập ít nhất 0.60,
+Không còn giới hạn 32 ứng viên. Request đầy đủ sau serialize UTF-8 phải nằm trong
+256 KiB; vượt mức thì bỏ qua trước khi đọc credential hay gọi mạng, không cắt danh
+sách tùy ý. File skill vẫn giới hạn 32 KiB; response và envelope preload giới hạn
+64 KiB. Ngưỡng choice ít nhất 0.70, margin ít nhất 0.20 và fit độc lập ít nhất 0.60,
 giống chọn skill trong Hermes. Toàn thao tác có deadline 3 giây, không retry, tối đa
 một thao tác đang chạy và cooldown 30 giây sau lỗi. Timeout, response sai schema,
 abstain hay thay đổi điều kiện skill đều giữ nguyên yêu cầu ban đầu.
@@ -52,3 +56,68 @@ Contract native được đối chiếu với OpenClaw 2026.2.23 đã cài và
 Các kiểm tra local không đồng nghĩa đã gọi Jev thật, deploy thiết bị hay test tích
 hợp đầy đủ gateway/kênh. Hook bản cũ không cung cấp metadata attachment có cấu trúc;
 chỉ nhận diện được field attachment được truyền vào và marker trong văn bản.
+
+## Dấu xác nhận workspace (OpenClaw >= 2026.9)
+
+Khi tạo workspace, OpenClaw ghi một dấu xác nhận (attestation) vào
+`/root/.openclaw/state/openclaw.sqlite` (bảng `workspace_setup_state` và các bảng
+liên quan). Trong 24 giờ sau đó, `openclaw onboard` từ chối tạo lại một workspace
+trông như đã bị xoá (`WorkspaceVanishedError: … Refusing to reseed BOOTSTRAP.md
+over a recently attested workspace`), làm setup thất bại với `agent_setup_failed`.
+
+- **Factory reset** (`runtimes/openclaw/reset.go`) xoá `/root/.openclaw/state`
+  cùng với workspace, nên setup ngay sau reset vẫn onboard lại được.
+- **Build ảnh** (`scripts/imager/build*.sh`) chạy `openclaw onboard` trong chroot
+  (tối đa 180 giây), rồi xoá các dòng workspace trong database state và các file
+  dấu xác nhận kiểu cũ. Vì vậy ảnh build vài giờ trước lần setup đầu tiên không
+  mang theo dấu xác nhận mới, kể cả khi onboard trong chroot bị timeout và để lại
+  workspace trống.
+
+Máy đã bị kẹt lỗi này: chạy `sudo rm -rf /root/.openclaw/state
+/root/.openclaw/workspace-attestations` rồi setup lại.
+
+## Tiền tố câu trả lời và trả lời heartbeat
+
+- **Không gắn tiền tố.** Trước đây setup ghi `messages.responsePrefix: "auto"`,
+  OpenClaw hiểu là tên định danh của agent; agent không đặt tên thì dùng id, nên
+  mọi câu trả lời trong chat bắt đầu bằng `[main]`. Lệnh `doctor` của OpenClaw
+  còn chép giá trị này xuống `channels.<channel>.responsePrefix`. Giờ setup không
+  ghi nữa, và onboarding (`ensureMessagesQueueConfig`) xoá `"auto"` khỏi
+  `messages`, mọi channel và mọi account của channel trên máy đã setup, rồi
+  restart gateway. Tiền tố người dùng tự đặt được giữ nguyên.
+- **Heartbeat kết thúc bằng `NO_REPLY`.** Khối OS trong `workspace/HEARTBEAT.md`
+  trước đây ghi "skip silently", và model đôi khi trả về tin rỗng. OpenClaw coi
+  heartbeat rỗng là `agent-runner-failure` và gửi `[main] ⚠️ Agent couldn't
+  generate a response. Please try again.` lên chat gần nhất. Giờ khối này dặn
+  agent trả lời đúng `NO_REPLY` khi xong, là token heartbeat im lặng của OpenClaw.
+  Onboarding ghi lại khối này trên máy đã setup vì nội dung đã đổi.
+- **SOUL của thiết bị phải nằm trong giới hạn bootstrap.** Setup và onboarding
+  cùng dùng `agents.defaults.bootstrapMaxChars = 24000` và
+  `agents.defaults.bootstrapTotalMaxChars = 48000`, lấy từ các hằng số chung trong
+  `runtimes/openclaw/onboarding.go`. Đây là ngân sách ký tự, không phải giới hạn token.
+  Mức 24k mỗi file chứa đủ SOUL lamp (18.615 ký tự), có chỗ cho marker OS và chỉnh
+  sửa của chủ máy. SOUL lamp cộng các khối AGENTS và HEARTBEAT do OS quản lý có
+  tổng khoảng 27,9k ký tự; mức 48k dành thêm khoảng 20k cho các file bootstrap khác
+  và nội dung bổ sung. Đây là phần dự phòng theo kích thước, chưa phải mức tối ưu
+  độ trễ đã đo hay bảo đảm mọi workspace lớn đều vừa.
+  Giới hạn mỗi file và giới hạn tổng đều áp dụng; file dài vẫn có thể mất phần
+  giữa (OpenClaw giữ đầu và cuối). Thiết bị hiện có nhận giới hạn mới khi chạy
+  onboarding sau triển khai; onboarding yêu cầu restart gateway khi defaults
+  thay đổi. `TestDeviceSoulsFitTheBootstrapCap` kiểm tra SOUL của mọi thiết bị,
+  kể cả lamp, với mức 23.000 ký tự, dành 1.000 cho marker OS và mục `## Personal`
+  của chủ máy. SOUL intern-v2 vẫn khoảng 10,5k; thẻ âm thanh chỉ dùng cho câu trả
+  lời được đọc lên, không dùng trong chat qua channel hoặc web.
+- **Tắt heartbeat định kỳ.** Dù đã dặn `NO_REPLY`, model vẫn trả heartbeat
+  bằng tin rỗng, và OpenClaw thử lại với "visible-answer continuation". OpenClaw
+  2026.9 còn đổi đích gửi mặc định của heartbeat từ `none` sang `owner` (DM của
+  chủ máy, ví dụ Telegram), nên kết quả mà bản cũ chỉ hiện trong phiên chính —
+  nơi os-server đọc ra loa — giờ lọt lên Telegram. Chạy với `target: "none"` và
+  `isolatedSession: true` vẫn chưa đủ: ở lần thử lại, model đọc chat chính qua
+  `sessions_history` rồi tự nhắn chủ máy bằng tool `message` mỗi 30 phút. Giờ
+  onboarding (`pinSilentHeartbeat`) đặt `agents.defaults.heartbeat.every:
+  "0m"`, vẫn giữ `target: "none"` và `isolatedSession: true` cho các lần đánh
+  thức theo sự kiện (ví dụ khi một tác vụ chạy nền xong) mà OpenClaw vẫn chạy.
+  Chat, giọng nói, skill và lịch hẹn không bị ảnh hưởng. Thứ dừng lại là phần
+  dọn dẹp trong `HEARTBEAT.md`: tổng hợp hằng ngày vào `KNOWLEDGE.md` và đồng bộ
+  thông tin người vào `USER.md`; file `memory/` hằng ngày vẫn được ghi và tìm lại
+  được.

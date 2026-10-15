@@ -1,9 +1,4 @@
-"""Optional Smart Turn inference on bounded PCM snapshots, outside capture.
-
-Pipecat and its bundled model are loaded on the worker's first request. The
-capture loop only submits snapshots and polls results; it owns turn timing and
-must change the request token whenever speech resumes or a new session starts.
-"""
+"""Optional Smart Turn inference on bounded PCM snapshots, outside capture."""
 
 import asyncio
 import logging
@@ -18,20 +13,12 @@ def _create_analyzer():
     from pipecat.audio.turn.smart_turn.local_smart_turn_v3 import LocalSmartTurnAnalyzerV3
 
     analyzer = LocalSmartTurnAnalyzerV3(sample_rate=16000, cpu_count=1)
-    # Pipecat normally applies this on its pipeline StartFrame; constructing
-    # the analyzer alone leaves the effective sample rate at zero.
     analyzer.set_sample_rate(16000)
     return analyzer, EndOfTurnState.COMPLETE
 
 
 class SmartTurnDetector:
-    """Single-flight detector with at most one request and one result.
-
-    ``available`` becomes true after model initialization; ``failed`` becomes
-    true on any import, loading or inference error. Both are false before the
-    first request. Failures disable this instance so callers can use their
-    bounded silence fallback without repeated imports or error logs.
-    """
+    """Single-flight detector with at most one request and one result."""
 
     def __init__(self):
         self._lock = threading.Lock()
@@ -90,6 +77,17 @@ class SmartTurnDetector:
         loop = asyncio.new_event_loop()
         analyzer = None
         try:
+            with self._lock:
+                if self._closed:
+                    return
+            # Loading belongs to worker startup, not the first user's endpoint.
+            # A request arriving during loading still occupies the single slot.
+            analyzer, complete = _create_analyzer()
+            with self._lock:
+                if self._closed:
+                    return
+                self._available = True
+            logger.info("Smart Turn ready (local bundled model, CPU threads=1)")
             while True:
                 self._wake.wait()
                 with self._lock:
@@ -100,30 +98,34 @@ class SmartTurnDetector:
                 if request is None:
                     continue
                 token, pcm = request
-                try:
-                    if analyzer is None:
-                        analyzer, complete = _create_analyzer()
-                        with self._lock:
-                            self._available = True
-                        logger.info("Smart Turn ready (local bundled model, CPU threads=1)")
-                    analyzer.clear()
-                    analyzer.append_audio(pcm, is_speech=True)
-                    state, _metrics = loop.run_until_complete(analyzer.analyze_end_of_turn())
-                    with self._lock:
-                        if not self._closed:
-                            self._result = (token, state == complete)
-                        self._busy = False
-                except Exception as exc:
-                    with self._lock:
-                        self._failed = True
-                        self._available = False
-                        self._busy = False
-                    logger.warning(
-                        "Smart Turn unavailable; using silence fallback. "
-                        "Optional HAL pipecat extra and bundled model required: %s", exc,
-                    )
-                    return
+                analyzer.clear()
+                analyzer.append_audio(pcm, is_speech=True)
+                state, metrics = loop.run_until_complete(analyzer.analyze_end_of_turn())
+                logger.info(
+                    "[smart-turn] token=%s audio_s=%.3f probability=%s "
+                    "inference_ms=%s complete=%s",
+                    token, len(pcm) / (16000 * 2),
+                    getattr(metrics, "probability", None),
+                    getattr(metrics, "e2e_processing_time_ms", None),
+                    state == complete,
+                )
+                with self._lock:
+                    if not self._closed:
+                        self._result = (token, state == complete)
+                    self._busy = False
+        except Exception as exc:
+            with self._lock:
+                self._failed = True
+                self._result = None
+            logger.warning(
+                "Smart Turn unavailable; using silence fallback. "
+                "Optional HAL pipecat extra and bundled model required: %s", exc,
+            )
         finally:
+            with self._lock:
+                self._available = False
+                self._busy = False
+                self._request = None
             if analyzer is not None:
                 try:
                     loop.run_until_complete(analyzer.cleanup())

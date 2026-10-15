@@ -1,7 +1,7 @@
 # Sensing Threshold Tuning Guide
 
 How to tune Lamp's sensing thresholds on real hardware.
-All constants live in `hal/config.py` and `hal/drivers/voice/voice_service.py`.
+All constants live in `hal/config.py` and `hal/drivers/voice/_internal/config.py`.
 
 ## View Logs
 
@@ -82,7 +82,7 @@ INFO hal...motion: [motion] transition bypass: ['sedentary'] → ['eat'] (last e
 **File:** `hal/config.py`
 
 ```python
-SOUND_RMS_THRESHOLD = 3000   # RMS level to trigger "loud noise" event
+SOUND_RMS_THRESHOLD = 8000   # RMS level to trigger "loud noise" event (env HAL_SOUND_RMS_THRESHOLD)
 SOUND_SAMPLE_DURATION_S = 0.5 # sample window length
 ```
 
@@ -90,7 +90,7 @@ SOUND_SAMPLE_DURATION_S = 0.5 # sample window length
 The event message includes the actual RMS level:
 
 ```
-INFO lelamp.service.sensing.sensing_service: [sensing] sound: Loud noise detected (level: 4521)
+INFO lelamp.service.sensing.sensing_service: [sensing] sound: Loud noise detected (level: 9521)
 ```
 
 Watch the `level` value during normal ambient conditions vs. when you clap/speak loudly.
@@ -99,15 +99,15 @@ Watch the `level` value during normal ambient conditions vs. when you clap/speak
 
 | Symptom | Fix |
 |---------|-----|
-| Normal speech doesn't trigger event | Decrease `SOUND_RMS_THRESHOLD` (3000 → 1500) |
-| Triggers on fan noise / AC hum | Increase `SOUND_RMS_THRESHOLD` (3000 → 5000) |
+| Normal speech doesn't trigger event | Decrease `SOUND_RMS_THRESHOLD` (8000 → 4000) |
+| Triggers on fan noise / AC hum | Increase `SOUND_RMS_THRESHOLD` (8000 → 12000) |
 
 
 ---
 
 ## Voice Wake Word (VAD)
 
-**File:** `hal/drivers/voice/voice_service.py` (all env-tunable)
+**File:** `hal/drivers/voice/_internal/config.py` (all env-tunable)
 
 ```python
 HAL_VAD_THRESHOLD = 3500        # RMS to trigger speech detection (default 3500)
@@ -140,22 +140,22 @@ HAL_SILERO_ENABLED = false      # tertiary gate (ONNX); webrtcvad usually enough
 **File:** `hal/config.py`
 
 ```python
-LIGHT_LEVEL_INTERVAL_S = 30.0  # check every 30 seconds
-LIGHT_CHANGE_THRESHOLD = 30    # min brightness change (0–255) to trigger event
+LIGHT_LEVEL_INTERVAL_S = 300.0  # check every 5 minutes (env HAL_LIGHT_LEVEL_INTERVAL_S)
+LIGHT_CHANGE_THRESHOLD = 100    # min brightness change (0–255) to trigger event (env HAL_LIGHT_CHANGE_THRESHOLD)
 ```
 
 **How to read the log:**
 
 ```
-INFO lelamp.service.sensing.sensing_service: [sensing] light.level: Ambient light decreased significantly (level: 45/255, change: -38)
+INFO lelamp.service.sensing.sensing_service: [sensing] light.level: Ambient light decreased significantly (level: 45/255, change: -120)
 ```
 
 **Tuning:**
 
 | Symptom | Fix |
 |---------|-----|
-| No event when lights are turned on/off | Decrease `LIGHT_CHANGE_THRESHOLD` (30 → 15) |
-| Too sensitive (triggers from lamp dimming slowly) | Increase `LIGHT_CHANGE_THRESHOLD` (30 → 50) |
+| No event when lights are turned on/off | Decrease `LIGHT_CHANGE_THRESHOLD` (100 → 50) |
+| Too sensitive (triggers from lamp dimming slowly) | Increase `LIGHT_CHANGE_THRESHOLD` (100 → 150) |
 | Events too frequent | Increase `LIGHT_LEVEL_INTERVAL_S` |
 
 ---
@@ -170,7 +170,6 @@ FACE_MAX_TRUNCATION = 0.05          # Skip faces with >5% of their bbox off-fram
 FACE_MIN_SHARPNESS = 100.0          # Skip faces too motion-blurred to identify
 FACE_STRANGER_MIN_TICKS = 2         # Sightings before an unknown face earns an id
 FACE_STRANGER_CORROBORATION_S = 6.0 # How long a pending candidate stays countable
-FACE_COPRESENCE_MIN_TICKS = 2       # Ticks friend + non-friend boxes must share a frame before "already present"
 HAL_FACE_LANDMARK_CONF_THRESHOLD = 0.99  # Skip crops the face mesh isn't sure about
 FACE_MATCH_THRESHOLD = 0.40         # Bar for a match carried by the enrolled uploads
 FACE_EXTENDED_THRESHOLD = 0.45      # Bar for a match carried by the extended bank alone
@@ -179,6 +178,10 @@ FACE_EXTEND_MIN_ENROLL_SIM = 0.45   # Bar the uploads must clear to auto-capture
 FACE_COOLDOWN_S = 10.0              # Min seconds between face presence events
 FACE_OWNER_FORGET_S = 3600.0        # Re-fire presence after N seconds without seeing owner
 FACE_STRANGER_FORGET_S = 1800.0     # Same for strangers
+FACE_STRANGER_RETENTION_S = 2592000.0  # HAL_FACE_STRANGER_RETENTION_S: forget a stranger after 30 days without a visit
+FACE_STRANGER_GAZE_TICKS = 3        # Stranger greeting: face-ID ticks in the gaze vote
+FACE_STRANGER_GAZE_MIN_FACING = 2   # Stranger greeting: ticks facing the lamp needed
+FACE_STRANGER_GAZE_WINDOW_S = 10.0  # Stranger greeting: max age of a gaze vote
 ```
 
 The height ratio threshold filters out faces that are **too small** relative to the frame — typically distant people or false positives where the face crop is too low-resolution for reliable recognition. Faces whose bounding-box height is under the threshold fraction of the frame height are skipped, before classification.
@@ -339,7 +342,15 @@ the honest outcome, and it beats being absorbed into somebody else's.
 
 A real visitor is unaffected beyond one tick of delay: they are still there 2 s later and mint then. The window is deliberately ~3 sensing ticks rather than strictly back-to-back, so one dropped or blurred frame in the middle does not reset a genuine visitor's count.
 
-**Listing the user as "already present" needs the same corroboration.** When a stranger enters while a friend is boxed in the same frame, `presence.enter` adds `already present: <name> (friend)` so the agent talks to the user instead of greeting the visitor (#426). That segment is only written once a friend box and a non-friend box have shared the frame for `FACE_COPRESENCE_MIN_TICKS` (2) consecutive ticks — `unsure` boxes count, so the tick the recognizer spends corroborating the stranger is the first of the two, and a real visitor is listed on the very enter that announces them. Set `HAL_FACE_STRANGER_MIN_TICKS=1` and the counter reads 1 on the mint tick, so the segment only appears when the stranger flush happens to land a tick later; raise `HAL_FACE_COPRESENCE_MIN_TICKS` if a monitor or a poster behind the user keeps being announced as company.
+The stranger gaze check reuses gaze wake's `GAZE_MAX_YAW_DEG`, `GAZE_EDGE_CONE_SCALE` and `GAZE_MIN_FACE_PX`, so tuning those for gaze wake also changes when strangers are greeted. It measures face-ID boxes, not gaze's face picker, so the picker's 15% floor (`HAL_GAZE_BEARING_MIN_FACE_HEIGHT_FRAC`, #567) does not apply to it.
+
+Each face-ID tick with an ungreeted stranger in frame logs one line, with the numbers behind each stranger's vote and their running count:
+
+```
+[face] stranger gaze: stranger_16 yaw=51.6<=92.6 face=117px>=48 edge=0.68 -> facing 2/2; stranger_17 yaw=70.2>62.4 face=40px<48 edge=0.05 -> away (face too small, turned too far) 0/1; stranger_18 yaw=- face=120px>=48 edge=0.10 -> away (landmarks off-frame) 0/3
+```
+
+`yaw` is the head yaw in degrees, shown against the cone allowed at that edge (`GAZE_MAX_YAW_DEG` widened by `GAZE_EDGE_CONE_SCALE`): `<=` passes, `>` fails. `face` is the face height in the gaze watcher's 640-wide pixels, shown against `GAZE_MIN_FACE_PX`: `>=` passes, `<` fails. A tick votes `facing` only when both pass. `edge` is the distance from frame centre (0 = centre, 1 = edge). An `away` vote names what failed in brackets: `face too small`, `turned too far`, or, when yaw could not be measured at all (`yaw=-`), `no keypoints`, `landmarks off-frame`, `no yaw` or `no frame`. An unmeasurable face never counts as facing, but it isn't a stranger who turned away either.
 
 **Tuning:**
 
@@ -360,8 +371,8 @@ A real visitor is unaffected beyond one tick of delay: they are still there 2 s 
 | Lamp mints a `stranger_N` for the enrolled user while it is panning | Motion blur — that is what `FACE_MIN_SHARPNESS` screens out; check `FAIL-blurred` folders for the sharpness actually seen |
 | Unknown visitors take too long to be noticed | Lower `FACE_STRANGER_MIN_TICKS` to 1 to mint from a single frame (the old behaviour) |
 | Spurious `stranger_N` identities still appear | Raise `FACE_STRANGER_MIN_TICKS` to 3; each step costs a visitor one more sensing tick |
-| Lamp tells the user they "have company" when a poster or monitor is behind them | Raise `FACE_COPRESENCE_MIN_TICKS` (2 → 3); a real visitor waits one more tick before the user is named |
-| A visitor is greeted while the user sits there, `already present` never appears | Check `FACE_STRANGER_MIN_TICKS` ≥ 2 (its corroboration ticks feed the counter); with 1 the counter cannot reach 2 by mint time |
+| Lamp never greets a visitor who looked at it | Lower `FACE_STRANGER_GAZE_MIN_FACING` (2 → 1); check `[face] stranger gaze:` in the HAL log |
+| Visitor who looked briefly is not greeted because ticks are slow or skipped | Raise `FACE_STRANGER_GAZE_WINDOW_S` (10 → 15); too large lets glances minutes apart add up |
 | Recognition drops out in a dim room after an update | Laplacian variance falls with light; lower `FACE_MIN_SHARPNESS` (100 → 70) and re-check `FAIL-blurred` |
 | Lamp mints `stranger_N` ids for the enrolled user at close range | The detector is firing on an ear or similar — that is what `HAL_FACE_LANDMARK_CONF_THRESHOLD` 0.99 screens out |
 | Faces that are plainly fine stop being recognized after an update | Lower `HAL_FACE_LANDMARK_CONF_THRESHOLD` (0.99 → 0.95); the default is tuned on one device |
@@ -402,7 +413,7 @@ Per-face motion opens a separate WS session per detected face and runs action re
 **Voice integration (session end, transcript-independent):** in the `finally` block of every mic session (VAD trigger → ~2.5 s silence), `_stream_session` runs `_identify_and_decorate(final_text, audio_buffer)` **once** to resolve both `final_msg` (for the Lamp POST when STT had text) and `user_name` (for the SER submit). The result is passed to `_submit_speech_emotion_from_session(audio_buffer, user=...)`, which builds the WAV and calls `SpeechEmotionService.submit`. Unknown / no-match speakers still enqueue SER under the shared `unknown` dedup key when audio is long enough.
 
 ```python
-SPEECH_EMOTION_ENABLED = True
+SPEECH_EMOTION_ENABLED = False             # Owner opt-in cloud_perception.speech_emotion (not env)
 SPEECH_EMOTION_FLUSH_S = 10.0               # Per-user buffer drain cadence
 SPEECH_EMOTION_DEDUP_WINDOW_S = 300.0       # (user, bucket) TTL — 5 min
 SPEECH_EMOTION_MIN_AUDIO_S = 3.0            # Skip utterances shorter than this (hal.config default)
@@ -453,6 +464,75 @@ The `flushing` line shows the raw label list — that's the mode-over-samples th
 
 ---
 
+## Fire Hazard
+
+**Files:** `hal/config.py`, `hal/drivers/sensing/perceptions/processors/fire_hazard.py`,
+`hal/drivers/sensing/perceptions/processors/fire_gate.py`. How the pipeline behaves:
+[Sensing behavior](sensing-behavior.md#fire-hazard). Runs only with the owner's
+`cloud_perception.fire_hazard` opt-in (not an env var).
+
+| Env var | Default | What it does |
+|---|---|---|
+| `HAL_FIRE_HAZARD_CHECK_INTERVAL_S` | `5.0` | Min gap between checks. Checks run on the 2 s sensing tick, so 5 s means about every 6 s; 0 checks every tick |
+| `HAL_FIRE_HAZARD_GATE_SCORE_THRESHOLD` | `0.2` | On-lamp gate: a `fire`/`smoke` score at or above this sends the frame to OWLv2 and starts escalation |
+| `HAL_FIRE_HAZARD_GATE_MODEL_PATH` | `/root/local/models/yolo26s_fire_e2e_320.onnx` | Gate model file (the directory follows `HAL_FACE_MODEL_PATH` when that is set) |
+| `HAL_FIRE_HAZARD_GATE_MODEL_URL` | model CDN `onnx_models/yolo26s_fire_e2e_320.onnx` | Where the gate model is downloaded from on first use |
+| `HAL_FIRE_HAZARD_GATE_THREADS` | `2` | ONNX Runtime intra-op threads for the gate (CPU, slow cores) |
+| `HAL_FIRE_HAZARD_ESCALATION_HOLD_S` | `10.0` | OWLv2 keeps running every check until this long after its last fire/smoke sighting |
+| `HAL_FIRE_HAZARD_PRESET` | `fire_hazard_v1` | Server prompt preset sent instead of the 46 class strings; empty = always send the classes |
+| `HAL_FIRE_HAZARD_DETECTOR` | `owlv2` | Detector name in the default endpoint path |
+| `DL_FIRE_HAZARD_ENDPOINT` | `/detect/<detector>` | Endpoint path appended to `DL_BACKEND_URL` |
+| `HAL_FIRE_HAZARD_API_TIMEOUT_S` | `15.0` | OWLv2 HTTP timeout |
+| `HAL_FIRE_HAZARD_CONFIDENCE_THRESHOLD` | `0.3` | OWLv2 detections below this are dropped |
+| `HAL_FIRE_HAZARD_OVERLAP_THRESHOLD` | `0.2` | Min fire/object overlap for `safe_fire` or `hazard_fire`; below it a flame is `unsure_fire` |
+| `HAL_FIRE_HAZARD_CONFIRM_S` | `10.0` | How long OWLv2 must keep seeing flame (or smoke) before it alerts |
+| `HAL_FIRE_HAZARD_FLUSH_S` | `10.0` | Min gap between `fire_hazard.detected` events |
+| `HAL_FIRE_HAZARD_DEDUP_WINDOW_S` | `1800.0` | Re-alert pace for a still-confirmed `safe_fire` (30 min) |
+| `HAL_FIRE_HAZARD_REALERT_S` | `60.0` | Re-alert pace for a still-confirmed `hazard_fire`, `unsure_fire` or `smoke` |
+
+Fixed in code, not env: a streak whose last sighting is over 30 s old starts over
+(`_STREAK_MAX_GAP_S`); the 429 pause is 5 s doubling per 429 in a row up to 60 s with
+±20 % jitter (`_RATE_LIMIT_BACKOFF_*`); a gate model that fails to load is retried every
+10 min (`_LOAD_RETRY_S` in `fire_gate.py`).
+
+**How to read the log:**
+
+```bash
+tail -f /var/log/hal/server.log | grep -E '\[fire_(hazard|gate)\]'
+```
+
+```
+[fire_gate] model ready in <ms> ms (/root/local/models/yolo26s_fire_e2e_320.onnx, 320x320, 2 threads, threshold 0.20, names {...})
+[fire_hazard] gate hit: fire 0.41 — escalating to OWLv2
+[fire_hazard] Fire hazard detected: hazard_fire (1 snapshots)
+[fire_gate] model unavailable (...); OWLv2 runs every check until it loads
+[fire_hazard] preset fire_hazard_v1 rejected (400), retrying with classes
+[fire_hazard] preset response has no known classes; is the server older than the preset?
+[fire_hazard] HTTP 429 (quota) — pausing detection for 6s: ...
+```
+
+The hourly `fire_hazard_stats` telemetry row (fields in
+[Sensing behavior](sensing-behavior.md#fire-hazard)) shows the same picture across a
+fleet: `gate_hits`, `escalations`, `owlv2_calls` and their failure counts.
+
+**Tuning:**
+
+| Symptom | Fix |
+|---------|-----|
+| A visible flame never logs `gate hit` | Lower `HAL_FIRE_HAZARD_GATE_SCORE_THRESHOLD` (0.2 → 0.15); more frames go to OWLv2 |
+| One lamp escalates all the time (`gate_hits` / `escalations` high, `owlv2_calls` close to one per check) | Look at what is in view (TV, glare, a lit candle); raise `HAL_FIRE_HAZARD_GATE_SCORE_THRESHOLD` (0.2 → 0.3) only if the scene is not a real flame |
+| `gate_unavailable` high, or `model unavailable` in the log | Check the download from `HAL_FIRE_HAZARD_GATE_MODEL_URL` and the file at `HAL_FIRE_HAZARD_GATE_MODEL_PATH`; until it loads, OWLv2 runs every check |
+| Gate CPU load too high | Lower `HAL_FIRE_HAZARD_GATE_THREADS` (2 → 1); each frame takes longer |
+| Alert comes too late | Lower `HAL_FIRE_HAZARD_CONFIRM_S` (10 → 6) or `HAL_FIRE_HAZARD_CHECK_INTERVAL_S` (5 → 3, about every 4 s); both raise false alerts or uploads |
+| False alerts from a brief flicker | Raise `HAL_FIRE_HAZARD_CONFIRM_S` (10 → 15) or `HAL_FIRE_HAZARD_CONFIDENCE_THRESHOLD` (0.3 → 0.4) |
+| A real hazard repeats too often | Raise `HAL_FIRE_HAZARD_REALERT_S` (60 → 120) |
+| A fireplace or candle alerts too often | Raise `HAL_FIRE_HAZARD_DEDUP_WINDOW_S` (1800 → 3600) |
+| `owlv2_preset_fallback` > 0, or `rejected (400)` in the log | The server does not know the preset: deploy the server, or set `HAL_FIRE_HAZARD_PRESET=` to send classes |
+| `preset response has no known classes` warning | The server is older than the preset and ignores it: deploy the server first |
+| `owlv2_timeout` high | Check DL backend latency; raise `HAL_FIRE_HAZARD_API_TIMEOUT_S` only if replies are slow but arrive |
+
+---
+
 ## Apply Changes
 
 After editing `hal/config.py` or `voice_service.py` on the Pi:
@@ -463,3 +543,11 @@ tail -f /var/log/hal/server.log
 ```
 
 No reboot needed — just restart the service.
+
+### Post-capture voice noise guard (lamp-52e6 trial)
+
+The measured trial uses `HAL_SILERO_THRESHOLD=0.15`, `HAL_REALTIME_NOISE_SPEECH_RATIO=0.45`, and `HAL_VOICE_NOISE_MIN_VOICED_MS=160` in `/opt/hal/.env`, followed by a HAL restart. The duration condition requires code supporting the new key; lowering the ratio alone does not reject isolated high-ratio noise spikes. These values are stored in `robots/lamp/rootfs/opt/hal/.env` as the lamp profile defaults. The shared code defaults remain ratio `0.55` and minimum duration `0`; microphone variants still need their own acoustic validation.
+
+On 2026-10-08, 12 captures through the device's existing post-AEC pipeline covered background (6), servo (3), and speaker echo (3). Two previously recorded human utterances plus 14 derived gain/padding variants were replayed on-device. The old ratio-only guard accepted 7/12 noise samples and 15/16 speech samples; the trial accepted 0/12 and 16/16 respectively. These are guard decisions, not end-to-end false dispatch rates. The variants are not independent human recordings, and tuning and evaluation used the same small corpus; broader speech, physical tap, and sleep/wake validation remain necessary.
+
+The guard also applies in automatic mode and before OS fallback when realtime is off/unavailable. Only empty/short transcripts selected by the existing policy are checked; other transcript filters remain unchanged. Logs expose `voiced_ms`, `min_ratio`, `min_voiced_ms`, and `accepted`. The duration is cumulative voiced audio, not a required delay: the extra decision is arithmetic on the existing Silero result.

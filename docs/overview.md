@@ -8,7 +8,7 @@ Agentic Runtime (AI/LLM) → OS Server (Go, :5000) → HAL (Python, :5001) → H
 
 | Layer | Language | Port | Role |
 |-------|----------|------|------|
-| Agentic Runtime | Go | WS | AI brain, LLM, SKILL.md, memory, channels |
+| Agentic Runtime | Go | WS / SSE | AI brain, LLM, SKILL.md, memory, channels (Hermes and remote Hermes use HTTP+SSE; the others use WebSocket) |
 | OS Server | Go | 5000 | System (network, OTA, MQTT, reset), sensing event routing, local intent |
 | HAL | Python | 5001 | Hardware drivers (servo, LED, camera, audio, display), FastAPI |
 
@@ -17,7 +17,7 @@ Agentic Runtime (AI/LLM) → OS Server (Go, :5000) → HAL (Python, :5001) → H
 - **[Harness](https://github.com/autonomous-ai/openharness):** `harness-use` delegates coding and research to agents on a paired computer over a direct authenticated LAN connection. Questions and results return through voice or chat. Harness-only voice routes manual tap-to-record captures to the agent focused in Harness. See [Harness](harness.md).
 - **Mac computer use:** `computer-use` lets the device agent observe, act and verify through Autonomous Buddy, using the bundled Cua Driver and screenshot support. Buddy executes desktop actions; the device agent owns reasoning and completion. Harness and Buddy keep separate pairing and connections. See [Computer use](../integrations/companions/autonomous-buddy/docs/computer-use.md).
 - **Jev:** the OS-managed Hermes plugin selects and preloads an installed skill before the first model call, with normal skill discovery as fallback. This plugin is enabled in the current build; the separate voice-intent fallback is on by default, while Buddy's action-suggestion endpoint is enabled but experimental. Selection does not execute actions or grant permission. See [Hermes preloading](agentic/hermes.md#13-optional-jev-skill-preloading), [intent fallback](os-server.md#jev-intent-fallback), and [Buddy suggestions](os-server.md#buddy-computer-use-feedback).
-- **Realtime voice:** HAL supports Gemini Live (default model `gemini-3.8-live`), OpenAI Realtime, GPT-Live and Pipecat v1. Pipecat orchestrates STT → an OpenAI-compatible LLM (default `qwen/qwen3.6-35b-a3b`) → HAL TTS on the device; model calls still use remote services. Normal voice can answer directly or delegate to the main runtime.
+- **Realtime voice:** HAL supports Gemini Live (os-server seeds `gemini-3.8-live-extended-thinking` into `config.json` and re-seeds it on unpinned `realtime` blocks; HAL's own fallback when no model is configured is `gemini-3.8-live`), OpenAI Realtime, GPT-Live and Pipecat v1. Pipecat orchestrates STT → an OpenAI-compatible LLM (default `qwen/qwen3.6-35b-a3b`) → HAL TTS on the device; model calls still use remote services. Normal voice can answer directly or delegate to the main runtime.
 - **Smart Turn:** local ONNX inference supplements silence detection in shared non-Live hands-free capture; Pipecat Live uses its own Silero VAD + Smart Turn pipeline. Silence fallbacks bound the wait when inference is unavailable. Manual Harness capture ends on the user's tap. The optional `pipecat` extra is included in Lamp/Pi/OrangePi setup and excluded from Reachy because of ONNX dependency conflicts. See [Realtime voice](realtime-voice.md).
 
 ## Project Directory
@@ -170,6 +170,27 @@ the new runtime and swipe configuration were deployed to Lamp `lamp-0c4e` on
 See [physical controls](../robots/lamp/docs/physical-controls.md) for configuration
 and gesture details.
 
+Servo overload thresholds are device-owned too, in `robots/lamp/servo_overload.json`
+(`boards` map: `load`, `hold_s`, `retry_s`, optional `enabled`, `contact` and
+`torque_limit`), read by `hal/board/servo_overload.py`. A watched joint at or above its
+`contact.load` floor for `contact.hold_s` makes the feetech driver halt in place (torque
+stays on), silently, and hold still for `contact.pause_s` before easing back into idle; still
+held `contact.release_after_s` into that pause, it releases torque like the cut-off. A
+joint at or above `load` for `hold_s` cuts torque on every servo, plays the ack chime and refuses
+motion for `retry_s` before resuming. `torque_limit` caps how hard a joint can push. No
+file, no board entry or `enabled: false` means none of these, and a malformed file
+rejects startup. A field HAL does not know is not malformed: every per-board config
+(`servo_overload`, `gpio_button`, `mpr121`, `ttp223`, `privacy_button`, `sen55`,
+`sen63c`, `scd41`) logs and drops it (`hal/board/config_fields.py`), because the device
+package and HAL update separately and a newer package must not take down an older HAL
+(lamp-52e6 failed boot six times on `contact.release_after_s` with HAL 0.1.282). Lamp watches `base_yaw` 55 %, `wrist_roll` 75 %, `wrist_pitch` 65 %
+for 0.05 s with a 3 s pause, and while a recording plays every joint is held to its
+learned per-frame envelope + 12 % load or + 3.5° lag (`contact.profile_margin`,
+`contact.lag_margin`, learned per unit by `POST /servo/contact/learn`), gaze turns,
+tracking and holds use the `contact.off_playback` load/lag floors, caps `base_yaw`, `base_pitch` and `elbow_pitch` at 60 % torque, and
+keeps the cut-off at 80 % / 1.5 s / 120 s (measured on lamp-52e6). See the fail-safe section of
+[safety](safety.md).
+
 ## Principles
 
 - **Hardware is a plugin** — plug in and it works, unplug and it's skipped
@@ -250,7 +271,8 @@ board — point `OS_CONFIG_PATH` at the `make os-dev` state dir and one file fee
 both processes. `llm_api_key` alone covers LLM, `AutonomousSTT`, ElevenLabs TTS,
 image description, **and** Gemini Live (whose key falls back to it and whose
 endpoint is `llm_base_url` + `/ws/gemini`); `deepgram_api_key` is optional and
-only swaps the STT provider.
+only swaps the STT provider. HAL then connects to Deepgram directly and sends
+`mip_opt_out=true` on every connect, so the audio is not used to train Deepgram models.
 
 Music plays too. `MusicService` streams yt-dlp → ffmpeg → **aplay** (ALSA), or
 **paplay** when a Bluetooth sink is active — neither exists on macOS, so both
@@ -295,7 +317,7 @@ HAL sensing loop (every 2s) → Read 1 camera frame, run all detectors:
 Event has image? (large motion, face enter) → encode frame full-resolution JPEG q85
 Face enter image: original frame annotated with bounding boxes + labels
 
-POST /api/sensing/event {type, message, image?}
+POST /api/sensing/event {type, message, images?: []string}
     → OS server (Go):
         1. Voice event + local intent match? → execute directly (~50ms)
         2. No match → forward to OpenClaw:

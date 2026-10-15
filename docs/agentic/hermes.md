@@ -1,5 +1,7 @@
 # Hermes agent backend
 
+**Hardware-first startup:** The installer and onboarding maintain `/etc/systemd/system/hermes-gateway.service.d/20-hardware-startup.conf`, appending `ExecStartPre=-/usr/local/bin/os-server --wait-hal-ready` without replacing upstream gateway commands. This delays Hermes imports until HAL `/health` succeeds, reducing cold-boot storage contention. The helper checks immediately, retries once per second, and proceeds after at most 60 seconds if HAL remains unavailable. OS HTTP startup is independent; Hermes chat readiness can be later than hardware readiness. Older OS binaries reject the unknown `--wait-hal-ready` flag before initializing services; the leading `-` lets systemd continue after that exit. The OS restart command allows up to 180 seconds for gateway drain, the 60-second HAL wait, and startup overhead. An already-ready HAL adds only one local check on gateway restarts. The Go reconciliation reloads systemd only when the managed file changes; an OS-only upgrade applies the gate for subsequent gateway starts.
+
 The Jev preload carries the categorized `lookup_name` and instructs reference reads to reuse it exactly (for example `openclaw-imports/computer-use`). A bundled skill with the same bare name can coexist; preload does not delete it or resolve ambiguous bare-name calls on the model’s behalf.
 
 Hermes is one of the **swappable agentic backends** the os-server can run behind
@@ -27,25 +29,29 @@ which brain is active.
 
 | `agent_runtime` | Backend |
 |---|---|
-| unset | falls back to `gateway.default` in `robots/<type>/ROBOT.md`, then OpenClaw if that is empty too |
+| unset | falls back to the image-baked `/root/config/f_r_default_agent`, then `gateway.default` in `robots/<type>/ROBOT.md`, then OpenClaw if both are empty (`device.ResolveDefaultAgent`) |
 | `"openclaw"` | OpenClaw (default) |
-| `"hermes"` | Hermes (`hermes.ProvideService`) |
+| `"hermes"` | Hermes (`hermes.ProvideService`) — HTTP+SSE |
+| `"remote"` | Hermes-over-LAN: same client after `hermes.ApplyExternalEndpoint(agent_remote_url, agent_remote_token)` — see [`remote-hermes.md`](remote-hermes.md). HAL aliases `remote` → `hermes`. |
 | `"picoclaw"` | PicoClaw (`picoclaw.ProvideService`) — persistent WebSocket client; assumes the PicoClaw service is already running. See `docs/agentic/picoclaw.md` + `runtimes/picoclaw`. |
+| `"codex"` / `"claudecode"` / `"opencode"` | Codex / Claude Code / OpenCode (`<runtime>.ProvideService`) — see [`codex.md`](codex.md), [`claudecode.md`](claudecode.md), [`opencode.md`](opencode.md) |
 | anything else | OpenClaw (logged as `FALLBACK — unknown runtime=…`) |
 
 When `agent_runtime` is unset in `config.json`, the backend is taken from the
+image-baked `/root/config/f_r_default_agent` (survives factory reset), then the
 device's declared `gateway.default` (`robots/<type>/ROBOT.md`); OpenClaw is used
-only if that is also empty. The banner logs `source` so you can tell which won.
+only if both are empty. The banner logs `source` so you can tell which won.
 
 On startup `ProvideGateway` prints an `AGENT BACKEND ACTIVE → HERMES` banner with
 `base_url`, `conversation`, `model`, and `api_key_set`. There is **no per-unit
-config** for these yet — they are compile-time constants in
-`runtimes/hermes/constants.go`:
+config** for the local server — the defaults are package-level `var`s in
+`runtimes/hermes/constants.go` (mutable so the `remote` runtime can repoint
+`BaseURL`/`APIKey` via `ApplyExternalEndpoint`, `runtimes/hermes/remote.go`):
 
-| Const | Default | Meaning |
+| Var | Default | Meaning |
 |---|---|---|
 | `BaseURL` | `http://127.0.0.1:8642` | Local Hermes API server |
-| `APIKey` | `hermes-api-key` | Bearer for Hermes |
+| `APIKey` | `hermes-local-api-key` | Bearer for Hermes |
 | `Conversation` | `device-main` | Named channel all turns flow into |
 | `Model` | `hermes-agent` | Model id sent to Hermes |
 
@@ -134,8 +140,9 @@ this, os-server rotates the conversation name:
   the wired path is `maybeAutoNewSession` (compact is disabled), each firing
   dropped the history with no summary and the device lost what it had just said.
   250 k holds ~10 turns at that rate — a net has to sit **above** where the
-  gateway's own compression settles, not inside it (same value and reasoning as
-  [`codex`](codex.md)).
+  gateway's own compression settles, not inside it (same reasoning as
+  [`codex`](codex.md), which uses a lower 120 k net because larger contexts hit a
+  latency cliff on its per-turn `codex exec` transport).
 
 ## 4. Request protocol — native Runs and Responses fallback
 
@@ -213,14 +220,30 @@ restarts) is *not* uncertain: the prompt never left the device, so the request
 fails but the conversation stays usable.
 
 Native mode also requires the OS compatibility marker above: the unpatched
-Runs API omits tool-call IDs/results and cache details needed by the existing
-handler. The compatibility patch adds `tool.call.started` / `tool.call.completed`
+Runs API omits full tool-call IDs/arguments/results needed by the existing
+handler (0.21.1 also omits cache details). The compatibility patch adds `tool.call.started` / `tool.call.completed`
 with real call IDs, arguments and results, plus `cache_read_tokens` and
 `cache_write_tokens` in usage. The adapter reuses the Responses translator and
 maps cache counters into `input_tokens_details`; legacy `tool.started` /
 `tool.completed` progress is ignored to avoid duplicate callbacks. If the patch
 is absent or refuses an unknown source shape, keep Responses until a verified
 patch is installed and the gateway restarts.
+
+The embedded OS patch accepts the verified source shapes of Hermes 0.21.1
+(`v2026.9.7`) and 0.21.5 (`v2026.9.24`). For 0.21.5 it preserves upstream cache
+counters and the interim assistant callback; it only adds structured tool
+evidence and the capability marker. Selection uses source shape and runtime
+capabilities, not a version-string switch. Unknown or partially patched shapes
+remain rejected. This is still a local compatibility patch, not a patch-free
+native adapter: upstream tool previews cannot replace full tool results.
+
+`TestLocalHermesRunsIntegration` is opt-in: point
+`HERMES_INTEGRATION_ENDPOINT_FILE` at a private JSON file containing `url` and
+`key` for an isolated, patched Hermes API, then run
+`go test -count=1 -run '^TestLocalHermesRunsIntegration$' -v ./runtimes/hermes`.
+It calls the configured LLM, steers during a real terminal tool call, checks full
+tool results and call IDs, and stops a second run. Use a scratch session/home
+with personal hooks disabled; normal tests skip this paid integration check.
 
 Sensing/pose markers are stripped before send using the same regexes as OpenClaw
 (`[snapshot: …]`, `[pose_bucket: …]`, `[pose_worst: …]`) so the agent never sees
@@ -536,7 +559,7 @@ inline, a direct `bash install.sh` is fully configured and running.
 
 > Unit name: the gateway runs as `hermes-gateway.service`. The installer declares
 > this in `/usr/local/lib/os-runtimes/hermes/service` so `switch-runtime` enables
-> the right unit (§11); `reset_hermes.go` targets the same unit.
+> the right unit (§11); `runtimes/hermes/reset.go` targets the same unit.
 
 ### The gateway unit is self-healed (image pre-bake + runtime backstop)
 
@@ -563,7 +586,7 @@ succeeded. Two layers close this gap:
   switch-runtime `service`/`verify` files. This is fast — the binary + venv are
   already pre-baked, so it only writes the unit (no git clone / `uv sync`).
   `EnsureOnboarding` then **`systemctl enable`s** the unit (factory reset disables it
-  — `reset_hermes.go` step 4, "SetupAgent re-enables" — and a freshly installed one
+  — `runtimes/hermes/reset.go` step 4, "SetupAgent re-enables" — and a freshly installed one
   is not enabled for boot) and (re)starts it whenever config changed, the unit was
   just installed, **or** the unit exists but is not active (crashed / disabled).
 
@@ -656,6 +679,12 @@ during install) and does three things, in order:
      ignores the field the cache silently stays at 5m, so the setting is harmless
      where unsupported. The 1h tier costs 2x input on the cache write (vs 1.25x
      for 5m); reads are 0.1x either way.
+   - `.custom_providers[0].models.Auto-AI.context_length = 256000` — same
+     proxy-only scope. campaign-api's `/models` carries no context window, so
+     without an explicit value Hermes probes `/models` and Ollama `/api/show`
+     (~0.4s each from the lamp) **before every turn**, logs `Could not detect
+     context length … (probe-down)` and falls back to 256K anyway. Pinning the
+     same 256K skips both round trips without changing compression thresholds.
    - `.auxiliary.vision` (the whole node is **overwritten**) → `provider: custom:autonomous`,
      `model: qwen/qwen3.6-plus`, `timeout: 120`, `download_timeout: 30`, `extra_body: {}`
      — the image-understanding model, routed through the same autonomous provider.
@@ -689,7 +718,7 @@ during install) and does three things, in order:
 | `discord_bot_token` / `discord_guild_id` / `discord_user_id` | → | `.env` `DISCORD_BOT_TOKEN` / `DISCORD_GUILD_ID` / `DISCORD_ALLOWED_USERS` |
 | `whatsapp_user_id` | → | `.env` `WHATSAPP_ALLOWED_USERS` |
 
-`.env` `API_SERVER_KEY` must equal `constants.go` `APIKey` (`hermes-api-key`) or
+`.env` `API_SERVER_KEY` must equal `constants.go` `APIKey` (`hermes-local-api-key`) or
 every turn 401s. Hermes must listen on `127.0.0.1:8642` to match `BaseURL`.
 
 To target a different Hermes endpoint / key / model today, edit
@@ -716,7 +745,11 @@ simply absent.
   are read per session, not at gateway start.
 - The text comes from `device.ResolveSoul(deviceType)` (`system/device/soul.go`),
   the runtime-agnostic resolver for the `soul_ref` declared in
-  `robots/<type>/ROBOT.md`: **no ref → no-op and no error** (a soulless body keeps
+  `robots/<type>/ROBOT.md`. A config.json `soul_variant` (e.g. `"wajo"`) selects
+  the branded sibling of a path ref (`SOUL.md` → `SOUL.wajo.md`) when the profile
+  ships it, and falls back to the declared ref with a warning when it does not;
+  config.json is outside the device-profile OTA, so the choice survives updates.
+  **No ref → no-op and no error** (a soulless body keeps
   whatever default soul Hermes ships); an `http(s)://` ref is downloaded with a 30 s
   timeout; any other value is read as a path under `DevicesDir()/<type>/`; a
   declared-but-unresolvable ref is an error (surfaced, boot continues). The Hermes
@@ -811,7 +844,7 @@ before is the `terminal.cwd` bullet below.
   migrated device's persona from being deleted when both blocks shared one marker
   in one file (issue #403).
 - The block carries **the OS rule set every runtime gets** — eight rules: skill
-  priority (`skills/openclaw-imports/` beat any overlapping Hermes bundled skill;
+  priority (`~/.hermes/skills/openclaw-imports/` beat any overlapping Hermes bundled skill;
   third-party services go through `connectors`; never install an alternative
   client/CLI for a service a connector covers), `memories/USER.md` discipline,
   skill scope before acting — including the four-branch `SKILL.md` selection
@@ -913,7 +946,7 @@ still-installed old backend). Hermes-specific facts the generic switcher relies 
 
 - **Unit name** `hermes-gateway.service` (not `hermes.service`) — declared in
   `/usr/local/lib/os-runtimes/hermes/service` so `switch-runtime` enables the right
-  unit; `reset_hermes.go` targets the same unit.
+  unit; `runtimes/hermes/reset.go` targets the same unit.
 - **Verify hook** `/usr/local/lib/os-runtimes/hermes/verify` runs `command -v
   hermes` (cheap CLI-presence check). It is deliberately **not** a config-structure
   check — config self-heals via presync (§10), so a verify failure would force an
@@ -929,7 +962,7 @@ Confirm the swap from the `AGENT BACKEND ACTIVE → HERMES` banner + a healthy
 ## 12. Persona, memory & skills carried across a switch
 
 Switching openclaw→hermes runs a Go persona migration
-(`system/agent/migrate_persona/openclaw_to_hermes.go`) at os-server boot —
+(`system/agent/migrate_persona/runtime_hermes.go` via `migrator.go`) at os-server boot —
 **separate from `claw migrate`**. It carries, into `~/.hermes/`:
 
 - **SOUL.md** (rebranded) — and, because Hermes has no separate IDENTITY.md slot,
@@ -963,7 +996,7 @@ SOUL and restores its fields back into OpenClaw's `IDENTITY.md`** (`restoreIdent
 the inverse of the inline) — so the name set under Hermes survives the trip back,
 not just the trip out. **Skills** stay fresh under Hermes via two complementary
 paths: every `EnsureOnboarding` capability-gates and reconciles the full supported
-catalog from the CDN into `skills/openclaw-imports` (repairing stale local files
+catalog from the CDN into `~/.hermes/skills/openclaw-imports` (repairing stale local files
 even when OTA was published before the watcher started), while `skill_watcher.go`
 polls OTA metadata every five minutes for later publishes. Both use the shared
 `system/skills/skillzip.go` engine; a real content change restarts the gateway and
@@ -975,8 +1008,8 @@ second root of its own (`runtimes/hermes/save_skill.go`):
 
 | Root | Owner | Written by |
 |------|-------|------------|
-| `skills/openclaw-imports/` | `hermes claw migrate` + the skill watcher | presync §0, CDN updates |
-| `skills/authored/` | the device | `AgentGateway.SaveSkill` / `InstallSkillArchive` (web UI "Write skill" / "Install") |
+| `~/.hermes/skills/openclaw-imports/` | `hermes claw migrate` + the skill watcher | presync §0, CDN updates |
+| `~/.hermes/skills/authored/` | the device | `AgentGateway.SaveSkill` / `InstallSkillArchive` (web UI "Write skill" / "Install") |
 
 The split is load-bearing, not cosmetic: presync §0 restores the imported
 platform skills **only when `openclaw-imports` is empty**, so an authored skill
@@ -986,8 +1019,8 @@ would silently never restore the real imports. `ListSkills` merges both roots
 discovers skills anywhere under `~/.hermes/skills`, so no config change is
 needed, and no gateway restart either — skills are re-read per session.
 
-Note that `wipeHermesState` (reset.go) clears `skills/openclaw-imports` but
-**not** `skills/authored`, so user-authored skills survive a factory reset.
+Note that `wipeHermesState` (reset.go) clears `~/.hermes/skills/openclaw-imports` but
+**not** `~/.hermes/skills/authored`, so user-authored skills survive a factory reset.
 
 **MCP connectors are carried across too** — the configured remote-MCP servers are
 cloned config→config by `MCPReconcile` on the same switch boot (see §10, *MCP
@@ -1098,23 +1131,34 @@ instructions prioritize the explicitly requested action over small talk,
 question/context modifiers, and proactive or supporting skills. Missing action
 parameters do not prevent routing: the selected skill can resolve them later.
 
-Only the current user message and OS platform skill names/descriptions are
-sent. The roster scans `skills/openclaw-imports` under the active Hermes home,
-using Hermes's native `agent.skill_utils` helpers: `iter_skill_index_files`,
-`parse_frontmatter`, `get_disabled_skill_names`, `skill_matches_platform`, and
-`skill_matches_environment`. This avoids `skills_list()` deduplication by first matching
-name hiding an OS skill behind a bundled skill with the same name. Other bundled,
-authored, and plugin skill categories are excluded. Metadata reads are bounded;
-conversation history and skill bodies are not sent. Each candidate description
-is capped at 500 characters. Native `skill_view` lookups use the qualified
-`openclaw-imports/<relative directory>` path to avoid name collisions.
+Only the current user message and eligible skill names/descriptions are sent.
+The roster combines two sources under the current Hermes context:
 
-If there are more than 32 eligible candidates, the router skips Jev entirely
-rather than truncating the catalog. Empty messages, messages over 8,000 UTF-8
-bytes, slash commands, `[system]` notices, and explicit `[skills:...]` selections also bypass the
-router. The catalog worker inherits the current Hermes context so
-session/platform skill filters still apply. This preloading experiment covers
-OS platform skills; normal Hermes discovery continues to handle other skills.
+- OS skills: scan `skills/openclaw-imports` with native `agent.skill_utils`
+  metadata, disabled, platform, and environment filters. Keep qualified
+  `openclaw-imports/<relative directory>` lookup paths so a bundled namesake
+  cannot hide or replace an OS skill.
+- Runtime skills: use native `skills_list()` for bundled, authored (including
+  `session-recall`), external/project, and plugin skills visible to Hermes.
+  Preserve native eligibility and lookup names; ignore its OS-category entries
+  because the direct scan above already handles them. When names collide, the
+  eligible OS entry wins; otherwise native listing order resolves duplicates.
+
+Native catalog failures leave discovery to Hermes rather than routing against
+an incomplete roster. Metadata reads are bounded; conversation history and skill
+bodies are not sent. Each candidate description is capped at 500 characters.
+The selected skill is rechecked against the current combined catalog and loaded
+through native `skill_view`, with the same preload checks for both sources.
+
+There is no 32-skill cutoff. The complete serialized JSON request (including
+prompt and questions) has a local 256 KiB wire budget, not a declared provider
+limit. If exceeded, log `skipped reason=catalog_budget` and fall back to normal
+Hermes discovery without truncating the roster or making a request. The existing
+3-second turn budget, 64 KiB response cap, and confidence thresholds still apply;
+large catalogs are not guaranteed to finish within that budget. Empty messages,
+messages over 8,000 UTF-8 bytes, slash commands, `[system]` notices, and explicit
+`[skills:...]` selections also bypass the router. The catalog worker inherits the
+current Hermes context so session/platform skill filters still apply.
 
 A selection requires choice probability at least 0.70, a margin of at least
 0.20 over the runner-up, and fit at least 0.60. These are provisional thresholds
@@ -1128,6 +1172,25 @@ its late result cannot inject skill content. HTTP 429 follows the same fallback
 and 30-second cooldown; no provider error body or `Retry-After` diagnostics are
 added by preloading.
 
+Machine event turns reuse the decision for their kind. When the message starts
+with a lowercase header such as `[sensing:sound]` or `[environment:update]`
+(anything except `[user]`), the first valid decision (preload or abstention) is
+memoized under that header plus the current eligible skill set; later turns of
+that kind skip the proxy request, still recheck and natively load the skill,
+and log `cached=1` without `request_ms`. A catalog change or a plugin restart
+clears the reuse; errors and timeouts are never memoized; the memo holds at most
+64 entries and is cleared when full. Typed user text always asks the proxy. Rationale: on lamp-52e6 (2026-10-06..09)
+every valid decision per event kind was identical (`sensing:sound`, `environment:update`
+and `activity` always preloaded the same skill; `sensing:presence.*` enter/away always
+abstained) while each request blocked the turn for ~1.5 s.
+
+Voice turns (`[via:voice]` anywhere in the message) skip the decision and log
+`outcome=skipped reason=voice_turn`. On lamp-52e6 the plugin blocked every voice
+turn for a median 1.47 s (n=300) while a preload happened on only ~11% of them and
+spared at most one `skill_view` round (~2.5 s). A same-binary A/B (11 injected voice
+turns each) cut no-tool replies from 3.4-7.0 s to 2.2-2.6 s and added no
+`skill_view` rounds.
+
 Structured logs distinguish accepted selections from valid abstentions and
 failures instead of grouping them as `deferred`:
 
@@ -1136,7 +1199,7 @@ failures instead of grouping them as `deferred`:
 | `preloaded` | A valid decision passed all acceptance thresholds and native skill content was loaded for this turn |
 | `abstained` | A valid decision selected `none` or failed `low_choice`, `low_margin`, or `low_fit` |
 | `error` | `http_error`, `network_error`, `invalid_json`, `response_too_large`, `provider_error`, `invalid_schema`, `catalog_error`, `thread_error`, `config_error`, `skill_unavailable`, `skill_load_failed`, or `preload_timeout` |
-| `skipped` | `disabled`, `invalid_message`, `explicit_selection`, `system_message`, `unconfigured`, `cooldown`, `busy`, or `no_candidates` |
+| `skipped` | `disabled`, `invalid_message`, `explicit_selection`, `system_message`, `unconfigured`, `cooldown`, `busy`, `no_candidates`, or `catalog_budget` |
 | `timeout` | The decision wait budget expired |
 
 Logs include validated `session_id`, `turn_id` and `task_id` when supplied by
@@ -1179,9 +1242,9 @@ based on the [TypeSafe skill-suggestion cookbook](https://docs.typesafe.ai/cookb
 | Area | Reference plugin | OS plugin |
 |---|---|---|
 | Hook | `pre_llm_call`, returns optional user-message context | Same hook; accepted skill content is loaded natively into ephemeral current-turn context; no system-prompt modification |
-| Skill data | Filesystem roster; shortlist receives full descriptions and up to 700 body characters | Bounded metadata from `openclaw-imports` files with native Hermes eligibility filters, descriptions capped at 500 characters, no body text; qualified skill lookup avoids name collisions |
+| Skill data | Filesystem roster; shortlist receives full descriptions and up to 700 body characters | OS metadata scan plus native Hermes `skills_list()` (runtime and plugin skills); OS wins name collisions; descriptions capped at 500 characters, no body text |
 | Decision | Stage 1 ranks and gates skill need; stage 2 reranks a shortlist of 3 (per chunk) | One request with choice, `none`, and per-candidate fit |
-| Large catalogs | Splits into chunks of 240 choices | Skips when more than 32 eligible skills |
+| Large catalogs | Splits into chunks of 240 choices | Full catalog up to a local 256 KiB serialized request budget; skips without truncation above it |
 | Acceptance | Catalog pin: gate 0.30 and winner fit 0.40; newer upstream also arbitrates disagreeing choice/fit signals | Choice 0.70, margin 0.20, fit 0.60; provisional preloading thresholds, uncalibrated for this workload |
 | Latency | Default hook budget 10 seconds, answer cache and retry-capable client | Temporary 3-second diagnostic budget, no retries/cache, busy bypass and cooldown |
 | Credentials | TypeSafe API with separate key | Shared OS proxy credentials |
@@ -1218,3 +1281,7 @@ handling isolates the conversation instead of replaying work. Unrelated queued
 requests retain their existing admission and ownership checks. This is not a
 user `/stop`, does not create a model turn, and does not erase the Harness intent
 journal or dispatch a Harness task.
+
+### BlueBubbles runtime patch validation
+
+BlueBubbles source patches compile their generated Python before replacing the installed module. The webhook subscription patch keeps its marker on a standalone line so inline registration dictionaries retain their closing delimiters. CI fixture suites cover application, compilation, repeated application and rejected source drift for every embedded patch; these checks do not require a device or BlueBubbles server.

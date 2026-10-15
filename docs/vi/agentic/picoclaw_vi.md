@@ -47,9 +47,11 @@ não nào đang chạy.
 
 | `agent_runtime` | Backend |
 |---|---|
-| `"openclaw"` / để trống | OpenClaw (mặc định; hoặc `gateway.default` từ `ROBOT.md`) |
-| `"hermes"` | Hermes (`hermes.ProvideService`) |
+| để trống | `/root/config/f_r_default_agent` bake trong image, nếu không thì `gateway.default` từ `ROBOT.md`, nếu không thì OpenClaw |
+| `"openclaw"` | OpenClaw (mặc định) |
+| `"hermes"` / `"remote"` | Hermes (`hermes.ProvideService`; `remote` = Hermes-qua-LAN qua `ApplyExternalEndpoint`) |
 | `"picoclaw"` | PicoClaw (`picoclaw.ProvideService`) |
+| `"codex"` / `"claudecode"` / `"opencode"` | Codex / Claude Code / OpenCode (`<runtime>.ProvideService`) |
 | giá trị khác | OpenClaw (log là `FALLBACK — unknown runtime=…`) |
 
 Khi khởi động, `ProvideGateway` in banner `AGENT BACKEND ACTIVE → PICOCLAW` kèm
@@ -157,7 +159,9 @@ và thử lại ở poll kế tiếp.
   discord (`discord_bot_token` + `discord_user_id`), slack (`slack_bot_token` +
   `slack_app_token` + `slack_user_id`), whatsapp native (`whatsapp_user_id` →
   `allow_from`, không token, quét QR lần đầu). Secrets nằm trong `.security.yml` dưới
-  `channel_list.<ch>.settings`; phần cấu trúc ở `config.json`.
+  `channel_list.<ch>.settings`; phần cấu trúc ở `config.json`. Có bot token Telegram
+  mà thiếu `telegram_user_id` thì kênh vẫn tắt: `allow_from` rỗng sẽ cho bất kỳ ai tìm
+  thấy bot ra lệnh cho thiết bị.
 
 Log của gateway xác nhận cấu hình khi boot (`Gateway started on 127.0.0.1:18790`,
 health ở `/health` `/ready` `/reload`, `Channels enabled: [pico]`). Cảnh báo
@@ -452,7 +456,9 @@ nên reset **xóa sạch** `/root/.picoclaw` rồi onboard lại một baseline 
    crash) nên gateway nằm yên trong lúc wipe. `waitForPicoclawStop` poll `is-active`
    tối đa 5s.
 2. **`systemctl disable picoclaw`** — factory reset cũng xóa `/root/config/config.json`
-   và reboot về runtime **mặc định (openclaw)**, nên PicoClaw KHÔNG được auto-start.
+   và reboot về runtime **mặc định** của thiết bị (`f_r_default_agent`, nếu không thì
+   ROBOT.md `gateway.default` — vd. hermes trên Lamp — chỉ về openclaw khi cả hai đều
+   không set), nên PicoClaw KHÔNG được auto-start.
    `switch-runtime` chỉ re-enable khi user switch trở lại.
 3. **`rm -rf /root/.picoclaw`** — config, `.security.yml`, workspace (persona/memory/
    skills), sessions, và **marker `.openclaw-migrated`** (để `presync.sh` §0 migrate
@@ -474,24 +480,28 @@ gateway hiện có của onboarding; reconcile không đổi không restart.
 **Jev mặc định tắt** bằng `const jevEnabled = false` trong `runtimes/picoclaw/jev_hook.go`. Khi tắt, bridge không tạo selector; onboarding native không cài asset hay tạo đăng ký Jev mới. Nếu có đăng ký Jev cũ, Go chỉ tắt đăng ký đó; các cấu hình khác được giữ nguyên. Không đọc skill, gọi provider hay thêm nội dung Jev vào yêu cầu khi tắt. Muốn bật sau kiểm chứng, đổi cờ Go rồi build và restart qua luồng quản lý runtime. Observer vẫn quản lý global gate `hooks.enabled`; Jev không thay đổi gate đó.
 Sidecar chỉ chứa đường dẫn tuyệt đối tới config OS; credential được đọc khi dùng.
 
-Hook dùng chung selector Hermes: tối đa 32 ứng viên, ngân sách chọn/nạp tổng cộng
-3 giây, choice >= 0.70, margin >= 0.20, fit độc lập >= 0.60. Lỗi, worker bận,
+Hook dùng chung selector Hermes: ngân sách request sau serialize 256 KiB thay
+cho giới hạn số ứng viên (catalog quá lớn thì abstain, không cắt bớt), ngân sách
+chọn/nạp tổng cộng 3 giây, choice >= 0.70, margin >= 0.20, fit độc lập >= 0.60. Lỗi, worker bận,
 timeout, abstain, slash command hoặc chỉ dẫn `[skills: ...]` giữ cơ chế tìm skill
 bình thường. Chỉ câu người dùng hiện tại và mô tả ứng viên được gửi tới Jev,
 không gửi lịch sử chat. Log `[picoclaw-jev]` không ghi prompt, credential hay nội
 dung skill.
 
 Danh sách ứng viên lấy từ `<skills>` trong system prompt native của PicoClaw,
-giới hạn ở file tồn tại trong `/root/.picoclaw/workspace/skills`. Không tự tạo
-catalog bằng cách quét thư mục khác. Thiếu roster hoặc sai định dạng thì bỏ qua.
+gồm skill workspace, global và built-in. Discovery native quyết định ưu tiên
+workspace > global > built-in và áp dụng bộ lọc `AllowedSkills` của turn trước
+khi công bố; hook không quét thư mục khác hay thêm lại skill bị loại. Các entry
+giống hệt lặp ở nhiều phần system message được gộp lại. Thiếu roster hoặc sai
+định dạng thì bỏ qua.
 Toàn bộ SKILL.md được chọn, đường dẫn tuyệt đối và thư mục tham chiếu được nạp
 vào context tạm của user message hiện tại; giữ nguyên system message và tools.
-Từ chối file quá 128 KiB, đường dẫn vượt skill root, tên trùng không rõ ràng và
+Từ chối file quá 128 KiB, đường dẫn tương đối hoặc có traversal, tên trùng không rõ ràng và
 inline shell template; preload không thực thi nội dung skill. Cache RAM giới hạn 256 turn chỉ nhớ skill đã chọn và prompt gốc. Mỗi iteration
 kiểm tra lại roster native hiện tại và đọc lại toàn bộ file an toàn; skill bị gỡ
 hoặc lỗi đọc sẽ hủy lựa chọn. Turn có attachment/content-part, system, sensing
-hay đã handled đều bỏ qua Jev. Đọc theo descriptor với no-follow chặn symlink
-và file không phải regular; context sau đóng gói cũng giới hạn 128 KiB. Không ghi persona
+hay đã handled đều bỏ qua Jev. Đọc theo descriptor từ gốc filesystem với
+no-follow chặn symlink ở mọi thư mục cha, symlink file và file không phải regular; context sau đóng gói cũng giới hạn 128 KiB. Không ghi persona
 hoặc file lịch sử. Turn thiếu ID/iteration và child turn được bỏ qua.
 
 Hook native bao phủ kênh WebSocket `pico` (voice/Web/MQTT qua OS) lẫn kênh trực

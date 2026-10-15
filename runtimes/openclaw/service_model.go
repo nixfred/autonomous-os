@@ -8,26 +8,23 @@ import (
 	"path/filepath"
 )
 
-// UpdatePrimaryModel patches agents.defaults.model.primary in openclaw.json
-// to "autonomous/{modelKey}" and restarts the gateway so the change takes
-// effect immediately. Writes the expected primary into the write flag before
-// the file write so the primary-model watcher recognises this as a
-// Lamp-initiated write and does not sync it back.
-//
-// No-op when modelKey is empty or when openclaw.json does not yet exist.
+// UpdatePrimaryModel patches agents.defaults.model.primary in openclaw.json to "autonomous/{modelKey}" and restarts the gateway so the change takes effect immediately.
 func (s *OpenclawService) UpdatePrimaryModel(modelKey string) error {
-	if modelKey == "" {
+	if s.config.LLMRuntimeManaged() || modelKey == "" {
 		return nil
 	}
 
 	s.primarySyncMu.Lock()
 	defer s.primarySyncMu.Unlock()
+	if s.config.LLMRuntimeManaged() {
+		return nil
+	}
 
 	configPath := filepath.Join(s.config.OpenclawConfigDir, "openclaw.json")
 	raw, err := os.ReadFile(configPath)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return nil // device not set up yet; skip silently
+			return nil
 		}
 		return fmt.Errorf("read openclaw config: %w", err)
 	}
@@ -39,10 +36,9 @@ func (s *OpenclawService) UpdatePrimaryModel(modelKey string) error {
 
 	newPrimary := customProviderName + "/" + modelKey
 	if current := extractPrimaryModel(configData); current == newPrimary {
-		return nil // already set, nothing to do
+		return nil
 	}
 
-	// Drill to agents.defaults.model and update primary.
 	agents := ensureMap(configData, "agents")
 	defaults := ensureMap(agents, "defaults")
 	modelMap := ensureMap(defaults, "model")
@@ -56,8 +52,6 @@ func (s *OpenclawService) UpdatePrimaryModel(modelKey string) error {
 		return fmt.Errorf("marshal openclaw config: %w", err)
 	}
 
-	// Write the expected primary into the flag BEFORE the file write so the
-	// watcher can match content (not just mtime) to identify this as Lamp's.
 	setOSWriteFlag(s.config.OpenclawConfigDir, newPrimary)
 
 	if err := atomicWriteFile(configPath, written, 0600); err != nil {

@@ -1,8 +1,4 @@
-"""Physical privacy policy shared by input handlers and peripheral consumers.
-
-Camera/speaker locks are temporary overlays on the user's existing preferences.
-They are configured per device, never inferred from a device name.
-"""
+"""Physical privacy policy: per-device camera/speaker locks overlaid on user preferences."""
 
 from functools import wraps
 import logging
@@ -74,9 +70,9 @@ def apply(muted, config):
 
 
 def mic_locked():
-    """Extra privacy guards apply only to devices opting into peripheral locks."""
+    """The hardware microphone switch is authoritative on every device."""
     from hal import app_state as state
-    return (camera_muted or speaker_muted) and state._hw_mic_switch_muted is True
+    return state._hw_mic_switch_muted is True
 
 
 def prepare(config):
@@ -111,7 +107,6 @@ class GuardedCamera:
     @serialized
     def stop(self):
         self._capture.stop()
-        # Discard frames retained by the backend across stop/start.
         self._capture.last_response = None
 
     @property

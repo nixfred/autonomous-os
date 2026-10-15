@@ -1,12 +1,11 @@
-// Package device owns the device-level service: setup/provisioning (setup.go),
-// messaging channels (channels.go), config updates (config_update.go), realtime
-// voice config (realtime.go), agent-runtime switching (runtime.go), the backend
-// status reporter (status_reporter.go), ROBOT.md parsing (devicemd.go),
-// hardware identity (hardware.go), and timezone (timezone.go).
+// Package device owns the device-level service: setup, channels, config updates,
+// agent-runtime switching, status reporting, ROBOT.md parsing and timezone.
 package device
 
 import (
+	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"os/exec"
 	"sync"
@@ -31,7 +30,18 @@ type Service struct {
 	beClient        *beclient.Client
 	statusLED       *statusled.Service
 	setupState      setupState
+	setupRuntime    setupRuntime
 	runtimeSwitchMu sync.Mutex
+	runtimeLogin    runtimeLoginState
+	wakeApply       wakeWordApply
+	// Optional command override for isolated service tests.
+	halRestartCommand func(context.Context) error
+	halInputModeApply func(context.Context, string, bool) error
+	// Optional HAL apply override for isolated cloud perception tests.
+	halCloudPerceptionApply func(context.Context, config.CloudPerception) error
+	cloudApply              cloudPerceptionApply
+	// foMu serializes Fo token refreshes (fo.go).
+	foMu sync.Mutex
 }
 
 func ProvideService(config *config.Config, ns *network.Service, gw domain.AgentGateway, be *beclient.Client, sled *statusled.Service) *Service {
@@ -46,39 +56,47 @@ func ProvideService(config *config.Config, ns *network.Service, gw domain.AgentG
 	}
 }
 
-// restartHAL restarts hal in the background so it re-reads config.json — HAL
-// reads the voice pipeline and realtime blocks at import, so a restart is the
-// only way to apply them. After a successful restart the boot-time config
-// baseline is refreshed so the next os-server restart sees the running HAL as
-// up-to-date and skips a redundant restart.
+// restartHAL restarts HAL in the background so it re-reads config.json, then
+// refreshes the boot-time config baseline to avoid a redundant restart.
 func (s *Service) restartHAL(reason string) {
 	go func() {
-		slog.Info("restarting hal", "component", "device", "reason", reason)
-		out, err := exec.Command("systemctl", "restart", "hal").CombinedOutput()
-		if err != nil {
-			slog.Warn("hal restart failed", "component", "device", "reason", reason, "error", err, "output", string(out))
-			return
-		}
-		slog.Info("hal restarted", "component", "device", "reason", reason)
-		if err := config.SnapshotHALConfig(); err != nil {
-			slog.Warn("hal config snapshot failed", "component", "device", "error", err)
+		if err := s.restartHALAndWait(context.Background(), reason); err != nil {
+			slog.Warn("hal restart failed", "component", "device", "reason", reason, "error", err)
 		}
 	}()
 }
 
-// applyTTSConfig pushes a voice change into the running hal instead of
-// restarting it. Falls back to a restart on failure: a voice that was saved but
-// never reached hal is a worse outcome than the restart this avoids, because
-// the device would keep speaking in the old voice with nothing to show for it.
+// restartHALAndWait reports the command outcome, not voice-pipeline readiness.
+// Non-wake callers retain the asynchronous restartHAL wrapper.
+func (s *Service) restartHALAndWait(ctx context.Context, reason string) error {
+	slog.Info("restarting hal", "component", "device", "reason", reason)
+	if s.halRestartCommand != nil {
+		if err := s.halRestartCommand(ctx); err != nil {
+			return fmt.Errorf("restart HAL: %w", err)
+		}
+	} else {
+		cmd := exec.CommandContext(ctx, "systemctl", "restart", "hal")
+		cmd.WaitDelay = time.Second
+		if out, err := cmd.CombinedOutput(); err != nil {
+			if ctx.Err() != nil {
+				return fmt.Errorf("restart HAL: %w", ctx.Err())
+			}
+			return fmt.Errorf("restart HAL: %w (%s)", err, out)
+		}
+	}
+	slog.Info("hal restarted", "component", "device", "reason", reason)
+	if err := config.SnapshotHALConfig(); err != nil {
+		slog.Warn("hal config snapshot failed", "component", "device", "error", err)
+	}
+	return nil
+}
+
+// applyTTSConfig pushes a voice change into the running HAL, falling back to a
+// restart on failure.
 func (s *Service) applyTTSConfig(c *config.Config) {
 	go func() {
-		// Send the RESOLVED key, matching what the boot path already sends
-		// (config_watch.go StartHALVoice). hal's /voice/tts/config does
-		// `req.tts_api_key or current_api_key`, so an empty key is read as
-		// "keep what you have" and would leave the previous vendor's key live
-		// in the running process — making a cleared key invisible until a
-		// restart. GetTTSAPIKey falls back to the AI-brain key, which is
-		// exactly the credential the Autonomous proxy expects.
+		// Send the resolved key: HAL treats an empty key as "keep current", which
+		// would leave a cleared vendor key live.
 		if err := hal.ApplyTTSConfig(c.TTSProvider, c.TTSVoice, c.GetTTSAPIKey(), c.TTSBaseURL, c.GetTTSSpeed()); err != nil {
 			slog.Warn("hal tts config apply failed, restarting instead",
 				"component", "device", "error", err)
@@ -87,8 +105,7 @@ func (s *Service) applyTTSConfig(c *config.Config) {
 		}
 		slog.Info("hal tts config applied live", "component", "device",
 			"provider", c.TTSProvider, "voice", c.TTSVoice)
-		// Keep the boot-time baseline in step, or the next os-server start
-		// would see drift and order a restart that is no longer needed.
+		// Keep the boot-time baseline in step to avoid a needless restart.
 		if err := config.SnapshotHALConfig(); err != nil {
 			slog.Warn("hal config snapshot failed", "component", "device", "error", err)
 		}
@@ -100,16 +117,13 @@ func (s *Service) WaitForAgentReady(timeout time.Duration) bool {
 	return waitForAgentReady(s.agentGateway, timeout, 0, 500*time.Millisecond)
 }
 
-// WaitForAgentReadyStable requires IsReady to remain true for stableFor before
-// succeeding. Startup reconciliation can restart a runtime after an earlier
-// health probe has marked it ready; a single true observation would then allow
-// a startup greeting to race the restart and be dropped.
+// WaitForAgentReadyStable requires IsReady to stay true for stableFor, so a
+// greeting cannot race a startup reconciliation restart.
 func (s *Service) WaitForAgentReadyStable(timeout, stableFor time.Duration) bool {
 	return waitForAgentReady(s.agentGateway, timeout, stableFor, 500*time.Millisecond)
 }
 
-// AgentReady reports whether the active gateway is answering right now. A
-// single probe, not a wait: callers that need to block have WaitForAgentReady.
+// AgentReady reports whether the active gateway is answering now (single probe).
 func (s *Service) AgentReady() bool {
 	return s.agentGateway != nil && s.agentGateway.IsReady()
 }

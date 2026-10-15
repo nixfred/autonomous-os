@@ -5,6 +5,8 @@ import select
 import threading
 from collections.abc import Callable, Iterable, Iterator
 
+from hal import cpu_affinity
+
 
 def change_tempo(chunks: Iterable[bytes], speed: float, sample_rate: int,
                  cancelled: Callable[[], bool] = lambda: False) -> Iterator[bytes]:
@@ -14,7 +16,6 @@ def change_tempo(chunks: Iterable[bytes], speed: float, sample_rate: int,
         return
     if not 0.25 <= speed <= 4.0:
         raise ValueError("TTS tempo must be between 0.25 and 4.0")
-    # Each atempo stage stays in its high-quality 0.5..2 range.
     factors = []
     remaining = speed
     while remaining > 2:
@@ -35,6 +36,7 @@ def change_tempo(chunks: Iterable[bytes], speed: float, sample_rate: int,
         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
         bufsize=0,
     )
+    cpu_affinity.pin_pid(process.pid, cpu_affinity.FAST)
     stopped = threading.Event()
     errors = []
 

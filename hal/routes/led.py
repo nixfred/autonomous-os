@@ -6,12 +6,18 @@ from typing import Optional
 from fastapi import APIRouter, Body, HTTPException
 
 import hal.app_state as state
+from hal.drivers.motors import hold
 from hal.models import (
     LEDColorResponse,
     LEDEffectRequest,
     LEDEffectResponse,
     LEDOffRequest,
     LEDPaintRequest,
+    LEDRestingPreviewRequest,
+    LEDWakeLightPreviewRequest,
+    LEDRestingPreviewResponse,
+    LEDRestingRequest,
+    LEDRestingResponse,
     LEDSolidRequest,
     LEDStateResponse,
     LEDStatusRequest,
@@ -33,21 +39,26 @@ router = APIRouter(tags=["LED"])
 
 
 def _sleep_led_locked(route: str) -> bool:
-    """True while the device is asleep — sleepy owns the strip.
-
-    app_state already gates every *internal* repaint (emotion, TTS wave, music
-    wave, mic-muted, restore timer) on `_sleeping`, but the HTTP routes were
-    open: an agent finishing a stale task and POSTing /led/effect or
-    /led/status would light the strip on a sleeping device. Writes are dropped
-    here rather than queued — sleep is a state, not a pause, so a cue that
-    arrives during it is stale by the time the device wakes.
-
-    Clearing routes (/led/off, /led/effect/stop) are deliberately NOT gated:
-    they drive the strip toward dark, which is what sleep already wants."""
+    """True while the device is asleep; HTTP LED writes are dropped (clearing routes are not gated)."""
     if not state._sleeping:
         return False
     state.logger.info("%s skipped -- sleepy owns the strip", route)
     return True
+
+
+def _end_scene() -> None:
+    """A non-transient LED override ends the scene, its servo hold, and its restore-on-restart."""
+    from hal.routes.scene import _persist_scene
+
+    state._active_scene = None
+    _persist_scene(None)
+    if hold.release(state.animation_service, hold.SCENE):
+        still = hold.holder(state.animation_service)
+        if still:
+            state.logger.info("Scene ended by an LED override: scene hold released, "
+                              "servo still held by %s", still)
+        else:
+            state.logger.info("Scene ended by an LED override: servo released")
 
 
 @router.get("/led", response_model=LEDStateResponse)
@@ -59,12 +70,7 @@ def get_led_state():
 
 
 def _read_ring(rgb_service) -> list[tuple[int, int, int]]:
-    """Every pixel on the strip, as (r, g, b).
-
-    Best-effort: a driver that cannot read back (or throws on a pixel) must not
-    turn a status query into a 500 — the caller then sees an empty ring and
-    reports the strip dark, which is the pre-existing behaviour.
-    """
+    """Every pixel on the strip as (r, g, b); best-effort, empty on read failure."""
     pixels: list[tuple[int, int, int]] = []
     try:
         for i in range(rgb_service.led_count):
@@ -86,26 +92,14 @@ def get_led_color():
         and state._effect_thread.is_alive()
     )
     uniform = True
-    # The ring is read either way — it is the only honest answer to "is the
-    # lamp lit". An effect thread running over a BLACK base reported on=true
-    # while the strip was physically dark (documented hazard in
-    # robots/lamp/docs/led-control.md, seen here as speaking_wave over the
-    # resting look). `color` still reports the effect's base while one runs:
-    # os-server's ambient loop keys off that value, and mid-animation samples
-    # would make it flap.
+    # `color` keeps reporting the effect base while one runs (os-server's ambient loop keys off it).
     ring = _read_ring(state.rgb_service)
     ring_lit = any(px != (0, 0, 0) for px in ring)
     if effect_running and state._effect_base_color:
         r, g, b = state._effect_base_color
         uniform = all(px == ring[0] for px in ring) if ring else True
     else:
-        # The WHOLE ring, not pixel 0. Reading one pixel made every
-        # non-uniform look report as the strip's state, and a look whose
-        # pixel 0 happens to be dark reported as "off" while the ring was
-        # visibly lit — which is exactly how a lit lamp became unanswerable
-        # from the API (device-observed 03/09/2026). Effects that dither
-        # across the ring (breathing_fine) are non-uniform BY DESIGN, so this
-        # is not an edge case; `uniform` says which kind of answer this is.
+        # The whole ring, not pixel 0: dithered effects are non-uniform by design.
         r, g, b = max(ring, key=lambda px: max(px)) if ring else (0, 0, 0)
         uniform = all(px == ring[0] for px in ring) if ring else True
     brightness = round(max(r, g, b) / 255.0, 3)
@@ -126,26 +120,31 @@ def get_led_color():
 @router.post("/led/solid", response_model=StatusResponse)
 def set_led_solid(req: LEDSolidRequest):
     """Fill entire LED strip with a single color."""
+    return _set_led_solid(req)
+
+
+def _set_led_solid(req: LEDSolidRequest, *, source: str | None = None):
+    """Keep system status provenance separate from explicit user colors."""
     if _sleep_led_locked("led/solid"):
         return {"status": "ok"}
     if not state.rgb_service:
         raise HTTPException(503, "LED not available")
     color = tuple(req.color) if isinstance(req.color, list) else req.color
+    state._cancel_pending_restore()
     state._stop_current_effect()
     state.rgb_service.dispatch(RGB_CMD_SOLID, color)
-    # Transient = temporary overlay that gets restored — it must not exit the
-    # active scene (the boot-time breathing effect was silently killing the
-    # scene re-activated after a HAL restart).
+    # Transient overlays must not exit the active scene.
     if not req.transient:
-        state._active_scene = None
-    if state.sensing_service and isinstance(color, tuple):
-        state.sensing_service.presence.set_last_color(color)
+        _end_scene()
     if req.transient:
         state._cancel_pending_restore()
     else:
         # Explicit user look — wins over the mic-muted resting indicator.
         state._dismiss_mic_muted_led("led/solid")
-        state._save_user_led_state({"type": LST_SOLID, "color": list(color)})
+        saved = {"type": LST_SOLID, "color": list(color)}
+        if source is not None:
+            saved["source"] = source
+        state._save_user_led_state(saved)
     return {"status": "ok"}
 
 
@@ -183,22 +182,17 @@ def set_led_paint(req: LEDPaintRequest):
         colors = _expand_gradient(req.colors, state.rgb_service.led_count)
     else:
         colors = [tuple(c) if isinstance(c, list) else c for c in req.colors]
-    # A running effect repaints the strip every ~40ms and would overwrite
-    # the painted pixels — stop it first, same as /led/solid.
+    # A running effect repaints every ~40ms; stop it first.
+    state._cancel_pending_restore()
     state._stop_current_effect()
     state.rgb_service.dispatch(RGB_CMD_PAINT, colors)
     if not req.transient:
-        state._active_scene = None
-    if state.sensing_service:
-        avg = state._avg_paint_color(colors)
-        if avg:
-            state.sensing_service.presence.set_last_color(avg)
+        _end_scene()
     if req.transient:
         state._cancel_pending_restore()
     else:
         state._dismiss_mic_muted_led("led/paint")
-        # Persist the final pixel list (gradient already expanded) so restore
-        # repaints exactly what the strip showed.
+        # Persist the expanded pixel list so restore repaints exactly what was shown.
         state._save_user_led_state(
             {
                 "type": LST_PAINT,
@@ -210,35 +204,29 @@ def set_led_paint(req: LEDPaintRequest):
 
 @router.post("/led/off", response_model=StatusResponse)
 def turn_off_leds(req: Optional[LEDOffRequest] = Body(default=None)):
-    """Turn off all LEDs — i.e. drop the user's colour and return to the
-    default resting state.
-
-    "Off" is not a separate mode. The resting look is already dark
-    (AMBIENT_RESTING_LED), so clearing the user state IS off: ambient, the
-    resting settle, presence and the speaking waves all read
-    led_should_stay_dark() and leave the strip alone. Actions may still light
-    it briefly (an emotion) or for as long as they last (a status cue, the
-    mic-muted indicator) — those are information, not decoration.
-
-    Modelling off as its own sticky state was worse: it looked identical to
-    the default (both dark) but behaved differently, and nothing could return
-    the device to the default — an explicit colour was the only way out, so
-    the user could never get back to "dark at rest, expressive on action".
-    """
+    """Turn off all LEDs and preserve explicit off across ambient restores."""
     if not state.rgb_service:
         raise HTTPException(503, "LED not available")
     transient = req.transient if req else False
+    # Legacy os-server ends provisioning with /led/off followed by /led/restore.
+    # Only the tagged setup cue is discarded; never infer ownership from its color.
+    ending_setup = bool(
+        not transient and state._user_led_state
+        and state._user_led_state.get("source") == "status:setup"
+    )
+    state._cancel_pending_restore()
     state._stop_current_effect()
     state.rgb_service.clear()
     if not transient:
-        state._active_scene = None
-    if state.sensing_service:
-        state.sensing_service.presence.set_last_color((0, 0, 0))
+        _end_scene()
     if transient:
         state._cancel_pending_restore()
+    elif ending_setup:
+        state._save_user_led_state(None)
+        state._restore_user_led()
     else:
         state._dismiss_mic_muted_led("led/off")
-        state._save_user_led_state(None)
+        state._save_user_led_state({"type": LST_SOLID, "color": [0, 0, 0]})
     return {"status": "ok"}
 
 
@@ -258,13 +246,7 @@ def start_led_effect(req: LEDEffectRequest):
         state.logger.info("LED effect '%s' skipped -- TTS speaking_wave active", req.effect)
         return {"status": "ok", "effect": req.effect, "speed": req.speed}
 
-    # Mic-muted red is a privacy indicator — a transient system overlay
-    # (ambient breathing, Buddy Busy pulse, statusled) must NOT paint over
-    # it. Ambient's breathingLoop reads the current color and re-fires every
-    # 2s (see system/ambient/service.go), and without this guard each tick
-    # would kill our red thread and start ambient's breathing in some dim
-    # frame we happened to sample. User-initiated writes (non-transient) go
-    # through unchanged and dismiss mic-muted below via _dismiss_mic_muted_led.
+    # Mic-muted red is a privacy indicator; transient overlays must not paint over it.
     if req.transient and state._mic_muted_led_owns_strip():
         state.logger.info(
             "LED effect '%s' (transient) skipped -- mic-muted indicator owns strip",
@@ -274,23 +256,16 @@ def start_led_effect(req: LEDEffectRequest):
 
     from hal.drivers.harness import led as harness_voice_led
     if req.transient and req.effect == "breathing" and req.duration_ms is None and harness_voice_led.enabled():
-        # Ambient idle breathing must not replace the active mode indicator.
         return {"status": "ok", "effect": req.effect, "speed": req.speed}
 
-    # NOTE: no "light is off" guard here. A transient effect on this route is
-    # a status cue (connectivity, error, OTA) or a companion overlay — it
-    # carries information, so it may light a resting strip. What must NOT
-    # relight it is ambient breathing, and that is handled at the source
-    # (system/ambient/service.go never paints a dark strip) rather than by
-    # second-guessing every caller here.
+    # No "light is off" guard: transient status cues may light a resting strip.
+    state._cancel_pending_restore()
     state._stop_current_effect()
     if not req.transient:
-        state._active_scene = None
+        _end_scene()
 
     base_color = tuple(req.color) if req.color else (255, 180, 100)
-    # Transient effects (e.g. Buddy's Busy pulse) overlay on the user's
-    # saved LED color so "đèn xanh lá" stays visible underneath the wave.
-    # Non-transient effects replace the strip outright.
+    # Transient effects overlay on the user's saved color; non-transient replace the strip.
     overlay_base = state._get_user_base_color() if req.transient else (0, 0, 0)
 
     state._effect_stop.clear()
@@ -338,10 +313,7 @@ def start_led_effect(req: LEDEffectRequest):
 
 @router.post("/led/status", response_model=LEDEffectResponse)
 def set_led_status(req: LEDStatusRequest):
-    """Apply an os-server status state (booting/error/ota/…) by NAME. The os-server
-    owns the status state machine (WHEN); HAL owns the appearance (WHAT) via
-    STATUS_LED_PRESETS, overridable per device in presets.json. Applied transiently
-    through the normal effect path, so it never clobbers the user's saved LED state."""
+    """Apply an os-server status state (booting/error/ota/...) by name, transiently via STATUS_LED_PRESETS."""
     preset = STATUS_LED_PRESETS.get(req.state)
     if not preset:
         raise HTTPException(
@@ -349,11 +321,9 @@ def set_led_status(req: LEDStatusRequest):
             f"Unknown status state '{req.state}'. Available: {sorted(STATUS_LED_PRESETS)}",
         )
     effect, color, speed = preset["effect"], preset["color"], preset.get("speed", 1.0)
-    # "solid" is a persistent fill (e.g. the setup-ready white): it is the
-    # displayed state, so it saves user LED state like /led/solid. Every other
-    # status is a transient effect overlay that never clobbers user state.
+    # Solid statuses survive transient overlays, but retain their system provenance.
     if effect == "solid":
-        set_led_solid(LEDSolidRequest(color=color))
+        _set_led_solid(LEDSolidRequest(color=color), source=f"status:{req.state}")
     else:
         start_led_effect(LEDEffectRequest(effect=effect, color=color, speed=speed, transient=True))
     return {"status": "ok", "effect": effect, "speed": speed}
@@ -361,50 +331,118 @@ def set_led_status(req: LEDStatusRequest):
 
 @router.post("/led/restore", response_model=StatusResponse)
 def restore_led():
-    """Restore the strip to the user's saved LED state.
-
-    Used by Buddy (and other transient drivers) after they release the
-    strip. If no user state exists, the strip is cleared to off so the
-    transient color/effect doesn't linger.
-    """
+    """Restore the strip to the user's saved LED state, else settle on the resting look."""
     if _sleep_led_locked("led/restore"):
         return {"status": "ok"}
     if not state.rgb_service:
         raise HTTPException(503, "LED not available")
-    if state._tts_speaking:
-        state.logger.info("LED restore skipped -- TTS speaking_wave active")
-        return {"status": "ok"}
-    if state._mic_muted_led_owns_strip():
-        # A transient driver releasing the strip while muted settles on the
-        # privacy indicator (the no-user-state branch below would clear it).
-        state._start_mic_muted_effect()
-        state.logger.info("LED restore: mic muted -- settling on privacy indicator")
-        return {"status": "ok"}
-    from hal.drivers.harness import led as harness_led
-    if harness_led.enabled():
-        state._restore_user_led()
-        return {"status": "ok"}
-    user_state = state._user_led_state
-    if user_state is None:
-        # No saved user preference — settle on the ambient resting look
-        # (mirrors the Go ambient loop fallback) so a transient overlay
-        # releasing the strip (voice_service noise-session cleanup, Buddy)
-        # doesn't leave the lamp in a look nobody chose for ~60s until
-        # ambient.breathingLoop resumes after its interaction quiet-window.
-        # Same pattern _clear_mic_muted_led uses when no user state exists.
-        # A dark resting look means clear the strip — see AMBIENT_RESTING_LED.
-        from hal.presets import AMBIENT_RESTING_LED, ambient_resting_is_dark
-
-        if ambient_resting_is_dark():
-            state._stop_current_effect()
-            state.rgb_service.dispatch(RGB_CMD_SOLID, (0, 0, 0))
-            state.logger.info("LED restore: no user state -- resting dark, cleared")
-            return {"status": "ok"}
-        state._start_preset_effect(AMBIENT_RESTING_LED, "led-ambient-fallback")
-        state.logger.info("LED restore: no user state -- settling on ambient resting")
-        return {"status": "ok"}
     state._restore_user_led()
     return {"status": "ok"}
+
+
+@router.get("/led/resting", response_model=LEDRestingResponse)
+def get_led_resting():
+    """The owner's resting LED choice, the device default and the look in effect."""
+    from hal import resting_led
+
+    return resting_led.snapshot()
+
+
+@router.put("/led/resting", response_model=LEDRestingResponse)
+def set_led_resting(req: LEDRestingRequest):
+    """Save the owner's resting LED look and show it now when the strip is resting."""
+    from hal import resting_led
+
+    if not state.rgb_service:
+        raise HTTPException(503, "LED not available")
+    try:
+        snap = resting_led.set_choice(req.mode, req.color)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    _cancel_resting_preview()
+    # The new resting look replaces an earlier explicit colour or off.
+    state._save_user_led_state(None)
+    if not _sleep_led_locked("led/resting"):
+        state._restore_user_led()
+    return snap
+
+
+# A preview the app never follows with a save falls back to the saved look.
+RESTING_PREVIEW_HOLD_S = 10.0
+_preview_lock = threading.Lock()
+_preview_timer: Optional[threading.Timer] = None
+
+
+def _cancel_resting_preview() -> None:
+    global _preview_timer
+    with _preview_lock:
+        if _preview_timer is not None:
+            _preview_timer.cancel()
+            _preview_timer = None
+
+
+def _end_resting_preview(timer: threading.Timer) -> None:
+    global _preview_timer
+    with _preview_lock:
+        if _preview_timer is not timer:
+            return
+        _preview_timer = None
+    state.logger.info("LED resting preview expired -- restoring saved look")
+    state._restore_user_led()
+
+
+@router.post("/led/resting/preview", response_model=LEDRestingPreviewResponse)
+def preview_led_resting(req: LEDRestingPreviewRequest):
+    """Paint a candidate resting colour now without saving it; reverts after 10 s of no previews."""
+    global _preview_timer
+    from hal import resting_led
+
+    if not state.rgb_service:
+        raise HTTPException(503, "LED not available")
+    try:
+        color = resting_led.valid_preview_color(req.color)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    # Never cut into sleep, speech, music or the mic-privacy indicator; the saved look is unchanged either way.
+    if (state._sleeping or state._tts_speaking or state._music_playing
+            or state._mic_muted_led_owns_strip()):
+        return {"status": "ok", "painted": False}
+    state._cancel_pending_restore()
+    state._stop_current_effect()
+    state.rgb_service.dispatch(RGB_CMD_SOLID, color)
+    timer = threading.Timer(RESTING_PREVIEW_HOLD_S, lambda: _end_resting_preview(timer))
+    timer.daemon = True
+    with _preview_lock:
+        if _preview_timer is not None:
+            _preview_timer.cancel()
+        _preview_timer = timer
+    timer.start()
+    return {"status": "ok", "painted": True}
+
+
+# Long enough to see a slow breath or a full spin.
+WAKE_LIGHT_PREVIEW_S = 3.0
+
+
+@router.post("/led/wake-light/preview", response_model=LEDRestingPreviewResponse)
+def preview_led_wake_light(req: LEDWakeLightPreviewRequest):
+    """Play a candidate wake light for a few seconds, then restore; nothing is saved."""
+    from hal import wake_light
+    from hal.presets import EMO_LISTENING
+
+    if not state.rgb_service:
+        raise HTTPException(503, "LED not available")
+    if wake_light.valid_color(req.color) is None:
+        raise HTTPException(400, "color must be [r, g, b] 0-255 with at least one lit channel")
+    if (state._sleeping or state._tts_speaking or state._music_playing
+            or state._mic_muted_led_owns_strip()):
+        return {"status": "ok", "painted": False}
+    _cancel_resting_preview()
+    state._cancel_pending_restore()
+    preset = wake_light.look_preset(req.color, req.effect, req.speed)
+    painted = state._apply_emotion_led_display(EMO_LISTENING, force_led=True, preset_override=preset)
+    state._schedule_led_restore(WAKE_LIGHT_PREVIEW_S)
+    return {"status": "ok", "painted": painted is not None}
 
 
 @router.post("/led/effect/stop", response_model=StatusResponse)
@@ -415,16 +453,7 @@ def stop_led_effect():
     if state._tts_speaking:
         state.logger.info("LED effect/stop skipped -- TTS speaking_wave active")
         return {"status": "ok"}
-    # Same reasoning as /led/effect: don't let a transient overlay's cleanup
-    # pull the mic-muted red down. While the indicator owns the strip no
-    # transient overlay can be RUNNING (its start was skipped above), so any
-    # stop arriving here is a stale caller: ambient's breathingLoop tracks
-    # "running" locally and still calls StopEffect on pause/lock even though
-    # its start was skipped. That stop used to pass when an EMOTION effect
-    # held the strip (e.g. thinking's purple pulse) and killed it after ~one
-    # cycle, freezing the strip on the last ripple frame — ambient's
-    # follow-up breathing is also skipped while muted, so nothing repainted.
-    # Emotion effects settle back onto the red via their scheduled restore.
+    # While the mic-muted indicator owns the strip, any stop here is stale; ignore it.
     if state._mic_muted_led_owns_strip():
         state.logger.info("LED effect/stop skipped -- mic-muted indicator owns strip")
         return {"status": "ok"}
@@ -432,11 +461,7 @@ def stop_led_effect():
     if owns_effect():
         return {"status": "ok"}
     state._stop_current_effect()
-    # Stopping a thread does not unpaint what it drew: the strip holds the
-    # effect's last frame. When the resting state is dark that remnant is the
-    # visible result, so clear it. With a lit resting look the old behaviour is
-    # right — the caller's follow-up restore repaints, and blanking here would
-    # add a flicker in between.
+    # Stopping a thread leaves its last frame; clear it when the resting state is dark.
     if state.led_should_stay_dark():
         state.rgb_service.dispatch(RGB_CMD_SOLID, (0, 0, 0))
         state.logger.info("LED effect/stop -- resting dark, cleared last frame")

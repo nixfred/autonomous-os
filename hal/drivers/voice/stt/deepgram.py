@@ -1,12 +1,4 @@
-"""
-Deepgram STT provider — streaming speech-to-text via Deepgram WebSocket API.
-
-Supports both v1 (nova-2) and v2 (flux) endpoints, auto-detected by model name.
-
-Optional env (same semantics as darren_stt):
-  DEEPGRAM_ENDPOINTING_MS — override endpointing ms (default 1500)
-  DEEPGRAM_INTERIM_RESULTS — set true/1/yes for partial transcripts (default false)
-"""
+"""Deepgram STT provider — streaming speech-to-text via Deepgram WebSocket API."""
 
 import logging
 import os
@@ -25,6 +17,8 @@ DEFAULT_INTERIM_RESULTS = "true"
 DEFAULT_ENDPOINTING_MS = 1500
 DEFAULT_ENCODING = "linear16"
 
+# Keep mic audio out of Deepgram's Model Improvement Program (training); sent on every connect.
+MIP_OPT_OUT = "true"
 
 
 def _is_flux(model: str) -> bool:
@@ -56,6 +50,7 @@ def _build_flux_listen_params(
         model=model,
         encoding=DEFAULT_ENCODING,
         sample_rate=sample_rate,
+        mip_opt_out=MIP_OPT_OUT,
     )
 
 
@@ -78,6 +73,7 @@ def _build_nova_listen_params(
         interim_results=DEFAULT_INTERIM_RESULTS,
         endpointing=DEFAULT_ENDPOINTING_MS,
         vad_events="true",
+        mip_opt_out=MIP_OPT_OUT,
     )
     if keywords:
         if _is_nova3(model):

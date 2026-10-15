@@ -1,13 +1,12 @@
-"""Client-side RSA+AES-GCM encryption for DL backend communication.
-
-Mirrors the wire format defined in integrations/perception-service/src/lbserver/models.py.
-Public key can be loaded from a local PEM file or fetched from the load balancer.
-"""
+"""Client-side RSA+AES-GCM encryption for DL backend communication."""
 
 import base64
+import json
 import logging
 import os
-from typing import Literal
+import threading
+import time
+from typing import Any, Literal
 
 import requests
 from cryptography.hazmat.primitives import hashes, serialization
@@ -21,22 +20,17 @@ logger = logging.getLogger(__name__)
 GCM_NONCE_SIZE: int = 12
 
 
-# ---------------------------------------------------------------------------
-# Wire-format models (mirrors integrations/perception-service/src/lbserver/models.py)
-# ---------------------------------------------------------------------------
-
-
 class CipherPayload(BaseModel):
     """Base AES-GCM cipher fields (shared by HTTP response + WS message)."""
 
-    nonce: str        # base64
-    cipher_data: str  # base64
+    nonce: str
+    cipher_data: str
 
 
 class CipherHTTPRequest(CipherPayload):
     """HTTP request with encrypted payload + RSA-encrypted AES key."""
 
-    encrypted_key: str  # base64
+    encrypted_key: str
 
 
 class CipherHTTPResponse(CipherPayload):
@@ -47,18 +41,13 @@ class WSKeyExchangeRequest(BaseModel):
     """WS key exchange: client sends RSA-encrypted AES session key."""
 
     type: Literal["key_exchange"] = "key_exchange"
-    encrypted_key: str  # base64
+    encrypted_key: str
 
 
 class WSCipherMessage(CipherPayload):
     """WS encrypted message (after key exchange, both directions)."""
 
     type: Literal["encrypted"] = "encrypted"
-
-
-# ---------------------------------------------------------------------------
-# Session
-# ---------------------------------------------------------------------------
 
 
 class CryptoSession:
@@ -89,8 +78,6 @@ class CryptoSession:
         cipher_data = base64.b64decode(payload.cipher_data)
         return self._aesgcm.decrypt(nonce, cipher_data, None)
 
-    # -- HTTP helpers --
-
     def wrap_http_request(self, plain_body: bytes) -> bytes:
         """Encrypt plain body into a CipherHTTPRequest JSON."""
         enc = self.encrypt(plain_body)
@@ -106,8 +93,6 @@ class CryptoSession:
         resp = CipherHTTPResponse.model_validate_json(resp_body)
         return self.decrypt(resp)
 
-    # -- WS helpers --
-
     def wrap_ws_message(self, plain: str) -> str:
         """Encrypt a plain WS text message into a WSCipherMessage JSON."""
         enc = self.encrypt(plain.encode())
@@ -118,11 +103,6 @@ class CryptoSession:
         """Decrypt a WSCipherMessage JSON back to a plain string."""
         msg = WSCipherMessage.model_validate_json(raw)
         return self.decrypt(msg).decode()
-
-
-# ---------------------------------------------------------------------------
-# Public key resolution
-# ---------------------------------------------------------------------------
 
 
 def load_public_key(pem: str) -> RSAPublicKey:
@@ -169,3 +149,77 @@ def resolve_public_key(public_key_url: str, api_key: str = "", key_file: str = "
         return fetch_public_key(public_key_url, api_key)
 
     return None
+
+
+class EncryptionUnavailable(RuntimeError):
+    """Encryption is on but no session could be set up; the caller must not send."""
+
+
+# How long to wait before fetching a missing public key again.
+_KEY_RETRY_S = 60.0
+
+
+class DLCrypto:
+    """The one rule for every DL backend client: while HAL_DL_ENCRYPTION is on (the
+    default) nothing is sent in plaintext. Without a public key the caller skips the
+    request (EncryptionUnavailable) and the key is fetched again after _KEY_RETRY_S.
+    Plaintext happens only when the operator turns HAL_DL_ENCRYPTION off.
+    """
+
+    def __init__(self, tag: str):
+        self._tag: str = tag
+        self._lock: threading.Lock = threading.Lock()
+        self._key: RSAPublicKey | None = None
+        self._session: CryptoSession | None = None
+        self._next_try: float = 0.0
+
+    def public_key(self) -> RSAPublicKey | None:
+        """None only when encryption is off; raises EncryptionUnavailable if on and no key."""
+        from hal import config
+
+        if not config.DL_ENCRYPTION_ENABLED:
+            return None
+        with self._lock:
+            if self._key is None:
+                now = time.monotonic()
+                if now < self._next_try:
+                    raise EncryptionUnavailable(f"{self._tag}: no DL public key")
+                key = resolve_public_key(config.DL_PUBLIC_KEY_URL, config.DL_API_KEY, config.DL_PUBLIC_KEY_FILE)
+                if key is None:
+                    self._next_try = now + _KEY_RETRY_S
+                    logger.warning(
+                        "[%s] no DL public key; not sending until one is available (retry in %.0fs)",
+                        self._tag, _KEY_RETRY_S,
+                    )
+                    raise EncryptionUnavailable(f"{self._tag}: no DL public key")
+                self._key = key
+            return self._key
+
+    def http_session(self) -> CryptoSession | None:
+        """Session for HTTP requests; None only when encryption is off."""
+        key = self.public_key()
+        if key is None:
+            return None
+        with self._lock:
+            if self._session is None:
+                self._session = CryptoSession(key)
+                logger.info("[%s] encryption session initialized", self._tag)
+            return self._session
+
+    def ws_key_exchange(self, ws: Any, recv_timeout: float) -> CryptoSession | None:
+        """Key exchange on a fresh WS connection; None only when encryption is off.
+
+        Raises EncryptionUnavailable when the key or the exchange is missing, so the
+        caller drops the connection instead of streaming frames in plaintext.
+        """
+        key = self.public_key()
+        if key is None:
+            return None
+        session = CryptoSession(key)
+        ws.send(WSKeyExchangeRequest(encrypted_key=session.encrypted_key_b64).model_dump_json())
+        resp = json.loads(ws.recv(timeout=recv_timeout))
+        if resp.get("status") != "key_exchange_ok":
+            raise EncryptionUnavailable(f"{self._tag}: key exchange failed: {resp}")
+        logger.info("[%s] encryption session established", self._tag)
+        return session
+

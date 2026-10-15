@@ -162,11 +162,9 @@ def test_hold_release_maps_each_duration_to_one_explicit_action():
         button_actions.hold_release_action(button_actions.FACTORY_RESET_DURATION, "test button")
         factory_reset.assert_called_once_with("test button")
 
-        # A standard button with factory_reset=False (Lamp primary) stays at shutdown too.
         assert button_actions.button_hold_tier(
             button_actions.FACTORY_RESET_DURATION, factory_reset=False) == 2
 
-        # MPR121 opts out: a 10s+ touch hold stays at shutdown.
         button_actions.hold_release_action(
             button_actions.FACTORY_RESET_DURATION, "MPR121", factory_reset=False)
         factory_reset.assert_called_once_with("test button")
@@ -182,8 +180,7 @@ def test_swipe_sleeps_when_awake():
 
 
 def test_swipe_on_a_sleeping_device_still_routes_to_sleep():
-    """It does NOT wake. Waking is tap / double tap, which is what the device
-    shipped with; sleep_action returns early on "already sleeping"."""
+    """A swipe while sleeping still routes to sleep and does not wake."""
     with mock.patch.object(state, "_sleeping", True), \
          mock.patch.object(button_actions, "sleep_action") as slept, \
          mock.patch.object(button_actions, "_wake_if_sleepy") as woke:
@@ -227,13 +224,7 @@ def _pool(pools):
 
 
 def test_muting_the_mic_says_so():
-    """The double tap's only other feedback is an LED. Landing in silence is
-    what the user reported; this pins the fix.
-
-    Asserted against the language's pool rather than an English literal — the
-    device under test runs Vietnamese, and hardcoding "Microphone off." made
-    this fail on hardware while the behaviour was correct.
-    """
+    """Muting via double tap speaks a confirmation."""
     from hal.i18n import MIC_MUTED_PHRASES_BY_LANG
 
     spoken, mute, unmute = _mic_toggle(muted=False)
@@ -252,14 +243,7 @@ def test_unmuting_the_mic_says_so():
 
 
 def test_every_mic_phrase_states_which_way_the_toggle_went():
-    """The pools exist to sound alive, not to be cryptic. This is a privacy
-    control: a confirmation the user cannot decode is worse than a robotic one,
-    because they are left unsure whether the microphone is live. Guards against
-    a future 'Shh!' with no state in it.
-
-    Checked structurally — every line must carry a listening/hearing/ear word in
-    its own language, and the two pools must never share a line.
-    """
+    """Mute confirmations must clearly state the microphone state."""
     from hal.i18n import (
         MIC_MUTED_PHRASES_BY_LANG as MUTED,
         MIC_UNMUTED_PHRASES_BY_LANG as UNMUTED,
@@ -268,6 +252,7 @@ def test_every_mic_phrase_states_which_way_the_toggle_went():
     cues = {
         "en": ("listen", "hear", "ear"),
         "vi": ("nghe", "tai"),
+        "ja": ("聞", "耳"),
         "zh-CN": ("听", "耳"),
         "zh-TW": ("聽", "耳"),
     }
@@ -289,9 +274,72 @@ def test_a_muted_speaker_stays_silent():
 
 
 def test_a_refused_toggle_says_nothing():
-    """Enrolment blocks the toggle — announcing a mute that did not happen
-    would be worse than silence."""
+    """Enrolment blocks the mute toggle and its announcement."""
     spoken, mute, unmute = _mic_toggle(muted=False, enrolling=True)
     mute.assert_not_called()
     unmute.assert_not_called()
     assert spoken == [], spoken
+
+
+def test_sleep_announcement_uses_configured_delay():
+    from hal.routes import emotion
+
+    for delay in (0.0, 2.0, 0.5):
+        calls = []
+        with (
+            mock.patch.object(state, "_sleeping", False),
+            mock.patch.object(button_actions, "_tts_available", return_value=True),
+            mock.patch.object(emotion, "harness_blocks_sleep", return_value=False),
+            mock.patch.object(state, "tts_service") as tts,
+            mock.patch.object(button_actions.config, "SLEEP_ANNOUNCEMENT_DELAY_S", delay),
+            mock.patch.object(button_actions.time, "sleep", side_effect=lambda seconds: calls.append(seconds)),
+            mock.patch.object(emotion, "express_emotion", side_effect=lambda *a, **kw: calls.append("sleepy")),
+        ):
+            button_actions.sleep_action("test")
+        tts.speak_cached.assert_called_once()
+        assert calls == [delay, "sleepy"]
+
+
+def test_sleep_without_tts_has_no_announcement_delay():
+    from hal.routes import emotion
+
+    with (
+        mock.patch.object(state, "_sleeping", False),
+        mock.patch.object(button_actions, "_tts_available", return_value=False),
+        mock.patch.object(emotion, "harness_blocks_sleep", return_value=False),
+        mock.patch.object(button_actions.time, "sleep") as wait,
+        mock.patch.object(emotion, "express_emotion") as express,
+    ):
+        button_actions.sleep_action("test")
+    wait.assert_not_called()
+    assert express.call_args.args[0].emotion == "sleepy"
+
+
+def test_scoped_cancel_does_not_wait_for_os(monkeypatch):
+    import threading
+    import time
+
+    entered = threading.Event()
+    release = threading.Event()
+    completed = threading.Event()
+    sent = []
+
+    def post(url, *, json, timeout):
+        sent.append(json)
+        entered.set()
+        assert release.wait(2)
+        completed.set()
+
+    monkeypatch.setattr(button_actions.requests, "post", post)
+    started = time.monotonic()
+    try:
+        button_actions._cancel_agent_speech("test", before_ms=1791400000000)
+        elapsed = time.monotonic() - started
+        assert entered.wait(1)
+        assert not completed.is_set()
+        assert elapsed < 0.05
+        print(f"scoped cancellation returned in {elapsed * 1000:.3f} ms while OS was blocked")
+        assert sent == [{"before_ms": 1791400000000}]
+    finally:
+        release.set()
+        assert completed.wait(1)

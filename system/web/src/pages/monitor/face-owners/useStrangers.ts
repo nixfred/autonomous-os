@@ -3,25 +3,22 @@ import { HW } from "../types";
 import { usePolling } from "../../../hooks/usePolling";
 import type { StrangersData, FaceStrangerStat } from "./types";
 
-// Unknown voice clusters (/voice/strangers) + face stranger visit stats
-// (/face/stranger-stats), with their own polling and delete flows. Independent
-// of the enrolled-owners data, so it lives in its own hook.
+// Unknown voice clusters (/voice/strangers) + unknown faces (/face/stranger-stats, DELETE /face/strangers), with their own polling and delete flows.
 export function useStrangers() {
   const [strangers, setStrangers] = useState<StrangersData | null>(null);
   const [strangersError, setStrangersError] = useState(false);
   const [expandedCluster, setExpandedCluster] = useState<Record<string, boolean>>({});
   const [deletingCluster, setDeletingCluster] = useState<string | null>(null);
-  const [deletingStrangerFile, setDeletingStrangerFile] = useState<string | null>(null); // "hash/filename"
+  const [deletingStrangerFile, setDeletingStrangerFile] = useState<string | null>(null);
 
-  // Face stranger visit stats. The device tracks each unrecognized face's visit
-  // count and surfaces a familiar-stranger enroll prompt to the agent when count
-  // crosses FAMILIAR_VISIT_THRESHOLD.
   const [faceStrangers, setFaceStrangers] = useState<FaceStrangerStat[] | null>(null);
   const [faceStrangersError, setFaceStrangersError] = useState(false);
 
-  // Pending themed-confirm targets (null = no dialog open).
   const [confirmCluster, setConfirmCluster] = useState<{ hash: string; sampleCount: number } | null>(null);
   const [confirmStrangerFile, setConfirmStrangerFile] = useState<{ hash: string; filename: string } | null>(null);
+  // Unknown face to forget: one stranger id, or "all".
+  const [confirmFaceForget, setConfirmFaceForget] = useState<string | null>(null);
+  const [forgettingFace, setForgettingFace] = useState<string | null>(null);
 
   const refreshStrangers = useCallback(async (signal?: AbortSignal) => {
     try {
@@ -52,7 +49,6 @@ export function useStrangers() {
         first_seen: v?.first_seen ?? "",
         last_seen: v?.last_seen ?? "",
       }));
-      // Newest activity first.
       rows.sort((a, b) => Date.parse(b.last_seen || "") - Date.parse(a.last_seen || ""));
       setFaceStrangers(rows);
       setFaceStrangersError(false);
@@ -109,6 +105,26 @@ export function useStrangers() {
     }
   };
 
+  const confirmForgetFace = async () => {
+    if (!confirmFaceForget) return;
+    const target = confirmFaceForget;
+    setConfirmFaceForget(null);
+    setForgettingFace(target);
+    try {
+      const path = target === "all" ? "/face/strangers" : `/face/strangers/${encodeURIComponent(target)}`;
+      const res = await fetch(`${HW}${path}`, { method: "DELETE" });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({ detail: `HTTP ${res.status}` }));
+        alert(`Delete failed: ${err.detail ?? res.status}`);
+      }
+      await refreshFaceStrangers();
+    } catch (e) {
+      alert(`Delete failed: ${(e as Error).message}`);
+    } finally {
+      setForgettingFace(null);
+    }
+  };
+
   return {
     strangers, strangersError,
     expandedCluster, setExpandedCluster,
@@ -118,5 +134,6 @@ export function useStrangers() {
     confirmStrangerFile, setConfirmStrangerFile,
     handleDeleteCluster, confirmDeleteCluster,
     handleDeleteStrangerFile, confirmDeleteStrangerFile,
+    confirmFaceForget, setConfirmFaceForget, forgettingFace, confirmForgetFace,
   };
 }

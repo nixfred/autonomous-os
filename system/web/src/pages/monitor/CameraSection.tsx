@@ -3,6 +3,7 @@ import { usePolling } from "../../hooks/usePolling";
 import { S } from "./styles";
 import { hwUrl } from "@/lib/api";
 import { HW } from "./types";
+import "./robot-status.css";
 
 interface TrackStatus {
   tracking: boolean;
@@ -16,15 +17,10 @@ export function CameraSection({
 }: {
   displayTs: number;
 }) {
-  // Lazy initializer: the clock is read once on mount, not on every render.
   const [snapTs, setSnapTs] = useState(() => Date.now());
   const [snapError, setSnapError] = useState(false);
   const [streamError, setStreamError] = useState(false);
-  // Bumped to force the MJPEG <img> to remount with a fresh connection —
-  // on enable and on transient-error retry. Without this, an error latched
-  // while the camera was starting up (HAL's capture loop takes ~1-2s to
-  // deliver the first frame after /camera/enable) would keep the "Stream
-  // unavailable" fallback up until a full page refresh.
+  // Bumped to remount the MJPEG <img> with a fresh connection.
   const [streamEpoch, setStreamEpoch] = useState(0);
   const [cameraDisabled, setCameraDisabled] = useState(false);
   const [manualOverride, setManualOverride] = useState(false);
@@ -37,6 +33,8 @@ export function CameraSection({
   const [track, setTrack] = useState<TrackStatus>({ tracking: false, target: null, bbox: null, confidence: null });
   const [trackTarget, setTrackTarget] = useState("object");
   const [trackBbox, setTrackBbox] = useState("");
+  const [actionError, setActionError] = useState("");
+  const [trackingBusy, setTrackingBusy] = useState(false);
 
   const [streamActive, setStreamActive] = useState(!document.hidden);
   useEffect(() => {
@@ -45,13 +43,8 @@ export function CameraSection({
     return () => document.removeEventListener("visibilitychange", onVis);
   }, []);
 
-  // When the camera transitions to enabled (via the toggle here or an
-  // auto-enable detected by polling), drop any stale error latch and remount
-  // the stream/snapshot with a fresh connection so live video comes back
-  // immediately — no page refresh needed.
   useEffect(() => {
     if (!cameraDisabled) {
-      // eslint-disable-next-line react-hooks/set-state-in-effect -- this reacts to a DEVICE state transition (the poll seeing the camera come back), not to a prop that could be derived during render. Bumping streamEpoch is what forces the MJPEG <img> to remount with a fresh connection; there is no render-time equivalent.
       setStreamError(false);
       setSnapError(false);
       setStreamEpoch((e) => e + 1);
@@ -59,10 +52,7 @@ export function CameraSection({
     }
   }, [cameraDisabled]);
 
-  // Auto-retry a transiently-failed stream while the camera is enabled: HAL
-  // may not have delivered the first frame yet right after enable, so a one-
-  // shot error must not stick. Remount the <img> on a short delay until it
-  // loads (onLoad clears streamError, stopping the loop).
+  // Auto-retry a failed stream while enabled: HAL may not have delivered the first frame yet.
   useEffect(() => {
     if (cameraDisabled || !streamError || !streamActive) return;
     const t = setTimeout(() => {
@@ -77,8 +67,7 @@ export function CameraSection({
       const r = await fetch(`${HW}/servo/track`).then((x) => x.json());
       setTrack({ tracking: !!r.tracking, target: r.target, bbox: r.bbox, confidence: r.confidence ?? null });
     } catch {
-      // Best-effort status read: keep the previously rendered tracking state
-      // instead of flipping the panel to "not tracking" on a transient failure.
+      // Keep the last tracking state on a transient failure.
     }
   }, []);
 
@@ -115,17 +104,19 @@ export function CameraSection({
 
   const toggleCamera = async () => {
     setToggling(true);
+    setActionError("");
     try {
-      await fetch(`${HW}/camera/${cameraDisabled ? "enable" : "disable"}`, { method: "POST" });
+      const response = await fetch(`${HW}/camera/${cameraDisabled ? "enable" : "disable"}`, { method: "POST" });
+      if (!response.ok) throw new Error("Camera request failed");
       setCameraDisabled(!cameraDisabled);
     } catch {
-      // Leave cameraDisabled untouched when the toggle never reached HAL: the
-      // next poll below is the source of truth for the real camera state.
+      setActionError("Could not change camera state. Please try again.");
     }
     setToggling(false);
   };
 
   const startTracking = async () => {
+    setActionError("");
     const labels = trackTarget.split(",").map((s) => s.trim()).filter(Boolean);
     const body: Record<string, unknown> = {};
     if (labels.length === 1) body.target = labels[0];
@@ -136,27 +127,38 @@ export function CameraSection({
         body.bbox = parts;
       }
     }
-    if (!body.target && !body.bbox) return;
+    if (!body.target && !body.bbox) {
+      setActionError("Enter an object label or a valid bounding box.");
+      return;
+    }
+    setTrackingBusy(true);
     try {
-      const r = await fetch(`${HW}/servo/track`, {
+      const response = await fetch(`${HW}/servo/track`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(body),
-      }).then((x) => x.json());
+      });
+      if (!response.ok) throw new Error("Tracking request failed");
+      const r = await response.json();
       setTrack({ tracking: !!r.tracking, target: r.target, bbox: r.bbox, confidence: r.confidence ?? null });
     } catch {
-      // Start failed: don't fake a tracking state the device isn't in — the
-      // status poll reports what actually happened.
+      setActionError("Could not start tracking. Please try again.");
+    } finally {
+      setTrackingBusy(false);
     }
   };
 
   const stopTracking = async () => {
+    setActionError("");
+    setTrackingBusy(true);
     try {
-      await fetch(`${HW}/servo/track/stop`, { method: "POST" });
+      const response = await fetch(`${HW}/servo/track/stop`, { method: "POST" });
+      if (!response.ok) throw new Error("Stop tracking request failed");
       setTrack({ tracking: false, target: null, bbox: null, confidence: null });
     } catch {
-      // Stop failed: leave the tracking state as-is so the panel keeps showing
-      // that the tracker is still running.
+      setActionError("Could not stop tracking. Please try again.");
+    } finally {
+      setTrackingBusy(false);
     }
   };
 
@@ -171,10 +173,10 @@ export function CameraSection({
   const statusColor = cameraDisabled ? "var(--lm-red)" : "var(--lm-green)";
 
   return (
-    <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
+    <div className="lm-camera-page" style={{ display: "flex", flexDirection: "column", gap: 14 }}>
+      {actionError && <div role="alert" className="lm-camera-error">{actionError}</div>}
       <div className="lm-grid-2">
 
-        {/* Live Stream card with Snapshot embedded as a sub-card */}
         <div style={S.card}>
           <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10, gap: 10, flexWrap: "wrap" }}>
             <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
@@ -218,9 +220,6 @@ export function CameraSection({
             </div>
           </div>
 
-          {/* Digital zoom — applies to capture loop, so sensing/tracker see it too.
-              Use to focus on a small subject (e.g. laptop screen on a video call).
-              Side effect: zoom > 1 narrows FOV for face recog / motion / pose. */}
           <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 8 }}>
             <span style={{ fontSize: 11, color: "var(--lm-text-dim)", minWidth: 36 }}>Zoom</span>
             <input
@@ -254,7 +253,6 @@ export function CameraSection({
             >Reset</button>
           </div>
 
-          {/* Stream frame with Snapshot mini-card overlaid at bottom-right (picture-in-picture). */}
           <div style={{ position: "relative" }}>
             <MediaFrame
               disabled={cameraDisabled}
@@ -275,12 +273,11 @@ export function CameraSection({
               />
             </MediaFrame>
 
-            {/* Snapshot PiP — sub-card pinned to bottom-right of stream */}
-            <div style={{
+            <div className="lm-camera-snapshot" style={{
               position: "absolute",
               bottom: 8,
               right: 8,
-              width: 130,
+              width: 210,
               borderRadius: 6,
               border: `1px solid ${statusColor === "var(--lm-green)" ? "rgba(52,211,153,0.4)" : "var(--lm-border)"}`,
               background: "var(--lm-card)",
@@ -310,7 +307,7 @@ export function CameraSection({
                       display: "inline-flex", alignItems: "center", justifyContent: "center",
                       minWidth: 16, lineHeight: 1,
                     }}
-                  >↓</a>
+                  >Download</a>
                   <button
                     onClick={refreshSnapshot}
                     disabled={cameraDisabled}
@@ -321,7 +318,7 @@ export function CameraSection({
                       color: "var(--lm-text-dim)", cursor: cameraDisabled ? "not-allowed" : "pointer",
                       opacity: cameraDisabled ? 0.5 : 1,
                     }}
-                  >↻</button>
+                  >Capture</button>
                 </div>
               </div>
               <div style={{
@@ -353,8 +350,6 @@ export function CameraSection({
           </div>
         </div>
 
-        {/* Vision Tracking — alignSelf:start so the card hugs its content
-            instead of stretching to match the taller Live Stream card. */}
         <div style={{ ...S.card, alignSelf: "start" }}>
           <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
             <div style={S.cardLabel}>Vision Tracking</div>
@@ -370,24 +365,32 @@ export function CameraSection({
           </div>
 
           <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+            <label className="lm-camera-label" htmlFor="camera-track-target">Track object</label>
             <input
+              id="camera-track-target"
               value={trackTarget}
               onChange={(e) => setTrackTarget(e.target.value)}
-              onKeyDown={(e) => { if (e.key === "Enter" && !track.tracking) startTracking(); }}
+              onKeyDown={(e) => { if (e.key === "Enter" && !track.tracking && !trackingBusy) startTracking(); }}
               placeholder="cup, mug, coffee cup"
               style={inputStyle}
             />
+            <details className="lm-camera-advanced">
+              <summary>Advanced tracking</summary>
+              <label className="lm-camera-label" htmlFor="camera-track-bbox">Bounding box (optional)</label>
             <input
+              id="camera-track-bbox"
               value={trackBbox}
               onChange={(e) => setTrackBbox(e.target.value)}
-              onKeyDown={(e) => { if (e.key === "Enter" && !track.tracking) startTracking(); }}
+              onKeyDown={(e) => { if (e.key === "Enter" && !track.tracking && !trackingBusy) startTracking(); }}
               placeholder="x, y, w, h (optional bbox)"
-              style={{ ...inputStyle, fontFamily: "monospace" }}
+              style={{ ...inputStyle, fontFamily: "monospace", width: "100%" }}
             />
+              <p>Use x, y, width, height to skip object detection.</p>
+            </details>
             <div style={{ display: "flex", gap: 6 }}>
               <button
                 onClick={startTracking}
-                disabled={track.tracking}
+                disabled={track.tracking || trackingBusy}
                 style={{
                   flex: 1,
                   padding: "6px 10px", borderRadius: 6, fontSize: 12, fontWeight: 600,
@@ -395,10 +398,10 @@ export function CameraSection({
                   background: "rgba(52,211,153,0.1)", border: "1px solid rgba(52,211,153,0.3)",
                   color: "var(--lm-green)", opacity: track.tracking ? 0.5 : 1,
                 }}
-              >Start</button>
+              >{trackingBusy ? "Please wait…" : "Start tracking"}</button>
               <button
                 onClick={stopTracking}
-                disabled={!track.tracking}
+                disabled={!track.tracking || trackingBusy}
                 style={{
                   flex: 1,
                   padding: "6px 10px", borderRadius: 6, fontSize: 12, fontWeight: 600,
@@ -406,11 +409,11 @@ export function CameraSection({
                   background: "rgba(248,113,113,0.1)", border: "1px solid rgba(248,113,113,0.3)",
                   color: "var(--lm-red)", opacity: !track.tracking ? 0.5 : 1,
                 }}
-              >Stop</button>
+              >Stop tracking</button>
             </div>
 
             <div style={{ fontSize: 10.5, color: "var(--lm-text-muted)", lineHeight: 1.5 }}>
-              One label or comma-separated synonyms. Bbox optional — skips YOLO detection.
+              Enter one object label, or separate alternative names with commas.
             </div>
 
             {track.tracking && (
@@ -440,8 +443,7 @@ export function CameraSection({
   );
 }
 
-// MediaFrame keeps stream at a stable aspect ratio and shows a friendly
-// fallback when off/paused/errored — so the card doesn't collapse to zero.
+// MediaFrame keeps stream at a stable aspect ratio and shows a friendly fallback when off/paused/errored
 function MediaFrame({
   disabled,
   paused,

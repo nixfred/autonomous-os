@@ -1,20 +1,4 @@
-"""Speak queued Harness updates in snapshots when the device is free.
-
-Raw Harness output is written for a screen (markdown, file lists, paths), so it
-is never read out as-is. One worker thread waits until nobody is talking or
-listening, takes a snapshot of the queue (see update_queue.py) and renders it:
-
-1. Realtime model, when the provider supports announcements (Gemini text-capable
-   models and pipecat_v1, turn-based mode): the update is sent as one
-   device-initiated text turn and the model says it in its own voice. A parked
-   session is resumed for a result or question, never for progress.
-2. Otherwise, or when the model says nothing: the text summarizer rewrites it
-   for speech and TTS speaks it with the Harness result chime. Past its timeout
-   a sanitized opening of the text is spoken instead. Progress never takes this
-   path.
-
-A user capture always wins: prepare_turn() stops a running announcement.
-"""
+"""Speak queued Harness updates in snapshots when the device is free."""
 
 import logging
 import re
@@ -28,7 +12,6 @@ from hal.drivers.harness.update_queue import HarnessUpdate, HarnessUpdateQueue, 
 logger = logging.getLogger("hal.harness.announce")
 
 GATE_POLL_S = 0.25
-# How long the fallback waits for a speaker another voice took in the meantime.
 BUSY_SPEAKER_WAIT_S = 10.0
 
 _CODE_BLOCK_RE = re.compile(r"```.*?```", re.DOTALL)
@@ -39,7 +22,7 @@ _BULLET_RE = re.compile(r"^\s*(?:[-•]|\d+\.)\s+", re.MULTILINE)
 _SENTENCE_RE = re.compile(r"(?<=[.!?。！？])\s+")
 
 
-def sanitize_for_speech(kind: str, text: str) -> str:
+def sanitize_for_speech(kind: str, text: str, outcome: str = "") -> str:
     """Last-resort spoken form: markup stripped, cut to its opening sentences."""
     text = _CODE_BLOCK_RE.sub(" ", text)
     text = _LINK_RE.sub(r"\1", text)
@@ -47,7 +30,13 @@ def sanitize_for_speech(kind: str, text: str) -> str:
     text = _BULLET_RE.sub("", text)
     text = _MARKUP_RE.sub("", text)
     text = " ".join(text.split())
-    limit, sentences = (500, 6) if kind == "question" else (280, 2)
+    if kind == "question":
+        limit, sentences = 500, 6
+    elif outcome == "completed":
+        # A failed rewrite must not read a long technical report aloud.
+        limit, sentences = 120, 1
+    else:
+        limit, sentences = 280, 2
     spoken = " ".join(_SENTENCE_RE.split(text)[:sentences])
     if len(spoken) > limit:
         spoken = spoken[:limit].rsplit(" ", 1)[0].rstrip(",;:") + "…"
@@ -110,8 +99,6 @@ class HarnessAnnouncer:
             except Exception:
                 logger.exception("[announce] snapshot failed")
 
-    # --- gate ------------------------------------------------------------------
-
     def gate_open(self) -> bool:
         """Nobody is speaking, listening or mid-turn, and the grace time has passed."""
         tts = self._get_tts()
@@ -134,8 +121,6 @@ class HarnessAnnouncer:
         realtime = voice.realtime
         return not (realtime is not None and realtime.turn_in_flight)
 
-    # --- rendering -------------------------------------------------------------
-
     def _announcing_realtime(self, voice) -> Any:
         """The orchestrator when it may render this snapshot, else None."""
         if voice is None or not hal_config.REALTIME_ENABLED:
@@ -146,7 +131,6 @@ class HarnessAnnouncer:
         from hal.drivers.voice._internal.harness_voice import bypass_realtime
 
         if bypass_realtime(self._read_voice_mode()):
-            # Harness-only voice mode: the realtime agent is out of the loop.
             return None
         return realtime
 
@@ -185,9 +169,6 @@ class HarnessAnnouncer:
                 logger.info("[announce] spoken by realtime: %r", result.transcript[:200])
                 return True
             if result.preempted:
-                # Nothing was heard yet: keep results and questions for after
-                # the user's turn. Once speech started, the snapshot counts as
-                # delivered — replaying it would repeat what they heard.
                 self._queue.requeue(snapshot)
                 logger.info("[announce] preempted by the user before speaking; requeued")
                 return False
@@ -210,14 +191,12 @@ class HarnessAnnouncer:
             hal_config.HARNESS_ANNOUNCE_SUMMARIZER_TIMEOUT_S,
         )
         if not text:
-            text = " ".join(filter(None, (sanitize_for_speech(i.kind, i.text) for i in items)))
+            text = " ".join(filter(None, (sanitize_for_speech(i.kind, i.text, i.outcome) for i in items)))
             logger.info("[announce] summarizer unavailable — speaking sanitized text")
         if not text:
             return False
         deadline = time.monotonic() + BUSY_SPEAKER_WAIT_S
         while True:
-            # realtime_feedback: the realtime session learns what was said
-            # ([TTS HISTORY]), exactly as it did for a raw Harness reply.
             if tts.speak(text, realtime_feedback=True, turn_id=snapshot.owner, harness_result=True):
                 logger.info("[announce] spoken by fallback: %r", text[:200])
                 return True
@@ -247,7 +226,10 @@ def _summarize_for_speech(instructions: str, content: str) -> str:
         return ""
     from hal.realtime.summarizer import RealtimeSummarizer
 
-    return RealtimeSummarizer(system_prompt=instructions, max_tokens=400).summarize([content])
+    return RealtimeSummarizer(
+        system_prompt=instructions, max_tokens=400, disable_thinking=True,
+        source="harness_announce",
+    ).summarize([content])
 
 
 def _call_with_timeout(fn: Callable[[], str], timeout_s: float) -> str:

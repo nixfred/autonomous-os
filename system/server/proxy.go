@@ -10,26 +10,20 @@ import (
 	"strings"
 
 	"github.com/gin-gonic/gin"
+
+	"go.autonomous.ai/os/system/server/config"
+	"go.autonomous.ai/os/system/server/session"
 )
 
 // hardwareProxy is a wildcard reverse proxy from /api/hardware/* to HAL on
-// loopback (127.0.0.1:5001). It exists so the web UI never touches /hw/*
-// directly — adminAuthMiddleware gates the bearer here, and the upstream
-// HAL call is loopback so its local_only_middleware lets it through.
-//
-// MJPEG streams (/api/hardware/camera/stream) work because
-// httputil.ReverseProxy disables response buffering for chunked / multipart
-// content out of the box. Long-running endpoints reuse the default 300s
-// proxy timeout configured at the http.Server level.
-// openapiProxy serves the in-iframe Swagger UI's `/openapi.json` fetch by
-// forwarding straight to HAL on loopback. Path stays as-is — FastAPI
-// generates the spec at /openapi.json on HAL, no rewrite needed.
+// loopback (127.0.0.1:5001).
 var openapiProxy = func() http.Handler {
 	target, _ := url.Parse("http://127.0.0.1:5001")
 	proxy := httputil.NewSingleHostReverseProxy(target)
 	origDirector := proxy.Director
 	proxy.Director = func(req *http.Request) {
 		origDirector(req)
+		stripProxyCredential(req)
 		req.Header.Del("X-Forwarded-For")
 		req.Header.Del("X-Real-IP")
 	}
@@ -38,13 +32,13 @@ var openapiProxy = func() http.Handler {
 
 // ambientLEDGate mirrors the intent/agent paths' led_set/led_off ambient
 // signals for LED writes that arrive through the hardware proxy (web UI →
-// /api/hardware/* → HAL). Those writes never pass through the intent matcher
-// or agent tool events, so without this ambient's ledLocked stays false and
-// its breathing loop resumes ~60s after the last interaction, trampling the
-// web-set color/effect. Transient writes (ambient itself, Buddy, status
-// overlays) don't lock — same rule as HAL's user-state save.
+// /api/hardware/* → HAL).
 func (s *Server) ambientLEDGate() gin.HandlerFunc {
 	return func(c *gin.Context) {
+		// A new resting look clears HAL's saved colour, so ambient restore resumes.
+		if s.ambientService != nil && c.Request.Method == http.MethodPut && c.Param("path") == "/led/resting" {
+			s.ambientService.UnlockLED()
+		}
 		if s.ambientService != nil && c.Request.Method == http.MethodPost {
 			switch c.Param("path") {
 			case "/led/solid", "/led/effect", "/scene":
@@ -89,13 +83,12 @@ var hardwareProxy = func() http.Handler {
 	proxy := httputil.NewSingleHostReverseProxy(target)
 	origDirector := proxy.Director
 	proxy.Director = func(req *http.Request) {
-		// Gin's wildcard match leaves /api/hardware/<path> in req.URL.Path.
-		// Strip the prefix so HAL sees its original path.
 		req.URL.Path = strings.TrimPrefix(req.URL.Path, "/api/hardware")
 		if req.URL.Path == "" {
 			req.URL.Path = "/"
 		}
 		origDirector(req)
+		stripProxyCredential(req)
 		// Stop leaking the original LAN client IP downstream: HAL's
 		// same-origin/local check trusts loopback, so we present as one.
 		req.Header.Del("X-Forwarded-For")
@@ -103,3 +96,30 @@ var hardwareProxy = func() http.Handler {
 	}
 	return proxy
 }()
+
+// Authentication has already run in Go. HAL must never receive the browser's
+// legacy admin credential, including through its access log query string.
+func stripProxyCredential(req *http.Request) {
+	query := req.URL.Query()
+	if _, present := query["token"]; present {
+		query.Del("token")
+		req.URL.RawQuery = query.Encode()
+	}
+}
+
+// ownerActionHeader tells HAL a hardware call came from a logged-in owner (session
+// cookie or session token). A Bearer LLM key (scripts, the agent) does not count, and
+// any client-supplied value is dropped so it cannot be forged through the proxy.
+func ownerActionHeader(cfg *config.Config) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		c.Request.Header.Del(halOwnerActionHeader)
+		bearer := strings.TrimSpace(strings.TrimPrefix(c.GetHeader("Authorization"), "Bearer "))
+		if session.HasValid(c, cfg) || session.VerifyToken(bearer, cfg) {
+			c.Request.Header.Set(halOwnerActionHeader, "1")
+		}
+		c.Next()
+	}
+}
+
+// halOwnerActionHeader mirrors OWNER_ACTION_HEADER in hal/routes/camera.py.
+const halOwnerActionHeader = "X-OS-Owner-Action"

@@ -3,11 +3,13 @@
 import json
 import threading
 from pathlib import Path
+from typing import Optional
 
 from fastapi import APIRouter, HTTPException
 
 import hal.app_state as state
 from hal import config, privacy
+from hal.drivers.motors import hold
 from hal.models import (
     SceneListResponse,
     SceneRequest,
@@ -19,12 +21,7 @@ from hal.presets import LST_OFF, LST_SCENE, RGB_CMD_SOLID, SCENE_PRESETS
 
 router = APIRouter(tags=["Scene"])
 
-# Persisted active scene — survives HAL *service* restarts so the agent's
-# belief ("focus mode is on") stays true instead of silently desyncing from a
-# scene-less HAL. Deliberately boot-scoped, twice over: the file lives on
-# tmpfs AND carries the kernel boot_id — a full device reboot starts scene-less
-# by design (restoring a days-old focus scene after a power cycle would be
-# wrong), only an in-boot restart (OTA, deploy, crash) restores.
+# Boot-scoped (tmpfs + boot_id): restored on service restart, cleared on reboot.
 _SCENE_STATE_PATH = Path(config.STATE_DIR) / "hal-scene-state.json"
 
 
@@ -46,12 +43,7 @@ def _persist_scene(scene: str | None) -> None:
 
 
 def restore_persisted_scene() -> None:
-    """Re-activate the scene that was live before a service restart.
-
-    Called once from server lifespan (background thread) after the hardware
-    services it touches (LED, servo, voice) are up. Stale files (other boot,
-    unknown scene) are removed, not applied.
-    """
+    """Re-activate the scene that was live before a service restart (stale files are removed)."""
     try:
         if not _SCENE_STATE_PATH.exists():
             return
@@ -61,10 +53,7 @@ def restore_persisted_scene() -> None:
             _SCENE_STATE_PATH.unlink(missing_ok=True)
             return
         if state._sleeping:
-            # Sleep owns the hardware across a restart. Keep scene identity so
-            # the normal wake path can clear it, without repainting LEDs,
-            # moving servos, or reopening the camera/mic/speaker. The saved
-            # user LED state is already loaded by app_state at import time.
+            # Sleep owns the hardware across a restart: keep scene identity without touching peripherals.
             state._active_scene = scene
             state.logger.info("Scene restore: retained '%s' while asleep (hardware unchanged)", scene)
             return
@@ -72,6 +61,13 @@ def restore_persisted_scene() -> None:
         state.logger.info("Scene restore: re-activated '%s' after service restart", scene)
     except Exception as e:
         state.logger.warning("scene restore failed: %s", e)
+
+
+def camera_held_off_by_scene() -> Optional[str]:
+    """The active scene's name when that scene keeps the camera off, else None."""
+    name = state._active_scene
+    preset = SCENE_PRESETS.get(name) if name else None
+    return name if preset and preset.get("camera") == LST_OFF else None
 
 
 @router.get("/scene", response_model=SceneListResponse)
@@ -102,34 +98,28 @@ def activate_scene(req: SceneRequest):
 
     state._active_scene = req.scene
     _persist_scene(req.scene)
-    if state.sensing_service:
-        state.sensing_service.presence.set_last_color(tuple(scaled))
     state._save_user_led_state({"type": LST_SCENE, "scene": req.scene})
 
     aim_dir = preset.get("aim")
     servo_mode = preset.get("servo")
-    if aim_dir and state.animation_service:
+    svc = state.animation_service
+    # Only this scene's own hold is ours to drop; tracking and explicit holds stay.
+    if svc and hold.release(svc, hold.SCENE) and servo_mode != "hold":
+        state.logger.info("Scene %s: servo released", req.scene)
+    if aim_dir and svc:
         from hal.routes.servo import aim_servo
-
-        # Release hold before aiming so the move isn't blocked
-        if state.animation_service._hold_mode:
-            state.animation_service._hold_mode = False
-            state.animation_service._hold_explicit = False
 
         def _aim_then_hold():
             aim_servo(ServoAimRequest(direction=aim_dir))
-            if servo_mode == "hold":
-                state.animation_service._hold_mode = True
+            # The scene may have ended while the arm was moving.
+            if servo_mode == "hold" and state._active_scene == req.scene:
+                hold.claim(svc, hold.SCENE)
                 state.logger.info("Scene %s: servo hold (after aim)", req.scene)
 
         threading.Thread(target=_aim_then_hold, daemon=True, name=f"scene-aim-{aim_dir}").start()
-    elif servo_mode == "hold" and state.animation_service:
-        state.animation_service._hold_mode = True
+    elif servo_mode == "hold" and svc:
+        hold.claim(svc, hold.SCENE)
         state.logger.info("Scene %s: servo hold", req.scene)
-    elif servo_mode != "hold" and state.animation_service and state.animation_service._hold_mode:
-        state.animation_service._hold_mode = False
-        state.animation_service._hold_explicit = False
-        state.logger.info("Scene %s: servo released", req.scene)
 
     cam = preset.get("camera")
     if cam == LST_OFF:
@@ -137,7 +127,6 @@ def activate_scene(req: SceneRequest):
     elif cam == "on":
         state._auto_camera_on(f"scene:{req.scene}")
 
-    # Mic control
     mic = preset.get("mic")
     if mic == "off" and not state._mic_muted:
         state._mic_muted = True
@@ -149,13 +138,10 @@ def activate_scene(req: SceneRequest):
         state._mic_muted = False
         state._mic_manual_override = False
         state.start_voice_service("scene:mic-on")
-        # Mic is live again — drop a lingering privacy indicator flag (the
-        # scene paint already owns the strip look).
         state._clear_mic_muted_led()
         state._persist_mic_state()
         state.logger.info("Scene %s: mic unmuted", req.scene)
 
-    # Speaker control
     spk = preset.get("speaker")
     if spk == "off" and not state._speaker_muted:
         # Stop music now; speech drains so the scene's own line still plays.
@@ -180,27 +166,22 @@ def activate_scene(req: SceneRequest):
 
 @router.post("/scene/off", response_model=StatusResponse)
 def deactivate_scene():
-    """Deactivate current scene and return to idle state.
-
-    Reverses ALL peripheral changes made by scene activation:
-    servo hold, camera, mic, speaker, LED.
-    """
+    """Deactivate the current scene, reversing all peripheral changes (servo, camera, mic, speaker, LED)."""
     prev = state._active_scene
     state._active_scene = None
     _persist_scene(None)
     state._save_user_led_state(None)
     state._cancel_scene_speaker_drain()
 
-    # Release servo hold
-    if state.animation_service and state.animation_service._hold_mode:
-        state.animation_service._hold_mode = False
-        state.animation_service._hold_explicit = False
-        state.logger.info("Scene off: servo released")
+    if hold.release(state.animation_service, hold.SCENE):
+        still = hold.holder(state.animation_service)
+        if still:
+            state.logger.info("Scene off: scene hold released, servo still held by %s", still)
+        else:
+            state.logger.info("Scene off: servo released")
 
-    # Under a privacy lock the overlay would restore the scene's mute as the
-    # user's preference; retarget its snapshot instead (as sleepy wake does).
+    # Under a privacy lock, retarget the overlay snapshot instead of restoring the scene's mute.
     with privacy.lock:
-        # Re-enable camera
         if state._camera_disabled:
             if privacy.camera_muted:
                 if not state._camera_manual_override:
@@ -210,7 +191,6 @@ def deactivate_scene():
             else:
                 state._auto_camera_on("scene:off")
 
-        # Unmute mic + restart voice pipeline
         if state._mic_muted and not privacy.mic_locked():
             state._mic_muted = False
             state._mic_manual_override = False
@@ -219,7 +199,6 @@ def deactivate_scene():
             state._persist_mic_state()
             state.logger.info("Scene off: mic unmuted")
 
-        # Unmute speaker
         if state._speaker_muted:
             if privacy.speaker_muted:
                 privacy.speaker_before = False
@@ -230,13 +209,7 @@ def deactivate_scene():
                 state._persist_speaker_state()
                 state.logger.info("Scene off: speaker unmuted")
 
-    # Settle the strip the same way every other release path does. This used to
-    # paint the `idle` preset color unconditionally, from back when the resting
-    # look was a warm white — with AMBIENT_RESTING_LED black (default off, see
-    # hal/presets.py), that left scene-off glowing dim orange until some
-    # unrelated restore later cleared it, instead of turning the light off.
-    # restore_led() reads the resting look, and honors mic-muted / TTS / music
-    # ownership, which the raw dispatch did not.
+    # restore_led() honors the resting look and mic-muted / TTS / music ownership.
     if state.rgb_service:
         from hal.routes.led import restore_led
 

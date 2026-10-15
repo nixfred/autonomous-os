@@ -1,5 +1,45 @@
 # Bootstrap & OTA
 
+## Snapshot tiến độ cập nhật
+
+`software-update` ghi nguyên tử `/root/bootstrap/progress/<component>.json` cho mỗi lượt cài đặt được nhận (không bao gồm lệnh rollback/recovery thủ công). Lượt gần nhất được giữ khi refresh frontend hoặc restart service. Các trường gồm `target`, `run_id`, `phase`, `pid`, `boot_id`, `updated_at` (giây Unix), `downloaded_bytes`, `total_bytes` và `message` ngắn. Ghi tiến độ là best effort, không làm thay đổi kết quả cài đặt hoặc rollback.
+
+Các bước gồm preparing, downloading, verifying, installing, restarting, checking, completed, failed và rolling_back. Chỉ ghi `completed` khi updater hiện có thoát thành công sau kiểm tra riêng của component; không phải runtime installer nào cũng kiểm tra health gateway. Journal rollback còn pending luôn khiến lượt update được tính là thất bại dù khôi phục thành công. Snapshot cũ hơn 30 giây mà PID updater đã mất (hoặc boot ID thay đổi) được trả về là `interrupted`, không phải thành công.
+
+Tải qua `download_verified` lấy số byte đã ghi mỗi giây và Content-Length của HTTP 200 cuối cùng. Kích thước redirect, thiếu độ dài, chunked transfer hoặc tổng byte không khớp không tạo phần trăm. Kiểm tra checksum trước cài đặt. Package manager/upstream installer chỉ báo bước thực tế, không dựng phần trăm tổng. Không theo dõi lượt rollback/recovery thủ công hoặc lượt tải bên trong installer bên thứ ba.
+
+Khi cài HAL, updater còn báo giải nén, kích hoạt và hoạt động `uv` nhận diện được: tên package đang tải/build/cài và số package resolved/prepared/installed/audited. Trường tùy chọn `activity_at` là thời điểm Unix của hoạt động nhận diện gần nhất (bằng 0 hoặc vắng mặt nếu không có). UI chỉ nhận tên/số lượng đã nhận diện; log thô vẫn nằm trong log installer. Ghi hoạt động tối đa mỗi giây một lần và thêm lần cuối. Log không nhận diện được vẫn giữ bước cài đặt; theo dõi không thay đổi exit code của `uv`. Hoạt động dependency không phải phần trăm theo byte hoặc phần trăm tổng cài đặt.
+
+`GET /api/system/ota-updating` giữ `data.updating`, thêm `data.progress` (map component, có alias `agent` đang dùng) và `data.bootstrap_available`. OS Server đọc snapshot local kể cả khi bootstrap không truy cập được; khi chính OS Server restart thì API vẫn tạm ngắt. Cần cập nhật cả updater, OS Server và frontend để có giao diện chi tiết. Worker cũ vẫn được hỗ trợ qua danh sách updating.
+
+
+Rootfs device lamp có service tắt LED sau HAL dành riêng Orange Pi (chờ 5 giây).
+Device OTA reload systemd sau khi áp overlay và sau khi khôi phục rollback,
+trước khi restart service; setup cũng reload sau khi áp hardware override.
+Image builder đã copy rootfs này. Update riêng HAL không cài fallback.
+Xem [vòng đời shutdown LED](../../robots/lamp/docs/vi/led-control_vi.md#fallback-shutdown-cho-orange-pi)
+để biết cách kích hoạt, giới hạn và rollback.
+
+Image OrangePi trì hoãn tác vụ đếm cập nhật cho MOTD của vendor (`orangepi-apt-updates`) 120 giây sau boot để giảm tranh chấp đọc storage với HAL. Chỉ dòng cron chính xác `@reboot root /usr/lib/orangepi/orangepi-apt-updates` được đổi; lịch đếm hằng ngày và lịch cập nhật APT/bảo mật giữ nguyên. Device hiện có có thể áp dụng bằng `sudo python3 scripts/imager/lib/defer_orangepi_update_count.py` sau khi chép script lên device. Helper chạy lại không đổi thêm, bỏ qua dòng thiếu/đã tùy chỉnh và lưu bản gốc tại `/var/backups/autonomous/orangepi-updates.before-boot-delay`. Chép bản gốc về `/etc/cron.d/orangepi-updates` để hoàn tác. Đây là thay đổi cấu hình image/device, không nằm trong OTA chỉ cập nhật HAL.
+
+Build image OrangePi dùng `golden-opi.img.building`, từ chối source lớn hơn
+`OUT_IMG_SIZE` và chạy `e2fsck -fp` có ghi trước khi resize (chỉ chấp nhận mã 0/1).
+Sau khi unmount cuối cùng, `e2fsck -fn` chỉ đọc bắt buộc trả mã 0.
+Cả hai loop device được detach trước khi công bố raw image
+bằng đổi tên nguyên tử; bước nén cũng ghi file staging rồi mới đổi tên. Build lỗi
+có thể để lại artifact hoàn tất cũ; `COMPRESS=0` không cập nhật image nén đã có.
+Khi flash cần chọn đúng bản build mong muốn.
+
+Với flash raw, `make sd-card-flash-raw DEVICE_TYPE=lamp DISK=17 VERIFY=0` bỏ bước đọc lại đối chiếu và yêu cầu Python của bước này; vẫn sync và eject. Mặc định vẫn bật verify.
+
+Cả hai target flash trong Makefile cần Python 3 và dùng
+`scripts/imager/lib/verify_flash.py` để đọc lại SD, đối chiếu toàn bộ byte của image
+trước khi báo thành công/eject. Flash image nén dùng Bash `pipefail` để lỗi giải nén
+làm target thất bại; dữ liệu khác biệt hoặc đọc thiếu cũng gây thất bại. Kiểm tra
+ext4 đánh giá cấu trúc filesystem; đọc lại kiểm tra byte đã ghi. Hai phép kiểm tra
+không bảo đảm boot thành công và không tự xác định nguyên nhân hỏng filesystem.
+Xem [quy trình imager](../../scripts/imager/README.md#flashing-an-sd-card).
+
 ## 1. Tổng Quan
 
 Thiết bị chạy **5 thành phần phần mềm** trên board được hỗ trợ (Raspberry Pi 4, Pi 5, hoặc OrangePi). Tất cả được cài đặt qua script setup ban đầu và cập nhật tự động qua OTA worker chạy nền.
@@ -89,23 +129,23 @@ lấy từ feed. Payload đã decode có dạng:
   "os-server": {
     "version": "1.2.3",
     "min_version": "1.2.0",
-    "url": "https://storage.googleapis.com/{BUCKET}/{PREFIX}/ota/os-server/1.2.3/os-server-1.2.3.zip",
+    "url": "https://storage.googleapis.com/{BUCKET}/{PREFIX}/ota/os-server/1.2.3.zip",
     "sha256": "<64 ký tự hex thường>"
   },
   "bootstrap": {
     "version": "1.0.5",
-    "url": "https://storage.googleapis.com/{BUCKET}/{PREFIX}/ota/bootstrap/1.0.5/bootstrap-1.0.5.zip"
+    "url": "https://storage.googleapis.com/{BUCKET}/{PREFIX}/ota/bootstrap/1.0.5.zip"
   },
   "web": {
     "version": "0.9.0",
-    "url": "https://storage.googleapis.com/{BUCKET}/{PREFIX}/ota/web/0.9.0/setup-0.9.0.zip"
+    "url": "https://storage.googleapis.com/{BUCKET}/{PREFIX}/ota/web/0.9.0.zip"
   },
   "openclaw": {
     "version": "2026.6.10"
   },
   "hal": {
     "version": "1.0.0",
-    "url": "https://storage.googleapis.com/{BUCKET}/{PREFIX}/ota/hal/1.0.0/hal-1.0.0.zip"
+    "url": "https://storage.googleapis.com/{BUCKET}/{PREFIX}/ota/hal/1.0.0.zip"
   }
 }
 ```
@@ -128,7 +168,7 @@ Có thể đổi thư mục hoặc ID:
 make ota-keygen OTA_SIGNING_KEY_DIR=/secure/ota-keys OTA_SIGNING_KEY_ID=prod-2026-08
 ```
 
-**Domain types** — `domain/ota.go`:
+**Domain types** — `system/domain/ota.go`:
 
 ```go
 const (
@@ -153,6 +193,7 @@ type OTAMetadata map[string]OTAComponent
 type OTAComponent struct {
     Version    string `json:"version"`
     MinVersion string `json:"min_version,omitempty"`
+    MinVersionByDevice map[string]string `json:"min_version_by_device,omitempty"`
     URL        string `json:"url,omitempty"`
     SHA256     string `json:"sha256,omitempty"`
 }
@@ -168,6 +209,13 @@ type OTAComponent struct {
   `version` (worker bám latest — hành vi cũ).
 - **`software-update <key>` thủ công** (qua SSH) bỏ qua `min_version`, luôn cài
   `version` — để test bản mới trên vài thiết bị trước.
+- **Sàn theo thiết bị:** `min_version_by_device` (vd `{"lamp": "0.1.285"}`)
+  ghi đè `min_version` cho `device_type` có trong map; loại không có thì dùng
+  `min_version`. Dùng khi một loại thiết bị phải giữ sàn cũ (vd `intern-v2` giữ
+  HAL cũ) trong khi loại khác lên bản mới. Bootstrap cũ hơn trường này bỏ qua nó
+  và vẫn đọc `min_version`, nên để `min_version` ở sàn bị giữ lại và promote
+  bootstrap mới trước khi dựa vào map. Đặt bằng
+  `make promote-hal FOR=lamp [V=<version>]` (dùng được cho mọi `promote-*`).
 
 Quy trình:
 
@@ -210,55 +258,36 @@ curl -fsSL https://cdn.autonomous.ai/os/install.sh | sudo bash
 | 3 | Setup nginx | Tải web bundle, cấu hình reverse proxy + captive portal |
 | 4 | Setup WiFi AP | Cấu hình hostapd, dnsmasq, bật AP mode cho provisioning |
 
-### Stage 2b: Cài HAL Runtime (MỚI)
+### Stage 2b: Cài HAL Runtime (`stage_hal`)
 
 ```bash
-stage_install_hal() {
-    echo "=== Stage 2b: Install HAL Runtime ==="
+stage_hal() {
+    HAL_DIR="/opt/hal"
+    mkdir -p "$HAL_DIR"
 
-    # 1. Cài Python dependencies hệ thống
-    apt-get install -y python3 python3-pip python3-venv
+    # 1. Tải zip theo metadata .hal.url (đối chiếu .hal.sha256)
+    curl -fsSL -o /tmp/hal.zip "$HAL_URL"
+    unzip -o -q /tmp/hal.zip -d "$HAL_DIR"
 
-    # 2. Tạo thư mục cài đặt
-    mkdir -p /opt/hal
+    # 2. Thư viện audio, PulseAudio AEC + socket anonymous, udev rule giữ PulseAudio tránh codec loa
 
-    # 3. Tải từ OTA metadata
-    HAL_URL=$(echo "$OTA_JSON" | jq -r '.hal.url')
-    HAL_VERSION=$(echo "$OTA_JSON" | jq -r '.hal.version')
+    # 3. Tạo lại venv bằng uv (tự tải Python 3.12 standalone)
+    rm -rf "$HAL_DIR/.venv"
+    cd "$HAL_DIR" && uv sync --python 3.12 --extra hardware --extra aec --extra pipecat
 
-    curl -fsSL "$HAL_URL" -o /tmp/hal.zip
-    unzip -o /tmp/hal.zip -d /opt/hal/
-    rm /tmp/hal.zip
+    # 4. Ghi $HAL_DIR/.env (HAL_MODE=production, DEVICE_TYPE, DEVICES_DIR) nếu chưa có
 
-    # 4. Cài Python dependencies trong venv
-    python3 -m venv /opt/hal/venv
-    /opt/hal/venv/bin/pip install -r /opt/hal/requirements.txt
-
-    # 5. Tạo systemd service
-    cat > /etc/systemd/system/hal.service << 'UNIT'
-[Unit]
-Description=HAL Python Runtime — Hardware Drivers
-After=network.target
-
+    # 5. systemd unit
+    cat >/etc/systemd/system/hal.service <<EOF
 [Service]
-Type=simple
-User=root
-WorkingDirectory=/opt/hal
-ExecStart=/opt/hal/venv/bin/python -m hal.server
+WorkingDirectory=$HAL_DIR
+EnvironmentFile=$HAL_DIR/.env
+Environment="PYTHONPATH=/opt"
+ExecStart=$HAL_DIR/.venv/bin/uvicorn hal.server:app --host 127.0.0.1 --port 5001 --timeout-graceful-shutdown 5
 Restart=always
-RestartSec=5
-StandardOutput=journal
-StandardError=journal
-
-[Install]
-WantedBy=multi-user.target
-UNIT
-
-    systemctl daemon-reload
-    systemctl enable hal.service
-    systemctl start hal.service
-
-    echo "HAL $HAL_VERSION installed at /opt/hal/"
+...
+EOF
+    systemctl daemon-reload && systemctl enable hal && systemctl restart hal
 }
 ```
 
@@ -321,7 +350,11 @@ Với hai binary tự chứa, mỗi lần update giữ
 để khôi phục. Updater ghi version vừa gỡ vào `rollback_versions`; bootstrap chỉ
 bỏ qua đúng target đó nên release lỗi không bị cài lại ở lần poll sau. Khi feed
 có version khác, OTA của component đó tự tiếp tục. Bản thân rollback không cần
-metadata URL hoặc mạng.
+metadata URL hoặc mạng. Bootstrap đọc lại `rollback_versions` trước mỗi lần
+reconcile component, nên rollback HAL/web/device thủ công có hiệu lực mà không
+cần restart bootstrap. Rules không đọc hoặc parse được sẽ dừng lần reconcile đó.
+Nếu reconcile HAL hoặc os-server thất bại, chu kỳ tự động bỏ qua device profile
+để tránh áp khai báo cần phiên bản core chưa cập nhật thành công.
 
 Trước khi update `os-server`, `web` hoặc `device`, updater bảo đảm nginx có route
 WebSocket Harness. Nó tìm trong `/etc/nginx/conf.d/*.conf` và mọi entry của
@@ -331,22 +364,29 @@ không hỗ trợ hoặc có rewrite URI bị từ chối. Site dạng symlink �
 file đích thực, giữ nguyên link enabled. Updater kiểm tra `nginx -t` và chỉ
 reload nginx sau khi thêm route.
 
+Để vá thủ công image cũ đã có `/api/buddy/ws`, chạy
+`scripts/maintenance/patch-nginx-harness-ws.sh` bằng root trên device. Script
+resolve site dạng symlink trước khi sửa, lưu bản sao riêng của file gốc tại
+`/var/backups/nginx-harness-ws/`, và khôi phục file đó nếu `nginx -t` thất bại,
+giữ nguyên symlink enabled. Nếu đã có route Harness thì không thay đổi.
+
 Các component cài theo thư mục cũng có cùng hợp đồng recovery. Trước khi update
 web, updater dừng nginx, swap bundle đã giải nén hoàn chỉnh từ thư mục staging,
 và giữ bundle trước đó tại `/root/bootstrap/rollback/web.previous` cùng trạng
 thái active/inactive trước đó của nginx. Sau đó nó đòi hỏi có `index.html`,
-`nginx -t` hợp lệ và—khi nginx vốn đang chạy—`GET /` loopback thành công. Nếu
-thất bại, updater tự khôi phục bundle và trạng thái service đã lưu. Operator cũng
+`nginx -t` hợp lệ và—khi nginx vốn active hoặc đang enabled—service active trước
+và sau khi `GET /` loopback thành công. Service bắt buộc chạy nhưng đã dừng hoặc
+failed sẽ làm update thất bại, không được bỏ qua health check. Nếu thất bại, updater tự khôi phục bundle và trạng thái service đã lưu. Operator cũng
 có thể chạy `software-update rollback web`; version bị loại được ghi vào
 `rollback_versions` giống rollback binary.
 
-Với device profile, updater stage ZIP, chỉ dừng `os-server` và `hal` vốn đang
-active, rồi giữ profile cũ tại `/root/bootstrap/rollback/device.previous`. Nó
+Với device profile, updater stage ZIP, dừng `os-server` và `hal`, rồi giữ profile cũ tại `/root/bootstrap/rollback/device.previous`. Nó
 cũng snapshot chính xác các file thuộc `rootfs/` của profile cũ hoặc mới trong
 `device.previous.rootfs`; rollback vì vậy khôi phục file bị ghi đè và xoá file
 chỉ được profile lỗi thêm vào. OTA thành công thay thế `.env` HAL được sinh.
-Profile bắt buộc có `ROBOT.md`; mỗi service vốn active phải khởi động lại và trả
-về health endpoint loopback. Check lỗi sẽ tự phục hồi profile known-good và trạng
+Profile bắt buộc có `ROBOT.md`; mỗi service vốn active hoặc đang enabled phải
+active trước và sau probe health loopback. HAL hoặc os-server lỗi đều làm update
+profile thất bại. Check lỗi sẽ tự phục hồi profile trước đó và trạng
 thái service cũ. Dùng `software-update rollback device` khi operator rollback;
 version profile bị loại sau đó sẽ bị chặn.
 
@@ -368,6 +408,13 @@ Các file `device/*.json` được chọn thay toàn bộ JSON device cấp cao 
 tồn tại, không merge nội dung. Renderer kiểm tra các input này trước khi ghi
 và từ chối capability hay file thay thế không hợp lệ. Giá trị riêng sản phẩm
 chỉ nằm trong package device. Ví dụ:
+
+Gain loa C-Media của Lamp standard được cố định ở mức mixer **9 (-28 dB)**,
+tăng 3 dB so với mức 6 trước đây. Override rootfs `pro` giữ **6 (-31 dB)**;
+các profile ReSpeaker giữ đường audio riêng. Slider softvol (-30..0 dB) và
+volume user đã lưu không đổi. Cấu hình nằm trong gói device/rootfs; mức gain
+được áp dụng khi `lamp-cmedia-speaker.service` chạy lại (ví dụ reboot), không
+phải qua update riêng HAL.
 
 | Profile | Mic hội thoại | Mic sensing | Loa | Âm lượng khởi động / tối đa | SEN63C |
 |---|---|---|---|---|---|
@@ -524,6 +571,14 @@ setup), `Serve()` không khởi động poll loop lẫn healthcheck server. Nó 
 `/root/config/bootstrap.json` mỗi 30s tới khi có URL rồi mới chạy tiếp. Không có
 gì silent.
 
+**Gửi log**: bootstrap ghi log qua logger dùng chung với
+`_service_name: "bootstrap"` (trước đây bị ghi là `os-server`). Bootstrap không có
+tín hiệu thay đổi config, nên `RunLogRelay` (`system/bootstrap/log_relay.go`) đọc
+lại `/root/config/config.json` mỗi phút và bật relay bằng key Autonomous của thiết
+bị (cùng quy tắc với os-server). Khi chưa có key — thiết bị mới, hoặc OTA chạy trong
+lúc setup — record nằm chờ trong spool (`/var/lib/autonomous/gelf-spool/bootstrap.jsonl`) và
+được replay khi gửi được. Xem [setup-flow_vi.md](setup-flow_vi.md).
+
 ### State (`/root/bootstrap/state.json`)
 
 Lưu version đã cài của mỗi thành phần:
@@ -545,7 +600,7 @@ mới rename vào vị trí chính thức. Nếu state cũ bị lỗi định d�
 legacy bị gián đoạn), bootstrap giữ lại thành `state.json.corrupt-<timestamp>`,
 log cảnh báo và tiếp tục với state rỗng thay vì không khởi động OTA polling.
 
-### Luồng xử lý chính (`bootstrap/bootstrap.go`)
+### Luồng xử lý chính (`system/bootstrap/bootstrap.go`)
 
 ```
 checkLoop():
@@ -555,15 +610,17 @@ checkLoop():
 
 checkOnce():
   1. Tải OTA metadata JSON
-  2. Với mỗi key [os-server, bootstrap, web, hal]:
+  2. Với mỗi key [os-server, bootstrap, web, hal, buddy, openclaw, codex,
+     claudecode, opencode, picoclaw, hermes]:
      → reconcile(key, metadata[key])
-  GHI CHÚ: OpenClaw OTA tạm thời bị tắt (reconcileOpenClawFromNpm đã comment out)
-  3. Lưu state
+     (hermes chỉ khi entry có `commit` — hermesPinned)
+  3. reconcileDevice() cho entry lồng devices.<device_type>
+  4. Lưu state (chỉ khi có thay đổi)
 
 reconcile(key, target):
   1. Phát hiện version hiện tại đã cài
   2. Nếu current == "" VÀ component không được cài → bỏ qua im lặng
-  3. floor = target.min_version (mặc định target.version nếu rỗng)
+  3. floor = target.min_version_by_device[device_type], không có thì target.min_version, không có nữa thì target.version
   4. Nếu current >= floor → đồng bộ state, return (đã ở/trên sàn duyệt)
   5. Nếu current < floor →
      a. Bật LED cam breathing (đang update)
@@ -649,9 +706,13 @@ Hai việc khác nhau, và lẫn lộn chúng chính là thứ làm nút web tr�
 | `force-check/<key>` | Chạy lại quyết định TỰ ĐỘNG cho component đó | **tôn trọng** — component đã bằng/cao hơn sàn thì không làm gì |
 
 Nút `update` trong card Versions là `force-update` (qua
-`POST /api/system/software-update/:target`). Cả hai dùng chung allowlist target,
-bao gồm `bootstrap` và `device`; Bootstrap tách installer nền để worker thay thế restart an
-toàn. `componentInstalled` vẫn từ chối component thiết bị không có.
+`POST /api/system/software-update/:target`). Cả hai dùng chung allowlist target —
+`os-server`, `bootstrap`, `web`, `hal`, `device`, `openclaw`, `codex`, `claudecode`,
+`opencode`, `picoclaw`, `hermes` — được giữ ở hai nơi và phải khớp nhau:
+`ota.allowedTargets` của os-server và `forceTargetAllowed` của bootstrap. Alias `agent`
+được đổi sang runtime đang cấu hình trước, nên trên thiết bị OpenClaw nút của dòng
+Agent đến nơi dưới dạng `openclaw`. Bootstrap tách installer nền để worker thay thế
+restart an toàn. `componentInstalled` vẫn từ chối component thiết bị không có.
 
 ### `GET /versions` (bootstrap, loopback)
 
@@ -674,7 +735,7 @@ resolve từ `metadata.devices.<device_type>` lồng nhau thay vì danh sách co
 | `web` | Đọc file `/usr/share/nginx/html/setup/VERSION` |
 | `device` | Đọc `/opt/devices/<device_type>/VERSION` |
 | `openclaw` | Chạy `openclaw --version`, trích xuất semver bằng regex |
-| `hal` | Chạy `/opt/hal/venv/bin/python -m hal --version` HOẶC đọc `/opt/hal/VERSION` |
+| `hal` | Đọc file `/opt/hal/VERSION_HAL` |
 | `codex` / `claudecode` / `opencode` | Chạy `<cli> --version`, lấy semver ở dòng đầu (`cliSemver`) |
 | `picoclaw` | Đọc `/usr/local/lib/os-runtimes/picoclaw/installed-version` — output `version` của nó không có semver |
 | `hermes` | Chạy `hermes --version` ("Hermes Agent v0.21.1 (2026.9.7)"), lấy semver ở dòng đầu (`cliSemver`) |
@@ -687,7 +748,7 @@ resolve từ `metadata.devices.<device_type>` lồng nhau thay vì danh sách co
 | `bootstrap` | Spawn detached `software-update bootstrap` (tự cập nhật, sống sót sau restart) |
 | `web` | Chạy `software-update web` |
 | `device` | Chạy `software-update device` cho profile `devices.<device_type>` đã resolve; rootfs overlay được áp dụng nhưng vẫn giữ `.env` HAL local của thiết bị |
-| `openclaw` | ~~Chạy `npm install -g openclaw@{version}` → `systemctl restart openclaw`~~ (tạm thời tắt) |
+| `openclaw` | Chạy `software-update openclaw` (npm install đúng version trong metadata → restart `openclaw`); chỉ khi binary `openclaw` có trong PATH |
 | `hal` | Chạy `software-update hal` → `systemctl restart hal` |
 | `codex` / `claudecode` / `opencode` / `picoclaw` | Chạy `software-update <key>` — CHỈ trên thiết bị có `agent_runtime` đúng bằng runtime đó |
 | `hermes` | Chạy `software-update hermes` — chỉ khi `agent_runtime` là hermes, entry metadata có `commit`, VÀ updater trên máy là bản biết pin (`updaterSupportsHermesPin`: có đọc `.hermes.commit`). Entry chưa pin (không có `commit`) bị cả loop lẫn `/versions` bỏ qua, nên nút trên web không hiện — `hermes update` sẽ lên upstream HEAD và không bao giờ đạt sàn. |
@@ -703,11 +764,11 @@ chung của hệ thống; nếu đã nâng Node thành công nhưng cài OpenCla
 updater không rollback Node. Xử lý prerequisite này không thay đổi gate cập
 nhật tự động ở trên.
 
-Mặc định image OrangePi khớp OTA metadata đã kiểm tra ngày 2026-09-11: OpenClaw
-`2026.9.3` và Hermes `0.21.1`. Builder cài package NodeSource 26.x mới nhất kể cả
+Image OrangePi mặc định dùng OpenClaw `2026.9.3` và Hermes `0.21.5` (khớp
+bản Hermes OTA công bố ngày 2026-10-01). Builder cài package NodeSource 26.x mới nhất kể cả
 khi dùng lại base image, và yêu cầu tối thiểu Node `26.8.2` (bản upstream mới nhất
 tại thời điểm kiểm tra). Installer và checkout Hermes được pin vào release
-`v2026.9.7`, commit `2237be355906fbe6065ce1815711eee52b2d646e`; version CLI báo về
+`v2026.9.24`, commit `f97608f178d1ffeca59860195ab7da295f7c8e5f`; version CLI báo về
 khác sẽ làm build thất bại. Đây là mặc định lúc build image; presync và hành vi
 `software-update` sau đó giữ nguyên.
 
@@ -807,9 +868,45 @@ cũ có thể chưa set `agent_runtime`.
 Bash script được cài bởi setup.sh (và được imager bake sẵn vào image). Bootstrap
 worker gọi script này để thực hiện cập nhật.
 
-Script đọc URL metadata OTA từ `metadata_url` trong `/root/config/bootstrap.json`
+Khi cài đặt, script đọc URL metadata OTA từ `metadata_url` trong `/root/config/bootstrap.json`
 (biến môi trường `OTA_METADATA_URL` nếu set sẽ override, dùng cho chạy thủ công/debug),
 và exit lỗi nếu cả hai đều rỗng — không có URL hardcode.
+
+### Update bị gián đoạn và binary core
+
+Với HAL, web, device profile, os-server và bootstrap, updater ghi và flush
+`/root/bootstrap/rollback/pending-update.json` trước khi publish bản thay thế.
+Journal được giữ tới khi bản mới vượt qua các health check bắt buộc. Lỗi thông
+thường hoặc signal có trap sẽ khôi phục bản đã lưu; recovery lỗi giữ journal để
+thử tiếp.
+
+Update device profile giữ một snapshot rootfs riêng cho transaction đang chạy.
+Snapshot dành cho rollback thủ công chỉ được thay sau khi profile mới vượt qua
+health check; recovery sử dụng snapshot được ghi trong journal.
+
+`software-update recover` không cần metadata OTA hay tải mạng. Mỗi lượt updater
+phục hồi transaction còn dang dở trước khi cập nhật tiếp. Bootstrap cũng chạy
+recovery trước khi kiểm tra metadata/version ở poll tự động, component check và
+force update. Nó còn nhận ra trường hợp legacy: `/opt/hal` mất nhưng còn
+`hal.previous` mà chưa có journal, tránh version đã lưu che mất runtime bị thiếu.
+SIGKILL hoặc mất điện được phục hồi ở lần chạy updater hoặc poll bootstrap tiếp
+theo; cơ chế này không bảo đảm khôi phục mọi lỗi dữ liệu thẻ SD hoặc máy không
+boot được tới bước chạy các service đó.
+
+Nếu cài HAL lần đầu mà không có runtime hay backup trước đó, recovery đưa
+candidate lỗi ra khỏi đường dẫn live và giữ HAL dừng. Nó không báo đã phục hồi
+một bản cũ vốn không tồn tại.
+
+Update binary core stage executable cạnh đường dẫn đích, yêu cầu probe
+`--version` thành công trong 15 giây, lưu binary cũ rồi publish bằng atomic
+rename. Restart đơn thuần chưa đủ: os-server phải trả `/api/health/live` ở port
+5000; bootstrap phải trả `/health` trên `httpPort` cấu hình (mặc định 8080).
+Cả hai check đều yêu cầu service còn active. Thất bại sẽ khôi phục binary đã lưu
+và kiểm tra service vừa phục hồi.
+
+Phát hành thay đổi bằng **cả** `make upload-setup` (script updater) và
+`make upload-bootstrap` (Go phát hiện recovery, đọc lại rollback rules và chặn
+profile khi core lỗi). Chỉ upload HAL sẽ không phân phối các thay đổi này.
 
 ### Xử lý HAL
 
@@ -827,36 +924,19 @@ script chọn Python extras theo `DEVICE_TYPE` trong `/opt/hal/.env`, fallback s
 > một lần. Đo trên lamp: **5-6 phút → 41 giây**, và `/opt/hal` từ ~4.8 GB còn
 > 98 MB (venv hardlink vào cache dùng chung).
 
-> **Cửa sổ publish an toàn trước gián đoạn.** Giữa lúc "dời cây đang chạy đi" và
-> "đổi tên cây staging vào chỗ", component không tồn tại trên đĩa. Một `trap` ghi
-> lại lần dời đang treo và trả cây về nếu tiến trình thoát trước — SSH đứt (HUP),
-> `systemctl restart bootstrap` giết cả cgroup (TERM), hay bất kỳ nhánh lỗi nào.
-> SIGKILL và mất điện thì không trap được; những ca đó rơi vào đường cài lại
-> (cây bị thiếu sẽ được cài mới).
+Publish HAL theo cơ chế journal ở trên: giữ nguyên runtime cũ, tạo venv mới
+trong staging với cache dùng chung, giữ `.env`, rename thư mục staging vào
+`/opt/hal`, rồi khôi phục trạng thái service cần chạy và kiểm tra health. Chỉ
+xoá journal khi thành công; lỗi staging, publish hoặc health đều đi qua recovery.
+Operator cũng có thể chạy `software-update rollback hal`.
 
-```bash
-"hal")
-    # Giữ nguyên toàn bộ runtime và trạng thái service trước đó.
-    systemctl stop hal
-    mv /opt/hal /root/bootstrap/rollback/hal.previous
-
-    # UV_BIN and HAL_EXTRA are resolved before stopping HAL.
-    # Build a fresh venv; preserve .env and use the external shared cache.
-    unzip -q "$ZIP" -d /opt/.hal.new
-    cp -a /root/bootstrap/rollback/hal.previous/.env /opt/.hal.new/
-    HAL_EXTRA_ARGS=(--extra "$HAL_EXTRA")
-    if [ "$HAL_EXTRA" != "reachy" ]; then
-        HAL_EXTRA_ARGS+=(--extra pipecat)
-    fi
-    (cd /opt/.hal.new && UV_CACHE_DIR=/opt/.uv-cache-hal "$UV_BIN" sync --python 3.12 --extra hardware "${HAL_EXTRA_ARGS[@]}")
-    mv /opt/.hal.new /opt/hal
-
-    systemctl restart hal
-    curl -fsS http://127.0.0.1:5001/health
-    # Lỗi staging hoặc health sẽ khôi phục hal.previous và trạng thái cũ.
-    # Operator cũng có thể chạy: software-update rollback hal
-    ;;
-```
+Bắt buộc kiểm tra runtime nếu HAL chạy trước update hoặc service đang enabled.
+Khi đó service inactive/failed làm update thất bại, không được bỏ qua health check.
+HAL phải active trước và sau khi `/health` thành công; lỗi sẽ kích hoạt rollback.
+Chỉ HAL trước đó inactive và disabled mới bỏ qua kiểm tra runtime. Rollback trả
+về bản cài trước, không đảm bảo sửa được dependency hoặc cache dùng chung đã hỏng.
+Sau khi khởi động lại HAL thành công để phục hồi, updater tắt cleanup lúc thoát
+để việc trả mã lỗi không restart service đã phục hồi thêm lần nữa.
 
 ### Xử lý Codex
 
@@ -932,21 +1012,30 @@ cố định nên nó CÓ backup `.previous`: `software-update rollback opencode
 được, khác claudecode. Publish bằng `make upload-opencode <semver-trần>`, thả
 bằng `make promote-opencode`.
 
-### Xử lý Hermes (chỉ SSH — KHÔNG pin được nên không bao giờ auto-apply)
+### Xử lý Hermes (chỉ auto-apply khi entry được pin theo commit)
 
 Hermes cài kiểu git; `runtimes/hermes/install.sh` ghi
 `/usr/local/lib/hermes-agent/.install_method=git` chính là để updater upstream
 nhận ra. Updater đó **không nhận version đích** — `hermes update` luôn nhảy lên
-HEAD của upstream. Nên `hermes.version` publish ra chỉ quyết định *khi nào* fleet
-update (qua `min_version`), không quyết định *bản nào*.
+HEAD của upstream — nên nhánh này có hai mode như mô tả ở trên: entry **pinned**
+(`hermes.commit`) chạy installer upstream tại đúng commit đó, entry **unpinned**
+quay về `hermes update`. Bootstrap chỉ auto-apply entry pinned (`hermesPinned` +
+`updaterSupportsHermesPin` trong `system/bootstrap/bootstrap.go`); entry unpinned
+bị loop và `/versions` bỏ qua, chỉ áp dụng được bằng cách chạy
+`software-update hermes` qua SSH.
 
 ```bash
 "hermes")
-    hermes update                       # upstream không có tham số version
-    hermes --version                    # abort nếu không chạy được
-    # Version thực tế != version metadata → CẢNH BÁO, không fail: trên thiết bị
-    # không có gì pin được nó.
-    systemctl restart hermes-gateway    # unit là hermes-gateway.service, không phải hermes.service
+    HERMES_COMMIT=$(jq -r '.hermes.commit // empty' metadata)
+    if [ -n "$HERMES_COMMIT" ]; then
+        update_hermes_pinned "$HERMES_COMMIT"   # các stage installer tại commit, --force-commit
+    else
+        hermes update                          # unpinned: HEAD upstream
+    fi
+    hermes --version                           # abort nếu không chạy được
+    # Version thực tế != version metadata → pinned: FAIL (cặp metadata sai);
+    # unpinned: chỉ CẢNH BÁO.
+    systemctl restart hermes-gateway           # chỉ khi unit tồn tại; sau đó restart os-server
     ;;
 ```
 
@@ -1005,10 +1094,10 @@ Code HAL runtime được **copy** từ project upstream open-source vào mono-r
 
 **Các bước thực hiện:**
 1. Clone `humancomputerlab/lelamp_runtime` về thư mục tạm
-2. Copy driver code (`services/motors.py`, `services/rgb.py`, `services/audio.py`, `services/service_base.py`) vào `hal/services/`
+2. Copy driver code (`services/motors.py`, `services/rgb.py`, `services/audio.py`, `services/service_base.py`) vào `hal/drivers/` (nay là `hal/drivers/motors/`, `hal/drivers/rgb/`, `hal/drivers/voice/`, `hal/drivers/base.py`)
 3. Xoá toàn bộ code LiveKit, OpenAI, conversation
 4. Thêm `hal/server.py` — HTTP API server mới (FastAPI)
-5. Thêm `hal/services/display.py` — DisplayService mới cho GC9A01
+5. Thêm `hal/drivers/display/display_service.py` — DisplayService mới cho GC9A01
 6. Tạo `hal/UPSTREAM.md` ghi commit hash nguồn và ngày copy
 7. Test trên thiết bị với phần cứng thật
 
@@ -1017,55 +1106,61 @@ Code HAL runtime được **copy** từ project upstream open-source vào mono-r
 HAL nằm trong repo này dưới dạng subfolder Python, cùng với Go và TypeScript:
 
 ```
-autonomous/
-├── system/          # Go code (fork từ lobster)
-│   ├── cmd/              # Go entrypoints
+autonomous-os/
+├── system/               # Go os-server + bootstrap worker
+│   ├── cmd/              # Go entrypoints (os-server, bootstrap)
 │   ├── server/           # Go HTTP layer
-│   ├── internal/         # Go business logic
 │   ├── bootstrap/        # Go OTA worker
-│   └── domain/           # Struct dùng chung
-├── system/web/      # TypeScript/React SPA (copy từ lobster, đổi intern→lamp)
-├── hal/               # Python hardware drivers (MỚI)
-│   ├── __init__.py       # Package init, expose __version__
-│   ├── server.py         # HTTP API server (FastAPI) — MỚI, không từ upstream
-│   ├── system/
-│   │   ├── motors.py     # MotorsService — 5x Feetech servo (từ upstream)
-│   │   ├── rgb.py        # RGBService — 64x WS2812 LED (từ upstream)
-│   │   ├── audio.py      # Audio — amixer, playback (từ upstream)
-│   │   ├── display.py    # DisplayService — GC9A01 LCD (MỚI, không từ upstream)
-│   │   └── service_base.py  # Event-driven ServiceBase (từ upstream)
-│   ├── config.py         # Runtime config
-│   ├── requirements.txt  # Python dependencies
-│   ├── VERSION           # Version string
+│   ├── domain/           # Struct dùng chung
+│   └── web/              # TypeScript/React SPA
+├── runtimes/             # Các agent runtime thay thế được (openclaw, hermes, codex, …)
+├── hal/                  # Python hardware runtime
+│   ├── server.py         # FastAPI app (hal.server:app) — không từ upstream
+│   ├── routes/           # Module route FastAPI (servo, led, camera, audio, display, …)
+│   ├── drivers/
+│   │   ├── base.py       # Event-driven ServiceBase (từ upstream)
+│   │   ├── motors/       # MotorsService — Feetech servos (từ upstream)
+│   │   ├── rgb/          # RGBService — WS2812 LEDs (từ upstream)
+│   │   ├── voice/        # Audio, STT, TTS
+│   │   └── display/      # DisplayService — GC9A01 LCD (display_service.py, không từ upstream)
+│   ├── config.py         # Runtime config (env vars)
+│   ├── pyproject.toml    # Python dependencies (uv; khoá trong uv.lock)
+│   ├── VERSION_HAL       # Version string dạng text
 │   └── UPSTREAM.md       # Track commit nguồn từ humancomputerlab/lelamp_runtime
-├── resources/
-│   └── openclaw-skills/  # SKILL.md files
+├── skills/               # Các file SKILL.md của agent
 ├── scripts/
-│   └── setup.sh
+│   └── provision/setup.sh
 ├── go.mod
 ├── Makefile
 └── CLAUDE.md
 ```
 
-3 ngôn ngữ (Go, Python, TypeScript), 3 folder, 1 repo. Mỗi cái build riêng, quản lý chung.
+3 ngôn ngữ (Go, Python, TypeScript), 1 repo. Mỗi cái build riêng, quản lý chung.
 
 ### HAL OTA Package
 
-Để phân phối qua OTA, HAL được zip từ folder `hal/`:
+Để phân phối qua OTA, `scripts/release/upload-hal.sh` zip nội dung folder `hal/` (loại `.venv/`, `__pycache__/`, `.git/`, `*.pyc`, `.env`, `.python-version`, `test/`, `.coverage`, `drivers/voice/resources/ambernet.onnx`):
 
 ```
-hal-{version}.zip
-├── hal/                  # Full Python package
-├── requirements.txt
-└── VERSION
+hal-{version}.zip         # nội dung hal/ nằm ở gốc zip → giải nén vào /opt/hal
+├── server.py, routes/, drivers/, …
+├── pyproject.toml, uv.lock
+└── VERSION_HAL
 ```
+
+Model nhận diện ngôn ngữ (`ambernet.onnx`, ~117 MB) không nằm trong zip: OTA thay
+`/opt/hal` ở mỗi lần update, nên HAL tải release asset được pin trong
+`drivers/voice/resources/ambernet.model.json` (URL + SHA-256) vào
+`/opt/.models-hal`, thư mục này giữ nguyên qua các lần update và chỉ tải một lần
+cho mỗi version model (xem `docs/vi/realtime-voice_vi.md`, "Cổng ngôn ngữ").
 
 ### HAL HTTP API (FastAPI trên port 5001)
 
-HAL Python runtime expose HTTP API trên `127.0.0.1:5001`. OS Server (Go, port 5000) bridge request từ OpenClaw skills đến API này. Nginx proxy `/hw/*` chỉ cho caller trên cùng máy — client bên ngoài nhận 403. Swagger UI tại `/hw/docs` không truy cập được từ LAN.
+HAL Python runtime expose HTTP API trên `127.0.0.1:5001`. Agent skill trên thiết bị gọi thẳng qua loopback; web UI đi qua reverse proxy `/api/hardware/*` của OS Server (có admin auth, `system/server/proxy.go`). Nginx proxy `/hw/*` chỉ cho caller trên cùng máy — client bên ngoài nhận 403. Swagger UI tại `/hw/docs` không truy cập được từ LAN.
 
 ```
-OpenClaw LLM → curl 127.0.0.1:5000/api/servo → OS Server → http://127.0.0.1:5001/servo → HAL Python → Phần cứng
+Agent skill → curl http://127.0.0.1:5001/servo/play → HAL Python → Phần cứng
+Web UI       → /api/hardware/servo/play → OS Server (admin auth) → http://127.0.0.1:5001/servo/play → HAL Python
 Bên ngoài    → http://<device-ip>/hw/docs    → nginx → 403 Forbidden
 ```
 
@@ -1093,46 +1188,15 @@ Bên ngoài    → http://<device-ip>/hw/docs    → nginx → 403 Forbidden
 
 ## 7. Scripts Upload / Publish
 
-### `scripts/release/upload-hal.sh` (MỚI)
+### `scripts/release/upload-hal.sh`
 
-```bash
-#!/usr/bin/env bash
-# Upload HAL runtime lên OTA
+Chạy qua `make upload-hal`. Script source `ota-config.sh` / `ota-metadata.sh`, rồi:
 
-set -euo pipefail
-
-VERSION_FILE="VERSION_HAL"
-BUCKET="s3-autonomous-upgrade-3"
-OTA_PATH="os/ota/hal"
-METADATA_PATH="os/ota/metadata.json"
-
-# Tự tăng patch version
-CURRENT=$(cat "$VERSION_FILE" 2>/dev/null || echo "0.0.0")
-MAJOR=$(echo "$CURRENT" | cut -d. -f1)
-MINOR=$(echo "$CURRENT" | cut -d. -f2)
-PATCH=$(echo "$CURRENT" | cut -d. -f3)
-NEW_VERSION="$MAJOR.$MINOR.$((PATCH + 1))"
-echo "$NEW_VERSION" > "$VERSION_FILE"
-
-# Đóng gói
-echo "Packaging HAL $NEW_VERSION..."
-cd path/to/hal-source
-echo "$NEW_VERSION" > VERSION
-zip -r "/tmp/hal-${NEW_VERSION}.zip" hal/ requirements.txt VERSION
-
-# Upload zip
-gsutil cp "/tmp/hal-${NEW_VERSION}.zip" \
-    "gs://${BUCKET}/${OTA_PATH}/${NEW_VERSION}/hal-${NEW_VERSION}.zip"
-
-# Cập nhật metadata
-DOWNLOAD_URL="https://storage.googleapis.com/${BUCKET}/${OTA_PATH}/${NEW_VERSION}/hal-${NEW_VERSION}.zip"
-gsutil cp "gs://${BUCKET}/${METADATA_PATH}" /tmp/metadata.json
-jq --arg v "$NEW_VERSION" --arg u "$DOWNLOAD_URL" \
-    '.hal = {"version": $v, "url": $u}' /tmp/metadata.json > /tmp/metadata-updated.json
-gsutil cp /tmp/metadata-updated.json "gs://${BUCKET}/${METADATA_PATH}"
-
-echo "HAL $NEW_VERSION published."
-```
+1. `uv lock --project hal --python 3.12 --check` — từ chối publish khi lockfile lỗi thời.
+2. Tăng patch version trong `hal/VERSION_HAL` (khởi tạo `1.0.0` nếu chưa có).
+3. Zip nội dung `hal/` thành `hal-<version>.zip` (loại `.venv/`, `__pycache__/`, `.git/`, `*.pyc`, `.env`, `.python-version`, `test/`, `.coverage`, và file `drivers/voice/resources/ambernet.onnx` local, nếu không file này sẽ ghi đè model được pin trên mọi thiết bị).
+4. Upload lên `gs://${GCS_BUCKET}/${BUCKET_PREFIX}/ota/hal/<version>.zip` (no-cache).
+5. Giải nén `ota/metadata.json` đã ký, set `hal.version`, `hal.url`, `hal.sha256`, `hal.updated_at` (giữ nguyên `min_version` đang có — nâng bằng `promote-ota.sh`), ký lại và upload.
 
 ### Tất cả upload scripts
 
@@ -1141,7 +1205,7 @@ echo "HAL $NEW_VERSION published."
 | `scripts/release/upload-os-server.sh` | OS Server binary | Build → zip → GCS → update metadata |
 | `scripts/release/upload-bootstrap.sh` | Bootstrap Server binary | Build → zip → GCS → update metadata |
 | `scripts/release/upload-web.sh` | Web SPA bundle | Build → zip → GCS → update metadata |
-| `scripts/release/upload-hal.sh` | HAL Python runtime (MỚI) | Package → zip → GCS → update metadata |
+| `scripts/release/upload-hal.sh` | HAL Python runtime | Lock check → zip → GCS → update metadata |
 | `scripts/release/upload-setup.sh` | Script setup | Upload lên GCS |
 | `scripts/release/upload-setup-ap.sh` | Script setup AP | Upload lên GCS |
 | `scripts/release/upload-skills.sh` | OpenClaw skill files | Upload lên GCS |
@@ -1189,9 +1253,9 @@ os-build:
 	GOOS=linux GOARCH=arm64 go build -ldflags "$(LDFLAGS_OS)" -o os-server ./cmd/os-server
 ```
 
-### HAL (VERSION file)
+### HAL (file VERSION_HAL)
 
-Version của HAL là file text `VERSION` trong thư mục gốc package. Bootstrap đọc qua file hoặc `python -m hal --version`.
+Version của HAL là file text `hal/VERSION_HAL` (cài thành `/opt/hal/VERSION_HAL`), bootstrap đọc trực tiếp file này. Không sửa tay khi release — `make upload-hal` (`scripts/release/upload-hal.sh`) tự tăng patch version.
 
 ---
 
@@ -1214,13 +1278,170 @@ Version của HAL là file text `VERSION` trong thư mục gốc package. Bootst
 - [x] **HAL source**: Mono-repo. Driver code copy từ `humancomputerlab/lelamp_runtime` vào `hal/`, bỏ LiveKit/OpenAI, thêm HTTP API + DisplayService. Track upstream thủ công qua `hal/UPSTREAM.md`.
 - [x] **HAL HTTP port**: `5001` (OS Server là `5000`).
 - [x] **Bridge protocol**: HTTP proxy đơn giản. HAL chạy FastAPI trên `127.0.0.1:5001`, OS Server proxy từ port 5000.
-- [ ] **Python version**: Pin Python 3.11+? Yêu cầu Python hiện tại của HAL?
+- [x] **Python version**: Pin Python 3.12.x (`pyproject.toml`, `.python-version`, `setup.sh` dùng `uv sync --python 3.12`).
 - [x] **Đóng gói HAL**: Tạo venv trên thiết bị qua `uv sync --python 3.12 --extra hardware`, thêm `--extra reachy` cho Reachy Mini hoặc `--extra aec --extra pipecat` cho thiết bị khác. OTA tạo venv mới bằng cache dùng chung, giữ `.env` và runtime cũ để rollback.
-- [ ] **Display driver**: DisplayService (GC9A01) — nằm trong HAL Python? Hay module mới?
-- [ ] **HAL config**: HAL cần config file riêng? Hay cấu hình qua OS Server?
+- [x] **Display driver**: DisplayService (GC9A01) là một phần của HAL Python tại `hal/drivers/display/display_service.py`.
+- [x] **HAL config**: Dựa trên biến môi trường (`config.py` đọc env vars). Hỗ trợ file `.env` qua `python-dotenv`. Không cần config file riêng.
 
 ---
 
 > Tài liệu này mô tả toàn bộ hệ thống OTA và bootstrap.
 > Xem [architecture-decision.md](../../robots/lamp/docs/vi/architecture-decision.md) cho quyết định kiến trúc.
 > Xem [product-vision.md](../../robots/lamp/docs/vi/product-vision.md) cho tầm nhìn sản phẩm.
+
+## Thay service qua OTA feed hiện tại
+
+Component khai báo service dùng payload metadata đã ký hiện tại; không có release
+manifest thứ hai hay key theo kiến trúc `runtime`, `v2`, `v3`. Component mô tả
+service thực tế được phát hành:
+
+```json
+{
+  "lamp-os": {
+    "version": "0.1.0",
+    "url": "https://updates.example/lamp-os/0.1.0.zip",
+    "sha256": "<artifact SHA-256>",
+    "min_version_by_device": {"lamp": "0.1.0"},
+    "activate_by_device": {"lamp": true},
+    "service": "lamp-os",
+    "replaces": ["hal", "os-server"]
+  }
+}
+```
+
+Key component phải trùng tên service không có hậu tố `.service`. `replaces` chỉ
+định `hal`/`os-server` hoặc component khai báo service đã đăng ký,
+không phải service hệ thống tùy ý. Bản này chưa hỗ trợ thay các component V1 khác. Cơ chế này không được thay bootstrap. Tên, quyền
+sở hữu và metadata đã ký được kiểm tra trước khi chuyển service. Các trường này
+không được chứa lệnh shell hay hook thực thi tùy ý.
+
+Máy tự chuyển lần đầu khi mục service trong metadata đã ký đặt
+`activate_by_device[device_type]` thành `true` và có ngưỡng
+`min_version_by_device[device_type]` hợp lệ, không rỗng, không lớn hơn version
+đang phát hành. Người vận hành release bật bằng promote; người dùng device
+không cần SSH hay chạy CLI:
+
+```bash
+make promote-service COMPONENT=lamp-os FOR=lamp V=0.1.0 ACTIVATE=1
+```
+
+Bootstrap tìm các service được promote rồi gọi
+`software-update lamp-os --activate-promoted`. Updater kiểm tra lại metadata
+đã ký vừa tải và loại device thực tế trước khi dùng giao dịch chuyển service
+hiện có. Metadata không ký, thiếu chỉ định loại máy, ngưỡng không hợp lệ,
+xung đột quyền sở hữu hoặc updater cũ không cho phép cài lần đầu. Phải đưa
+bootstrap và updater tương thích xuống device trước khi bật chỉ định trên feed.
+
+Chỉ publish không tự kích hoạt. Promote không truyền `ACTIVATE` giữ nguyên
+chỉ định kích hoạt đã có. `ACTIVATE=0 FOR=lamp` ngừng các lần cài đầu tiếp theo
+cho Lamp; không gỡ hay rollback service đã hoạt động. Phạm vi là loại device,
+không phải ID từng máy hoặc tỷ lệ rollout.
+
+Các version tiếp theo dùng bootstrap cập nhật theo ngưỡng như hiện tại, bao gồm
+`min_version_by_device`. Không được âm thầm đổi tổ chức service đã cài: phát
+hành component mới với predecessor trong `replaces`, rồi promote kích hoạt nó.
+Các component độc lập có thể cùng tồn tại. Lệnh thủ công
+`sudo software-update lamp-os --activate` vẫn dùng được để kiểm thử, nhưng
+không phải bước bắt buộc khi chuyển toàn bộ thiết bị.
+
+### Hợp đồng adapter của gói
+
+ZIP chứa `VERSION` khớp version metadata, executable `bin/service` và các
+worker/tài nguyên đi kèm. Updater tạo systemd unit; gói không cung cấp systemd
+unit tùy ý. Entrypoint hỗ trợ các đối số cố định:
+
+- `bin/service serve`: quản lý component và các process con của nó.
+- `bin/service health`: hỏi component đang chạy và trả JSON chứa `ready: true`,
+  `version` khớp và `pid` của supervisor đang chạy. Updater đối chiếu PID với
+  MainPID của systemd trong thời hạn giới hạn.
+
+Adapter health không được bật runtime thứ hai hoặc di chuyển hardware. Readiness
+chỉ chứng minh các kiểm tra khởi động mà gói khai báo, không chứng minh hội thoại
+đúng, cơ khí an toàn hay tương thích với mọi client bên ngoài. Bên đóng gói V2
+phải triển khai và kiểm chứng adapter này; OTA mới không tự làm mọi build V2
+hiện có trở thành gói cài được.
+
+### Giới hạn chuyển đổi, dữ liệu và rollback
+
+Tải và kiểm tra gói trước khi dừng service hiện tại. Updater ghi trạng thái sở
+hữu và phục hồi, dừng các chủ sở hữu cũ được khai báo và xác nhận đã dừng trước
+khi bật service thay thế. Khi lỗi hoặc phục hồi giao dịch bị gián đoạn, nó khôi
+phục cấu hình trước đó. Trạng thái sở hữu bền vững cũng ngăn OTA cũ hoặc reboot
+bật lại các service đã bị thay thế. Rollback không được bật service tổ tiên
+khi service thay thế nó vẫn đang hoạt động.
+
+Mỗi component có vùng dữ liệu ghi riêng. Kích hoạt lần đầu không tự nhập
+credentials, calibration, memory hay config của V1. Bên đóng gói phải định nghĩa
+migration đó riêng trước khi deploy. Cập nhật giữ snapshot dữ liệu riêng để
+rollback; rollback có thể mất các thay đổi ghi sau snapshot. Gói không được sửa
+dữ liệu V1 dùng chung rồi coi rollback hoàn tất chỉ vì binary cũ khởi động được.
+
+Bootstrap vẫn độc lập và nâng cấp được. Khai báo tương thích ngăn thay bootstrap
+hoặc updater bằng bản cũ không hiểu quyền sở hữu service và phục hồi. Kiểm tra
+tương thích không thay thế xác thực artifact. Refresh updater và kích hoạt service
+dùng chung khóa cài đặt; sau khi tải xong, kiểm tra tương thích lại dưới khóa đó.
+Trước rollout vẫn cần kiểm chứng
+kích hoạt trên device, reboot/mất điện và hành vi voice/hardware thực tế.
+
+### Phát hành component service
+
+Build và kiểm chứng gói riêng, sau đó phát hành bằng thông tin ký hiện có
+(`OTA_SIGNING_PRIVATE_KEY`, `OTA_SIGNING_KEY_ID`):
+
+```bash
+make upload-service COMPONENT=lamp-os V=0.1.0 PACKAGE=/path/lamp-os.zip REPLACES='hal os-server'
+make promote-service COMPONENT=lamp-os FOR=lamp V=0.1.0 ACTIVATE=1
+```
+
+Publisher bắt buộc metadata đã ký, kiểm tra gói, giữ nguyên ngưỡng promote và các
+component khác, đồng thời từ chối đổi tổ chức service dưới key cũ. URL gói chứa
+hash nội dung. Không được dùng lại version với nội dung khác khi version đó đang
+là bản hiện tại trên feed. Chạy các lần publish tuần tự như các script release
+hiện có; cập nhật metadata chưa phải giao dịch hỗ trợ nhiều người ghi đồng thời.
+Promote với `ACTIVATE=1` cho phép tự cài lần đầu trên loại device được chọn;
+các lần cập nhật tiếp theo vẫn tuân theo ngưỡng promote.
+Nếu kích hoạt tự động lỗi sau khi bắt đầu chuyển, recovery khôi phục service cũ
+và ghi nhận version bị từ chối để polling không thử lại liên tục. Nếu không ghi
+được thông tin từ chối, journal recovery vẫn được giữ lại. `ACTIVATE=0` giữ
+nguyên các ngưỡng version hiện có.
+
+### Build supervisor V2 từ main
+
+Từ checkout có công cụ release, chạy:
+
+```bash
+make upload-lamp-os
+```
+
+Lệnh fetch `refs/heads/lamp-voice` từ `origin` của checkout vào repository tạm
+riêng, cố định commit vừa lấy rồi chỉ giải nén `lampOS/`. Không đổi branch hiện
+tại và không lấy source chưa commit. Dùng Rust toolchain và lockfile của workspace
+đó để chạy
+`cargo zigbuild --locked --release --target aarch64-unknown-linux-gnu -p lamp-keeper`.
+Máy build cần Cargo/rustup, cargo-zigbuild, Zig, target
+`aarch64-unknown-linux-gnu` của toolchain được pin và `gsutil` đã đăng nhập.
+
+Binary quản lý được upload với tên `lamp-os`, kèm `build.json`, `VERSION` và `SHA256SUMS`,
+vào `gs://${GCS_BUCKET}/${BUCKET_PREFIX}/services/lamp-os/builds/<version>/<commit>/<sha256>/`.
+Mặc định vẫn là bucket `s3-autonomous-upgrade-3`, prefix `os`; có thể override qua
+biến môi trường như các lệnh release khác. Lệnh kiểm tra ELF ARM64 trước upload,
+sau đó tải lại binary đã lưu để đối chiếu SHA-256 trước khi báo thành công.
+Đây là kiểm tra build và nguồn gốc, chưa phải kiểm chứng trên hardware.
+
+Artifact bước đầu này là supervisor `lamp-keeper`, sau này đặt thành `bin/service`
+trong gói service `lamp-os`. **Chưa phải ZIP OTA V2 hoàn chỉnh**: phải đóng gói và
+kiểm chứng riêng các binary con, model, config/calibration của device và các unit
+đã render. Lệnh không sửa OTA metadata, ngưỡng version hay chỉ định kích hoạt.
+Chỉ dùng `upload-service` khi gói đầy đủ đã sẵn sàng; upload này không thay đổi V1
+hoặc các loại device khác.
+
+`system/VERSION_LAMP_OS` theo dõi version release riêng, độc lập HAL và bootstrap.
+File khởi tạo `0.0.0`; sau khi build binary hợp lệ, `upload-lamp-os` tự tăng patch
+(lần upload đầu là `0.0.1`). Version được ghi vào `build.json`, file `VERSION`
+upload kèm và đường dẫn GCS. Keeper đọc file `VERSION` của release để trả health
+cho OTA; lệnh không sửa version crate Rust. Giống các lệnh release hiện có, nếu
+upload lỗi sau bước tăng version thì file vẫn giữ số mới. Chạy release tuần tự,
+giữ lại version file đã cập nhật trong lịch sử release; không tự tăng bằng tay.
+
+Nếu PATH của shell chưa có Cargo, lệnh còn kiểm tra bản đã cài trong
+`${CARGO_HOME:-$HOME/.cargo}/bin`. Lệnh không tự cài Rust.

@@ -54,7 +54,6 @@ class HarnessClientTests(unittest.TestCase):
             self.assertFalse(session.trust_env)
 
     def test_focus_step_accepts_lagging_focus_snapshot(self):
-        # 200 means the app already switched; a not-yet-refreshed focus is not a failure.
         with patch.object(client.requests, "Session") as factory:
             session = factory.return_value.__enter__.return_value
             session.post.return_value.status_code = 200
@@ -74,6 +73,24 @@ class HarnessClientTests(unittest.TestCase):
 
 
 class HarnessActionTests(unittest.TestCase):
+    def setUp(self):
+        sleeping = patch.object(action.state, "_sleeping", False)
+        sleeping.start()
+        self.addCleanup(sleeping.stop)
+
+    def test_sleeping_swipe_cannot_toggle_harness_or_wake(self):
+        with patch.object(action.state, "_sleeping", True), \
+                patch.object(action.state, "_hw_mic_switch_muted", False), \
+                patch.object(action, "request_voice_toggle") as request, \
+                patch.object(action, "_show_feedback") as feedback, \
+                patch("hal.drivers.button_actions._speak_gesture_ack") as speak, \
+                patch("hal.drivers.button_actions._wake_if_sleepy") as wake:
+            action.toggle_harness_voice()
+            request.assert_not_called()
+            feedback.assert_not_called()
+            speak.assert_not_called()
+            wake.assert_not_called()
+
     def test_feedback_uses_device_overlay_and_restores_after_duration(self):
         from hal.board.presets_overlay import _TABLES, apply_device_presets
         from hal.presets import BUTTON_LED_PRESETS
@@ -108,10 +125,11 @@ class HarnessActionTests(unittest.TestCase):
 
     def test_all_languages_and_config_lookup(self):
         expected_off = {"en": "Harness is off. You’re back with the assistant on your device.", "vi": "Đã tắt Harness, trở về trợ lý trên thiết bị.",
-                        "zh-CN": "Harness 已关闭，已切回设备上的助手。", "zh-TW": "Harness 已關閉，已切回裝置上的助理。"}
-        # Use the project language constants (currently ISO language IDs).
-        from hal.presets import LANG_EN, LANG_VI, LANG_ZH_CN, LANG_ZH_TW
-        for lang, expected in zip((LANG_EN, LANG_VI, LANG_ZH_CN, LANG_ZH_TW), expected_off.values()):
+                        "zh-CN": "Harness 已关闭，已切回设备上的助手。", "zh-TW": "Harness 已關閉，已切回裝置上的助理。",
+                        "ja": "Harness をオフにしました。デバイスのアシスタントに戻りました。"}
+        from hal.presets import SUPPORTED_LANGS
+        self.assertEqual(set(expected_off), set(SUPPORTED_LANGS))
+        for lang, expected in expected_off.items():
             self.assertEqual(localized_phrase(PHRASE_HARNESS_OFF, lang), expected)
             self.assertIn("Test agent", localized_phrase(PHRASE_HARNESS_ON, lang).format(agent="Test agent"))
             with patch("hal.config._os_cfg_get", return_value=lang):

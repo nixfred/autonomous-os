@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 
 	"go.autonomous.ai/os/system/domain"
@@ -26,6 +27,17 @@ type manifest struct {
 	Entry       string `json:"entry"`
 }
 
+// Preserve safe existing names while preventing path traversal and systemd
+// glob/unit argument injection. A naming convention is not a security boundary.
+var pluginNamePattern = regexp.MustCompile(`^[A-Za-z0-9_.-]+$`)
+
+func validatePluginName(name string) error {
+	if name == "." || name == ".." || !pluginNamePattern.MatchString(name) {
+		return fmt.Errorf("invalid plugin name: expected a safe directory and service name")
+	}
+	return nil
+}
+
 type Service struct{}
 
 func ProvideService() *Service {
@@ -39,7 +51,11 @@ func (s *Service) Install(url string) (*domain.Plugin, error) {
 		return nil, fmt.Errorf("plugin url is required")
 	}
 
-	// Clone to a temp dir first, then read plugin.json to get the name.
+	// git would parse a leading hyphen as an option (argument injection).
+	if strings.HasPrefix(url, "-") {
+		return nil, fmt.Errorf("plugin url must not start with a hyphen")
+	}
+
 	tmpDir, err := os.MkdirTemp("", "os-plugin-clone-*")
 	if err != nil {
 		return nil, fmt.Errorf("create temp dir: %w", err)
@@ -47,23 +63,21 @@ func (s *Service) Install(url string) (*domain.Plugin, error) {
 	defer os.RemoveAll(tmpDir)
 
 	slog.Info("[plugins] cloning", "component", "plugin", "url", url)
-	if out, err := exec.Command("git", "clone", "--depth=1", url, tmpDir).CombinedOutput(); err != nil {
+	if out, err := exec.Command("git", "clone", "--depth=1", "--", url, tmpDir).CombinedOutput(); err != nil {
 		return nil, fmt.Errorf("git clone: %s: %w", strings.TrimSpace(string(out)), err)
 	}
 
-	// Parse plugin.json.
 	m, err := readManifest(tmpDir)
 	if err != nil {
 		return nil, fmt.Errorf("read plugin.json: %w", err)
 	}
-	if m.Name == "" {
-		return nil, fmt.Errorf("plugin.json: name is required")
+	if err := validatePluginName(m.Name); err != nil {
+		return nil, fmt.Errorf("plugin.json: %w", err)
 	}
 	if m.Entry == "" {
 		m.Entry = "main.py"
 	}
 
-	// Ensure plugins dir exists.
 	if err := os.MkdirAll(pluginsDir, 0o755); err != nil {
 		return nil, fmt.Errorf("create plugins dir: %w", err)
 	}
@@ -73,19 +87,16 @@ func (s *Service) Install(url string) (*domain.Plugin, error) {
 		return nil, fmt.Errorf("plugin %q already installed", m.Name)
 	}
 
-	// Move clone to final location.
 	if out, err := exec.Command("mv", tmpDir, dest).CombinedOutput(); err != nil {
 		return nil, fmt.Errorf("move plugin: %s: %w", strings.TrimSpace(string(out)), err)
 	}
 
-	// Create Python venv.
 	slog.Info("[plugins] creating venv", "component", "plugin", "name", m.Name)
 	if out, err := exec.Command("python3", "-m", "venv", filepath.Join(dest, ".venv")).CombinedOutput(); err != nil {
 		os.RemoveAll(dest)
 		return nil, fmt.Errorf("create venv: %s: %w", strings.TrimSpace(string(out)), err)
 	}
 
-	// Install requirements if present.
 	reqFile := filepath.Join(dest, "requirements.txt")
 	if _, err := os.Stat(reqFile); err == nil {
 		slog.Info("[plugins] installing requirements", "component", "plugin", "name", m.Name)
@@ -96,18 +107,15 @@ func (s *Service) Install(url string) (*domain.Plugin, error) {
 		}
 	}
 
-	// Generate systemd unit.
 	if err := writeSystemdUnit(m.Name, dest, m.Entry); err != nil {
 		os.RemoveAll(dest)
 		return nil, fmt.Errorf("write systemd unit: %w", err)
 	}
 
-	// Reload systemd.
 	if out, err := exec.Command("systemctl", "daemon-reload").CombinedOutput(); err != nil {
 		slog.Warn("[plugins] daemon-reload failed", "component", "plugin", "err", strings.TrimSpace(string(out)))
 	}
 
-	// Write source URL for later reference.
 	os.WriteFile(filepath.Join(dest, ".source_url"), []byte(url), 0o644)
 
 	slog.Info("[plugins] installed", "component", "plugin", "name", m.Name, "version", m.Version)
@@ -188,7 +196,7 @@ func (s *Service) Stop(name string) error {
 	return nil
 }
 
-// Uninstall stops, removes the systemd unit, and deletes the plugin directory.
+// Uninstall stops the plugin, removes its systemd unit, and deletes its directory.
 func (s *Service) Uninstall(name string) error {
 	if err := validatePluginExists(name); err != nil {
 		return err
@@ -197,18 +205,14 @@ func (s *Service) Uninstall(name string) error {
 	unit := unitPrefix + name + ".service"
 	unitPath := filepath.Join(systemdDir, unit)
 
-	// Stop if running.
 	exec.Command("systemctl", "stop", unit).Run()
 
-	// Remove systemd unit.
 	if err := os.Remove(unitPath); err != nil && !os.IsNotExist(err) {
 		slog.Warn("[plugins] remove unit file failed", "component", "plugin", "name", name, "err", err)
 	}
 
-	// Reload systemd.
 	exec.Command("systemctl", "daemon-reload").Run()
 
-	// Remove plugin directory.
 	dir := filepath.Join(pluginsDir, name)
 	if err := os.RemoveAll(dir); err != nil {
 		return fmt.Errorf("remove plugin dir: %w", err)
@@ -251,9 +255,8 @@ func unitStatus(name string) string {
 
 // validatePluginExists checks that a plugin directory exists.
 func validatePluginExists(name string) error {
-	name = strings.TrimSpace(name)
-	if name == "" {
-		return fmt.Errorf("plugin name is required")
+	if err := validatePluginName(name); err != nil {
+		return err
 	}
 	dir := filepath.Join(pluginsDir, name)
 	if _, err := os.Stat(dir); os.IsNotExist(err) {
@@ -264,6 +267,9 @@ func validatePluginExists(name string) error {
 
 // writeSystemdUnit generates and writes a systemd service unit file.
 func writeSystemdUnit(name, dir, entry string) error {
+	if err := validatePluginName(name); err != nil {
+		return err
+	}
 	unit := fmt.Sprintf(`[Unit]
 Description=Autonomous Plugin: %s
 After=network.target

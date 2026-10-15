@@ -1,8 +1,4 @@
-"""Optional MPR121 capacitive input using shared GPIO button gestures.
-
-I2C transport and register setup adapted from the user-supplied
-mpr121_opi_test.py. Only the device-declared bus/address is accessed.
-"""
+"""Optional MPR121 capacitive input using shared GPIO button gestures."""
 
 import ctypes
 import errno
@@ -13,7 +9,7 @@ import threading
 import time
 from dataclasses import dataclass
 
-from hal.board.mpr121 import MPR121Config
+from hal.board.mpr121 import ESI_CODES, FFI_CODES, SFI_CODES, MPR121Config
 from hal.drivers.button_gestures import (
     DOUBLE_CLICK_WINDOW, LONG_PRESS_DURATION, SLEEP_HOLD_DURATION,
 )
@@ -82,9 +78,10 @@ class _GestureEvent:
 class _GestureRecognizer:
     """Poll-clock recognition independent of action execution and electrode count."""
 
-    def __init__(self, debounce_ms, *, hold_thresholds=None, multi_click=True, hold_on_threshold=False):
+    def __init__(self, debounce_ms, *, hold_thresholds=None, multi_click=True, hold_on_threshold=False, qualified_hold=False):
         # Touch pads never factory-reset: that tier stays on the mechanical button.
         self._hold_thresholds = hold_thresholds or (SLEEP_HOLD_DURATION, LONG_PRESS_DURATION)
+        self._qualified_hold = qualified_hold
         self._multi_click = multi_click
         self._hold_on_threshold = hold_on_threshold
         self._delay = debounce_ms / 1000
@@ -104,7 +101,7 @@ class _GestureRecognizer:
         self._deadline = None
         self._armed = False
 
-    def update(self, touched, now):
+    def update(self, touched, now, *, tap_allowed=True):
         events = []
         if self._stable is None:
             self._stable = self._candidate = touched
@@ -144,7 +141,13 @@ class _GestureRecognizer:
                         self._click_count = 0
                         self._deadline = None
                         events.append(_GestureEvent("invalidate", self._gesture_id))
-                        events.append(_GestureEvent("hold", self._gesture_id, held_s=held))
+                        if not self._qualified_hold or tap_allowed:
+                            events.append(_GestureEvent("hold", self._gesture_id, held_s=held))
+                    elif not tap_allowed:
+                        # Reject this contact before it can contribute to any tap burst.
+                        self._click_count = 0
+                        self._deadline = None
+                        logger.info("MPR121 event=tap_discarded gesture_id=%d reason=insufficient_electrodes", self._gesture_id)
                     else:
                         if not self._multi_click:
                             self._click_count = 0
@@ -159,7 +162,7 @@ class _GestureRecognizer:
         if self._press_start is not None:
             held = (now if touched else self._since) - self._press_start
             tier = sum(held >= threshold for threshold in self._hold_thresholds)
-            if tier > self._hold_tier:
+            if tier > self._hold_tier and (not self._qualified_hold or tap_allowed):
                 self._hold_tier = tier
                 events.append(_GestureEvent("hold_tier", self._gesture_id, tier, held))
                 if self._hold_on_threshold:
@@ -176,22 +179,21 @@ class _GestureRecognizer:
         return events
 
 
-# The release grace joins a finger handoff without turning it into two taps.
 SWIPE_RELEASE_S = 0.120
 SWIPE_MAX_GAP_S = 0.150
-# Travel time is measured from cycle start (after the contact debounce) to the
-# last new pad, so a fast full-strip swipe (~90 ms raw on Lamp) measures ~50 ms.
-# Displacement >= 3 pads already proves motion; this only rejects a whole hand
-# landing within a poll or two.
+# Travel time is measured from cycle start (after the contact debounce) to the last new
+# pad, so a fast full-strip swipe (~90 ms raw on Lamp) measures ~50 ms.
 SWIPE_MIN_TRAVEL_S = 0.030
 
 
 class _SpatialGestureRecognizer:
     """Debounce electrode footprints before resolving travel versus a button."""
 
-    def __init__(self, config, button_factory=None):
+    def __init__(self, config, button_factory=None, *, fast_stationary_tap=False):
+        self._fast_stationary_tap = fast_stationary_tap
         self._button_factory = button_factory or _GestureRecognizer
-        self._axis = config.swipe_axis
+        self._axis = config.swipe_axis or ()
+        self._tap_min_electrodes = config.tap_min_electrodes
         self._selected = config.electrodes
         # A 30 ms per-pad filter erases measured 10-20 ms travel steps.
         # Require consecutive samples for footprints, while retaining the
@@ -212,9 +214,12 @@ class _SpatialGestureRecognizer:
 
     def _clear_cycle(self):
         self._cycle = False
+        self._tap_since = None
+        self._tap_qualified = self._tap_min_electrodes == 1
         self._seen = set()
         self._outside = set()
         self._previous_positions = set()
+        self._origin_positions = set()
         self._origin = None
         self._last_center = None
         self._last_move = None
@@ -230,6 +235,15 @@ class _SpatialGestureRecognizer:
         self._clear_cycle()
         self._armed = False
 
+    def _release_delay(self, active):
+        # A qualified stationary palm tap can commit after contact debounce.
+        # Unqualified contacts and moving swipes keep the full handoff window.
+        if (self._fast_stationary_tap and self._tap_min_electrodes >= 3
+                and self._tap_qualified and not self._moving and not self._invalid
+                and not active):
+            return min(SWIPE_RELEASE_S, max(0.030, self._contact_delay))
+        return SWIPE_RELEASE_S
+
     def _finish(self, now, active=False):
         events = []
         if self._moving:
@@ -240,11 +254,10 @@ class _SpatialGestureRecognizer:
                         self._gesture_id, self._direction, self._peak, valid)
             if valid:
                 events.append(_GestureEvent("swipe", self._gesture_id, direction=self._direction))
-            # Restart the button detector only after the spatial cycle ends.
             self._button = self._button_factory(0)
             self._button.update(False, now)
         else:
-            events.extend(self._button.update(False, self._release_at))
+            events.extend(self._button.update(False, self._release_at, tap_allowed=self._tap_qualified))
             if not active:
                 events.extend(self._button.update(False, now))
         self._clear_cycle()
@@ -288,7 +301,7 @@ class _SpatialGestureRecognizer:
         # Resolve an old contact before looking at the next one. Raw contact
         # blocks release only inside the handoff grace, never indefinitely.
         if self._cycle and self._release_at is not None:
-            if now - self._release_at >= SWIPE_RELEASE_S:
+            if now - self._release_at >= self._release_delay(active):
                 events.extend(self._finish(now, bool(active)))
             elif stable:
                 positions = {self._axis.index(i) for i in stable if i in self._axis}
@@ -298,6 +311,21 @@ class _SpatialGestureRecognizer:
                     events.extend(self._finish(now, bool(active)))
                 else:
                     self._release_at = None
+        # Count pads still physically active, not the delta in the diagnostic
+        # touched list or a union of pads visited while swiping. A short third-pad
+        # spike must not qualify the contact; require the configured debounce.
+        if len(stable & active) >= self._tap_min_electrodes:
+            if self._tap_since is None:
+                self._tap_since = now
+            if now - self._tap_since >= self._contact_delay:
+                self._tap_qualified = True
+        else:
+            # The falling edge closes the sampled interval. With irregular
+            # polling it may be the first sample past the qualification time;
+            # count that elapsed interval before dropping the candidate.
+            if self._tap_since is not None and now - self._tap_since >= self._contact_delay:
+                self._tap_qualified = True
+            self._tap_since = None
         if stable:
             positions = {self._axis.index(i) for i in stable if i in self._axis}
             if not self._cycle:
@@ -309,6 +337,7 @@ class _SpatialGestureRecognizer:
                 self._outside = stable - set(self._axis)
                 self._seen = positions.copy()
                 self._previous_positions = positions.copy()
+                self._origin_positions = positions.copy()
                 self._origin = sum(positions) / len(positions) if positions else None
                 self._last_center = self._origin
             elif ((positions and self._origin is None)
@@ -326,11 +355,6 @@ class _SpatialGestureRecognizer:
                 new = positions - self._seen
                 displacement = center - self._origin
                 if new:
-                    # A far-off arrival is a second finger, not travel -- unless
-                    # the contact is already moving and the jump continues in
-                    # its direction: a fast swipe (~1 pad per poll) skips pads
-                    # whose dwell is shorter than the footprint filter, so the
-                    # centroid legitimately leaps 3-4 pads (measured on Lamp).
                     jump = center - self._last_center
                     if abs(jump) > 3 and not (self._moving and jump * self._direction > 0):
                         self._invalid = True
@@ -338,7 +362,12 @@ class _SpatialGestureRecognizer:
                         self._invalid = True
                     self._last_move = now
                     self._seen.update(positions)
-                if new and abs(displacement) >= 1 and not self._moving:
+                # A stationary palm can recruit more pads as its signal crosses
+                # their thresholds. Centroid movement alone is not travel:
+                # require a new arrival after part of the original footprint
+                # has departed. Shrinking on release has no new arrival.
+                departed = self._origin_positions - positions
+                if new and departed and abs(displacement) >= 1 and not self._moving:
                     self._moving = True
                     self._direction = 1 if displacement > 0 else -1
                     self._button.cancel()
@@ -348,7 +377,6 @@ class _SpatialGestureRecognizer:
                     progress = displacement * self._direction
                     if arrivals and progress < self._peak - 1:
                         self._invalid = True
-                    # Releases alone shift the centroid but prove no travel.
                     if new:
                         self._peak = max(self._peak, progress)
                 self._last_center = center
@@ -356,11 +384,9 @@ class _SpatialGestureRecognizer:
                 edge_time = self._contact_since if self._button._press_start is None else now
                 if not active:
                     edge_time = max(since for value, since in self._raw.values() if not value)
-                button_events = self._button.update(True, edge_time)
+                button_events = self._button.update(True, edge_time, tap_allowed=self._tap_qualified)
                 events.extend(button_events)
                 if any(event.kind == "hold" for event in button_events):
-                    # Threshold-fired actions consume this entire contact,
-                    # including later travel, until a stable physical release.
                     self.cancel()
         elif self._cycle:
             if self._release_at is None:
@@ -372,7 +398,7 @@ class _SpatialGestureRecognizer:
 
 
 def single_click_action(*, source, announce):
-    from hal.drivers.button_actions import single_click_action as action
+    from hal.drivers.device_tap_actions import physical_short_tap as action
     action(source=source, announce=announce)
 
 
@@ -383,15 +409,14 @@ def announce_listening_cue(*, source):
 
 def triple_click_action(*, source):
     # Disabled for MPR121: accidental triple taps must not reboot the device.
-    # Keep the shared action wiring here so it can be restored deliberately.
-    # from hal.drivers.button_actions import triple_click_action as action
-    # action(source=source)
     return
 
 
 def hold_release_action(held_s, *, source):
-    from hal.drivers.button_actions import hold_release_action as action
-    action(held_s, source=source, factory_reset=False)
+    # Disabled for MPR121: holds must not sleep or shut down the device.
+    # from hal.drivers.button_actions import hold_release_action as action
+    # action(held_s, source=source, factory_reset=False)
+    return
 
 
 def swipe_action(*, source):
@@ -410,32 +435,51 @@ class MPR121Handler:
         self._action_thread = None
         self._harness_gestures = None
         self._mode_key = None
+        from hal import config as hal_config
+        self._voice_mode_key = getattr(hal_config, "VOICE_INPUT_MODE", "automatic")
         self._detector = self._new_detector()
         self._last_raw_mask = None
         self._generation = 0
+        self._single_generation = 0
         self._action_busy = False
         self._gesture_lock = threading.Lock()
         self._hold_led = None
+        self._mode_toggle = None
 
     def _new_detector(self):
         factory = _GestureRecognizer
         if self._harness_gestures and self._harness_gestures.snapshot.get("enabled"):
             from hal.drivers.harness.gestures import harness_button_recognizer
             factory = harness_button_recognizer
-        if self._config.swipe_axis is not None:
-            return _SpatialGestureRecognizer(self._config, factory)
+        elif "hold" in self._config.gesture_actions:
+            factory = lambda debounce_ms: _GestureRecognizer(
+                debounce_ms, hold_thresholds=(self._config.hold_action_s,),
+                multi_click=not self._device_tap_mode(), qualified_hold=True,
+            )
+        elif self._device_tap_mode():
+            factory = lambda debounce_ms: _GestureRecognizer(debounce_ms, multi_click=False)
+        if self._config.swipe_axis is not None or self._config.tap_min_electrodes > 1:
+            return _SpatialGestureRecognizer(
+                self._config, factory, fast_stationary_tap=self._device_tap_mode(),
+            )
         return factory(self._config.debounce_ms)
+
+    def _device_tap_mode(self):
+        from hal.drivers.device_tap_actions import device_tap_mode
+        return device_tap_mode(self._harness_gestures.snapshot if self._harness_gestures else None)
 
     def _sample(self):
         touched = self._read_touched()
-        return self._last_raw_mask if self._config.swipe_axis is not None else touched
+        return (self._last_raw_mask
+                if self._config.swipe_axis is not None or self._config.tap_min_electrodes > 1
+                else touched)
 
     def _feedback(self):
         with self._gesture_lock:
             if self._hold_led is None:
-                from hal.drivers.button_actions import HoldLEDFeedback
+                from hal.drivers.voice_mode_gesture import ModeHoldFeedback
 
-                self._hold_led = HoldLEDFeedback()
+                self._hold_led = ModeHoldFeedback()
             if self._stop.is_set():
                 self._hold_led.stop()
             return self._hold_led
@@ -452,24 +496,23 @@ class MPR121Handler:
         write(0x5E, 0x00)
         if bus.read_regs(config.address, 0x5D, 1) != b"\x24":
             raise RuntimeError("MPR121 CONFIG2 reset value is not 0x24")
+        ffi = FFI_CODES[config.ffi]  # autoconfig FFI must match CONFIG1
         for electrode in range(12):
             write(0x41 + 2 * electrode, config.touch_threshold)
             write(0x42 + 2 * electrode, config.release_threshold)
-        # Slow falling baseline tracking using NXP AN3944 quick-start values
-        # so the baseline does not quickly follow an approaching finger.
         for register, value in (
             (0x2B, 1), (0x2C, 1), (0x2D, 14), (0x2E, 0),
             (0x2F, 1), (0x30, 1), (0x31, 0xFF), (0x32, 0x02),
             (0x33, 0), (0x34, 0), (0x35, 0),
-            # CONFIG2: CDT 0.5 us, SFI 10 samples, ESI 1 ms. The 10-sample
-            # second-level filter halves idle noise versus 4 samples and
-            # updates every ~10 ms, matching the poll period. Chip debounce
-            # stays 0: contact/footprint debounce is done in software.
-            (0x5B, 0), (0x5C, 0x10), (0x5D, 0x30),
+            # CONFIG1: FFI from config, 16 uA. CONFIG2: CDT 0.5 us, SFI/ESI from config.
+            # Debounce: DR (release) and DT (touch) both from chip_debounce; contact and
+            # footprint debounce in software still apply on top.
+            (0x5B, config.chip_debounce << 4 | config.chip_debounce), (0x5C, ffi << 6 | 0x10),
+            (0x5D, 0x20 | SFI_CODES[config.sfi] << 3 | ESI_CODES[config.esi_ms]),
         ):
             write(register, value)
         if config.autoconfig:
-            for register, value in ((0x7D, 200), (0x7F, 180), (0x7E, 130), (0x7B, 0x0B)):
+            for register, value in ((0x7D, 200), (0x7F, 180), (0x7E, 130), (0x7B, ffi << 6 | 0x0B)):
                 write(register, value)
         write(0x5E, 0x8F)
 
@@ -485,7 +528,7 @@ class MPR121Handler:
             previous = self._last_raw_mask or 0
             touched = [i for i in range(12) if raw_mask & ~previous & (1 << i)]
             released = [i for i in range(12) if previous & ~raw_mask & (1 << i)]
-            logger.info(
+            logger.debug(
                 "MPR121 event=electrodes initial=%s raw_mask=0x%03x selected_mask=0x%03x selected_active=0x%03x touched=%s released=%s",
                 self._last_raw_mask is None, raw_mask, self._mask,
                 raw_mask & self._mask, touched, released,
@@ -494,13 +537,15 @@ class MPR121Handler:
         return bool(raw_mask & self._mask)
 
     def start(self):
-        if any(thread and thread.is_alive() for thread in (self._poll_thread, self._action_thread)):
+        toggle_thread = self._mode_toggle._thread if self._mode_toggle is not None else None
+        if any(thread and thread.is_alive() for thread in (self._poll_thread, self._action_thread, toggle_thread)):
             raise RuntimeError("MPR121 handler already running or stopping")
         logger.info(
-            "MPR121 event=start bus=%d address=0x%02x electrodes=%s touch_threshold=%d release_threshold=%d autoconfig=%s poll_ms=%d debounce_ms=%d settle_ms=100 pending_capacity=2",
+            "MPR121 event=start bus=%d address=0x%02x electrodes=%s touch_threshold=%d release_threshold=%d autoconfig=%s poll_ms=%d debounce_ms=%d ffi=%d sfi=%d esi_ms=%d tap_min_electrodes=%d settle_ms=100 pending_capacity=2",
             self._config.bus, self._config.address, self._config.electrodes,
             self._config.touch_threshold, self._config.release_threshold,
             self._config.autoconfig, self._config.poll_ms, self._config.debounce_ms,
+            self._config.ffi, self._config.sfi, self._config.esi_ms, self._config.tap_min_electrodes,
         )
         logger.info("MPR121 event=swipe_config axis=%s release_ms=120 max_gap_ms=150 min_travel_ms=30 footprint_debounce_ms=5", self._config.swipe_axis)
         self._last_raw_mask = None
@@ -513,8 +558,6 @@ class MPR121Handler:
         try:
             self._bus = I2CBus(self._config.bus)
             self._initialize()
-            # Allow conversions/autoconfiguration to settle before seeding the
-            # boot-held suppression from the first reported electrode state.
             time.sleep(0.1)
             from hal.drivers.harness.gestures import HarnessGestures
             self._harness_gestures = HarnessGestures()
@@ -529,7 +572,7 @@ class MPR121Handler:
             # permission, configuration and unexpected failures diagnosable.
             # Linux reports a non-acknowledging I2C slave as ENXIO or EREMOTEIO.
             if isinstance(exc, OSError) and exc.errno in {
-                errno.ENOENT, errno.ENODEV, errno.ENXIO, 121,  # Linux EREMOTEIO
+                errno.ENOENT, errno.ENODEV, errno.ENXIO, 121,
             }:
                 logger.warning(
                     "MPR121 event=unavailable bus=%d address=0x%02x errno=%d reason=%s; check I2C bus and wiring, then restart HAL",
@@ -555,17 +598,35 @@ class MPR121Handler:
             except OSError:
                 logger.exception("MPR121 bus close failed")
 
-    def _invalidate_pending(self, reason):
+    def _invalidate_pending(self, reason, *, preserve_singles=False):
         with self._gesture_lock:
             self._generation += 1
+            if not preserve_singles:
+                self._single_generation = self._generation
+            retained = []
             while True:
                 try:
-                    _, event, _ = self._pending.get_nowait()
+                    _, event, queued_at = self._pending.get_nowait()
                 except queue.Empty:
                     break
-                logger.info("MPR121 event=action_discarded gesture_id=%d action=%s reason=%s", event.gesture_id, event.kind, reason)
+                if preserve_singles and event.kind == "single":
+                    retained.append((self._generation, event, queued_at))
+                else:
+                    logger.info("MPR121 event=action_discarded gesture_id=%d action=%s reason=%s", event.gesture_id, event.kind, reason)
+            for pending in retained:
+                self._pending.put_nowait(pending)
 
     def _process_touch(self, touched, now):
+        from hal import config as hal_config
+        voice_mode = getattr(hal_config, "VOICE_INPUT_MODE", "automatic")
+        if voice_mode != self._voice_mode_key:
+            self._voice_mode_key = voice_mode
+            self._invalidate_pending("voice_input_mode_changed")
+            if self._hold_led is not None:
+                self._hold_led.release()
+            self._detector = self._new_detector()
+            self._detector.update(touched, now)
+            return
         if self._harness_gestures:
             key = self._harness_gestures.mode_key()
             if key != self._mode_key:
@@ -581,12 +642,15 @@ class MPR121Handler:
         for event in self._detector.update(touched, now):
             if self._stop.is_set():
                 return
-            logger.info("MPR121 event=gesture kind=%s gesture_id=%d count=%d held_s=%.3f direction=%d", event.kind, event.gesture_id, event.count, event.held_s, event.direction)
+            logger.debug("MPR121 event=gesture kind=%s gesture_id=%d count=%d held_s=%.3f direction=%d", event.kind, event.gesture_id, event.count, event.held_s, event.direction)
             if event.kind == "invalidate":
-                self._invalidate_pending("new_touch_or_hold")
+                self._invalidate_pending("new_touch_or_hold", preserve_singles=self._device_tap_mode())
             elif event.kind == "hold_tier":
-                if not (self._harness_gestures and self._harness_gestures.snapshot.get("enabled")):
-                    self._feedback().set_tier(event.count)
+                if "hold" in self._config.gesture_actions:
+                    from hal.drivers.voice_mode_gesture import action_allowed
+                    snapshot = self._harness_gestures.snapshot if self._harness_gestures else None
+                    if action_allowed(snapshot):
+                        self._feedback().set_tier(1)
             elif event.kind == "release":
                 if self._hold_led is not None:
                     self._hold_led.release()
@@ -599,7 +663,7 @@ class MPR121Handler:
                         continue
                     try:
                         self._pending.put_nowait((self._generation, event, time.monotonic()))
-                        logger.info("MPR121 event=action_queued gesture_id=%d action=%s", event.gesture_id, event.kind)
+                        logger.debug("MPR121 event=action_queued gesture_id=%d action=%s", event.gesture_id, event.kind)
                     except queue.Full:
                         # Counts are resolved from every electrode edge above;
                         # dropping a semantic outcome never invents a triple.
@@ -622,7 +686,7 @@ class MPR121Handler:
             logger.info("MPR121 event=worker_stopped worker=poll")
 
     def _execute_swipe(self, direction):
-        """The declared axis runs left to right; route one resolved swipe."""
+        """The declared axis runs right to left; route one resolved swipe."""
         if self._hold_led is not None and self._hold_led.commit(0) is False:
             return
         if direction == 1:
@@ -640,6 +704,21 @@ class MPR121Handler:
             if self._harness_gestures.snapshot.get("enabled"):
                 self._harness_gestures.execute(event)
                 return
+        from hal import config as hal_config
+        if getattr(hal_config, "VOICE_INPUT_MODE", "automatic") != self._voice_mode_key:
+            return
+        # Lamp's declared E11..E0 axis travels physically right to left.
+        action_key = ({1: "swipe_left", -1: "swipe_right"}.get(event.direction)
+                      if event.kind == "swipe" else event.kind)
+        if action_key in self._config.gesture_actions:
+            from hal.drivers.voice_mode_gesture import ModeToggleWorker
+            if self._mode_toggle is None:
+                self._mode_toggle = ModeToggleWorker(
+                    lambda: self._harness_gestures.snapshot if self._harness_gestures else None,
+                    self._stop,
+                )
+            self._mode_toggle.submit()
+            return
         if event.kind == "single":
             single_click_action(source="MPR121", announce=False)
         elif event.kind == "cue":
@@ -649,9 +728,10 @@ class MPR121Handler:
         elif event.kind == "swipe":
             self._execute_swipe(event.direction)
         elif event.kind == "hold":
-            if self._feedback().commit(event.held_s, factory_reset=False) is False:
-                logger.info("MPR121 event=action_discarded gesture_id=%d action=hold reason=feedback_cancelled", event.gesture_id)
-                return
+            # Disabled together with the sleep/shutdown action below.
+            # if self._feedback().commit(event.held_s, factory_reset=False) is False:
+            #     logger.info("MPR121 event=action_discarded gesture_id=%d action=hold reason=feedback_cancelled", event.gesture_id)
+            #     return
             hold_release_action(event.held_s, source="MPR121")
 
     def _dispatch(self):
@@ -663,7 +743,10 @@ class MPR121Handler:
                 except queue.Empty:
                     continue
                 with self._gesture_lock:
-                    valid = not self._stop.is_set() and generation == self._generation
+                    current = generation == self._generation
+                    if event.kind == "single" and self._device_tap_mode():
+                        current = generation >= self._single_generation
+                    valid = not self._stop.is_set() and current
                     if event.kind in ("hold", "triple", "swipe") and time.monotonic() - queued_at > DOUBLE_CLICK_WINDOW:
                         valid = False
                     if valid:
@@ -673,8 +756,6 @@ class MPR121Handler:
                     continue
                 try:
                     logger.info("MPR121 event=action_begin gesture_id=%d action=%s count=%d held_s=%.3f", event.gesture_id, event.kind, event.count, event.held_s)
-                    # Once a shared action starts its own I/O/OS sequence, it
-                    # cannot be interrupted here. Only pending work is canceled.
                     self._execute(event)
                     logger.info("MPR121 event=action_complete gesture_id=%d action=%s", event.gesture_id, event.kind)
                 except Exception:

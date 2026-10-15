@@ -15,6 +15,9 @@ labels merged runs explicitly instead of presenting an empty silent result.
 
 ## 1. Overview
 
+Light mode uses warm gray page surfaces, off-white cards, darker secondary text and stronger semantic colors across monitor and configuration screens. Flow uses a separate canvas surface, higher-contrast inactive connections and node descriptions, and neutral text for diagnostic payloads. System history charts resolve colors from the active monitor theme and use 11px axis labels.
+
+
 The device's Web UI is a React SPA (Single Page Application) built with **React 19 + TypeScript + Vite + Tailwind CSS 4**, serving two purposes:
 
 1. **Setup flow** — WiFi, LLM provider, messaging channel onboarding (`/setup/*` pages)
@@ -25,6 +28,30 @@ Build output (`dist/`) is served by nginx at root `/` on the device.
 During initial setup, **Channels** is optional and defaults to **Not now**.
 Selecting Telegram, Slack, or Discord reveals its credential fields, but the
 operator may leave them blank or configure a channel later in Settings.
+
+Initial setup can also keep an existing online Wi-Fi connection without asking
+for its password again. Leave the selected SSID empty or select the current SSID;
+an empty selection resolves to the current SSID on submit. An online wired
+connection also allows an empty Wi-Fi selection. Selecting another SSID requires
+a password or a saved password belonging to that selected network. Step
+completion and submission use the same validation. The backend still checks the
+live SSID and Internet connectivity before skipping reconnection; the UI's
+earlier probe does not guarantee that the network will remain unchanged.
+
+### Japanese language selection
+
+Setup and Settings offer **Japanese (日本語)** with code `ja`. Setup recognizes
+Japanese browser locales and `?stt_language=ja`; Japanese regional aliases normalize to
+`ja`. Existing chat i18n strings, relative times, voice enrollment instructions
+and all three enrollment phrases have Japanese translations. Test Voice sends a
+Japanese sample. Static settings labels follow the existing English UI convention.
+
+The ElevenLabs language filter has a Japanese bucket containing Shizuka, Konoha,
+Rin, Asahi, Hinata and Hiroki; Shizuka is the Japanese default. OpenAI and Gemini
+continue to use their multilingual voice pools. Setup validates the initial
+voice against the language-specific catalog, so a Japanese browser selects
+Shizuka instead of retaining Rachel. A valid saved/URL choice is preserved;
+late catalog responses are ignored after a provider, language or voice change.
 
 ### 1.1 Browser Tab Title
 
@@ -65,7 +92,7 @@ the page removes it.
 system/web/
 ├── src/
 │   ├── pages/
-│   │   ├── Monitor.tsx        # Dashboard monitor (main file)
+│   │   ├── monitor/           # Dashboard monitor (index.tsx = shell + polling; one file per section)
 │   │   └── ...                # Setup pages
 │   ├── components/
 │   │   └── ui/                # shadcn/ui components
@@ -130,6 +157,99 @@ Defined at `.lm-root` in `index.css`:
 ```
 
 ### 3.4 Settings (`/setting`) — shared shell
+
+**LLM ownership (Settings → Runtime).** `llm_config_mode` is device-wide: missing/empty retains legacy behavior (including Codex/Claude Code subscription detection), `os` explicitly uses saved OS LLM settings, and `runtime` preserves native settings. AI Brain becomes read-only in runtime mode; its saved key/base URL remain available to voice/backend services. Each runtime needs its own account/configuration; credentials do not migrate when switching runtimes.
+
+The Runtime section presents two ordered steps: choose a runtime and use its Switch button, then configure AI for the active runtime. AI configuration is disabled while another runtime is selected or a switch is in progress. Both LLM choices are visible radio options. **Use OS AI Brain** uses the local **Save Changes** button. **Use my own account** shows **Connect account** for supported runtimes: selecting the radio does not save runtime mode or disconnect the current OS provider. Users open the provider's HTTPS sign-in link, enter its device code if shown, or paste the returned code/callback URL into Settings. Passwords are entered on the provider's website, not in Settings.
+
+Web account sign-in is labeled **Experimental** while end-to-end device validation remains incomplete. The UI also points users to Terminal as an alternative; the label does not change OS AI Brain defaults or automatically start a login. If the login endpoint returns HTTP 404, Settings asks users to update OS Server and stops showing the checking message. Non-JSON error responses retain their HTTP status rather than exposing a JSON parser error.
+
+| Runtime | Web account sign-in |
+|---|---|
+| Claude Code | Claude account |
+| Codex | ChatGPT account |
+| Hermes | Claude or ChatGPT account |
+| OpenClaw | Claude or ChatGPT account |
+
+The backend runs native login in an isolated temporary home, verifies the new credentials, then selects runtime mode, installs the account/provider configuration, and restarts the runtime. The saved mode stays unchanged during authentication. Sign-in expires after **15 minutes**; users can cancel before activation. An authentication failure leaves the previous live configuration untouched. Activation failures attempt to restore credentials/configuration and the previous mode; a failed restoration is reported explicitly. Native login depends on the installed CLI version, its provider plugins and authentication commands; OpenClaw's Claude flow also requires Claude Code. A listed provider is an integration option, not a guarantee that the installed version or subscription supports it.
+
+Hermes selects `claude-sonnet-4-6` for Claude or `gpt-5.6-sol` for ChatGPT; OpenClaw uses the model recommended by its native login command. Codex switches to its built-in OpenAI provider and removes an OS proxy model override, preserving unrelated settings.
+
+The admin HTTP API is `GET /api/device/runtime-login` (providers and current session), `POST /api/device/runtime-login` (`runtime`, `provider`), `POST /api/device/runtime-login/code` (`id`, `code`), and `DELETE /api/device/runtime-login/:id`. The browser polls active sessions every two seconds, resumes an active session after reload, and stops polling at a terminal state. A historical success describes that completed attempt; it does not revalidate account access on reload. Runtime/mode changes and Settings saves are locked during sign-in. Completion updates only the LLM mode baseline, preserving other unsaved form values. Unsaved or pending LLM changes still lock runtime switching.
+
+The supported runtimes also expose **Use existing runtime configuration** under an advanced disclosure, for an account/model already configured locally. This selects the existing runtime mode through the normal Save Changes flow without another login or an account-access claim. Other runtimes retain the manual Terminal flow: configure account and model first, confirm that configuration in Settings, then save runtime mode. Restoring AI Brain defaults explicitly selects `os` and forces apply even if saved values are unchanged. An apply error is shown after mode has been saved; resolve the cause and retry applying. Configuration success and runtime readiness do not prove subscription entitlement; verify an actual chat separately.
+
+
+**eBay connector** (`/setting#ebay`, Settings → Connectors → eBay). The owner
+registers their own app in the eBay Developer Program and adds an eBay redirect
+URL (RuName) whose *auth accepted URL* is any https page. The card asks for the
+environment (Production or Sandbox), marketplace (e.g. `EBAY_US`), the app's
+**App ID (Client ID)**, **Cert ID (Client Secret)** and **RuName**, and rejects
+an App ID whose keyset (`-PRD-` / `-SBX-`) does not match the environment.
+**Sign in with eBay** opens eBay's consent page
+(`auth.ebay.com` / `auth.sandbox.ebay.com` `/oauth2/authorize`, scopes
+`api_scope`, `sell.inventory`, `sell.account`, `sell.fulfillment`); after the
+seller agrees, eBay opens the accept page with `?code=…`, and the owner pastes
+that address (or just the code) into the card within the code's five minutes.
+**Connect** sends everything to `PUT /api/device/connectors/ebay`, which
+exchanges the code for a refresh token on `api.ebay.com` /
+`api.sandbox.ebay.com` (`grant_type=authorization_code`). Owners who already
+hold a refresh token can paste it instead (*I already have a refresh token*);
+the device checks it once with `grant_type=refresh_token`. Nothing is saved when
+eBay rejects the values. The link is stored as connector `ebay`: the refresh
+token in `api_key`, and `client_id`, `client_secret`, `marketplace_id`,
+`environment` and `ru_name` in `credentials`. `GET /api/device/connectors/:code`
+never returns `client_secret`; after a reload the App ID, RuName, marketplace and
+environment are filled in again, and reconnecting needs the secret and a new
+sign-in. Everything stays on the device. The `connectors` skill helper mints a
+short-lived eBay access token from these on each call and caches it in
+`ebay.token.json` (mode 0600, dropped on every save) next to the connector
+files; when the refresh token expires (about 18 months) or is revoked, the agent
+asks the owner to reconnect here.
+
+**Remote MCP Tools** (`/setting#mcp`). Finish onboarding the selected runtime,
+then sign in to the device's admin UI. Enter a unique **Name**, the remote MCP
+server's **URL**, and any required **Headers**, then click **Add Tool**. For
+example, an operator with a [Pushary](https://pushary.com) account and connected
+phone can enter:
+
+| Field | Value |
+|---|---|
+| Name | `pushary` |
+| URL | `https://pushary.com/api/mcp/mcp` |
+| Header name | `Authorization` |
+| Header value | `Bearer YOUR_OPERATOR_API_KEY` — replace the placeholder with your Pushary key |
+
+Pushary is a separate hosted service with its own account, trial/subscription,
+and delivery policy. The device's admin login is separate from this server key.
+The OS saves the entry in `mcp_tools` and syncs it as `tool_pushary` to the active
+runtime. OpenCode receives `mcp.tool_pushary` with `type: remote`; Hermes receives
+`mcp_servers.tool_pushary`. Both keep the URL and headers and enable the entry.
+
+**Fo (Wajo)** has its own card in MCP Tools, below the tool list.
+It needs a Wajo account with Fo Pro. **Connect Fo** opens the Wajo sign-in in a
+new tab (with a link as fallback if the browser blocks it). After **Allow**, the
+browser lands on `http://localhost:5000/oauth/fo/callback?code=…`, which does not
+load: Wajo only accepts https or loopback redirects. Paste that full address into
+**Address after sign-in** and click **Finish**. Fo then appears in the list as
+tool `fo`, whose URL is os-server's local proxy (`/api/fo-mcp`); the Wajo tokens
+stay in os-server (see `docs/os-server.md`). **Remove** on `fo` signs out.
+The card reads `GET /api/device/fo/status`: once connected it shows **Connected**
+and a **Reconnect** button; if Wajo rejects the refresh token it shows **Sign-in
+expired** with a warning. Reconnect runs the same sign-in and only replaces the
+tokens, so the runtime does not restart.
+
+An Add error can occur after the OS saved the entry, if the runtime config is
+missing or invalid. Reload the list before retrying: duplicate names are rejected.
+Fix the runtime setup and check the logs on the next startup sync. A listed entry
+does not prove server authentication, tool discovery, or a successful gateway
+restart. To verify delivery, ask the runtime to discover Pushary's tools and send
+one harmless notification; confirm receipt on the intended phone.
+
+Adding an MCP server does not install a native approval hook. In particular,
+OS-managed Hermes presync sets `approvals.mode: "off"`; a model calling `ask_user`
+is a cooperative question, not enforcement before every tool. Use **Remove** to
+remove the configured server, then check runtime logs if it remains available.
 
 **Speech speed** in Voice (`/setting#tts`) loads effective `tts_speed` and
 shows the selectable range (`0.5–2.0×` for every provider) in `0.05` steps. **Save Changes** persists speed through
@@ -211,16 +331,36 @@ The Settings collapsible group lives in the shared sidebar `NAV` (`system/web/sr
 | MCP Tools | `/setting#mcp` |
 | Plugins | `/setting#plugins` |
 | Timezone | `/setting#timezone` |
+| Resting light | `/setting#led` |
+| Privacy | `/setting#privacy` |
 
-Monitor leaves serialize as the plain id, e.g. `/monitor#overview`, `/monitor#pairing`, `/monitor#system`, `/monitor#flow`. Defaults: `/monitor` with no/invalid hash → `overview`; `/setting` with no/invalid hash → `general` (URL normalized to `/setting#general`). Deep-links (e.g. `/setting#wifi`) and browser back/forward are honored via a `useLocation`-driven effect. Non-debug users only see the leaves in `PUBLIC_SECTIONS` (which includes Chat, Overview, **Pairing**, Info, Flow, Camera, **Sensing**, Users, **Logs**, **CLI**, and the public Settings leaves General/Wi-Fi/My Voice/Face/MCP Tools/Plugins/Timezone); Bluetooth remains available by direct URL but is hidden from navigation. `?debug=true` reveals the rest (Analytics, Servo, API Docs, Agent gateway, and the deeper Settings leaves AI Brain/Runtime/Language/Voice/Realtime/Channels/MQTT). Pressing `update` swaps the button for `updating…` immediately — the button never says "OK", which would read as "done" for a request that has only STARTED the install (and, for a component that finishes in seconds, arrived before the row could even show progress). Failures show the server's own reason (`rate-limited, retry in 8s`, `bootstrap unreachable`) rather than a bare "Failed". While an install runs, that row shows `updating…` in place of the button (an install takes tens of seconds — the component stops, is rebuilt and restarts — and a row that just sits there invites a second click, which is how a device once lost its HAL runtime). The `update` buttons in the Overview **Versions** card (Web / OS / HAL / Agent rows, plus Bootstrap and Device in debug) are gated the same way — regular viewers get no one-click OTA trigger. The top-bar **Debug** toggle beside the Dark/Light button toggles that query parameter while preserving the active route hash and any other query parameters; its amber state indicates that debug mode is enabled.
+Monitor leaves serialize as the plain id, e.g. `/monitor#overview`, `/monitor#pairing`, `/monitor#system`, `/monitor#flow`. Defaults: `/monitor` with no/invalid hash → `overview`; `/setting` with no/invalid hash → `general` (URL normalized to `/setting#general`). Deep-links (e.g. `/setting#wifi`) and browser back/forward are honored via a `useLocation`-driven effect. Non-debug users only see the leaves in `PUBLIC_SECTIONS` (which includes Chat, Overview, **Pairing**, Info, Flow, Camera, **Sensing**, Users, **Logs**, **CLI**, and the public Settings leaves General/Wi-Fi/My Voice/Face/Privacy/MCP Tools/Plugins/Timezone/Resting light); Bluetooth remains available by direct URL but is hidden from navigation. `?debug=true` reveals the rest (Analytics, Servo, API Docs, Agent gateway, and the deeper Settings leaves AI Brain/Runtime/Language/Voice/Realtime/Channels/MQTT). Pressing `update` swaps the button for `updating…` immediately — the button never says "OK", which would read as "done" for a request that has only STARTED the install (and, for a component that finishes in seconds, arrived before the row could even show progress). Failures show the server's own reason (`rate-limited, retry in 8s`, `bootstrap unreachable`) rather than a bare "Failed". While an install runs, that row shows `updating…` in place of the button (an install takes tens of seconds — the component stops, is rebuilt and restarts — and a row that just sits there invites a second click, which is how a device once lost its HAL runtime). The `update` buttons in the Overview **Versions** card (Web / OS / HAL / Agent rows, plus Bootstrap and Device in debug) are gated the same way — regular viewers get no one-click OTA trigger. The top-bar **Debug** toggle beside the Dark/Light button toggles that query parameter while preserving the active route hash and any other query parameters; its amber state indicates that debug mode is enabled.
 
 The Overview **Versions** card has a restart action column with `restart` for OS Server and HAL, including outside debug mode. Each button calls the admin-protected `POST /api/system/restart/:target` (`os-server` or `hal`). The server schedules the restart after 2 seconds and returns HTTP 202. The button shows `queued` and disables repeat clicks for 15 seconds; this acknowledges scheduling, not service recovery. Existing monitor polling refreshes status/uptime after reconnection. Errors remain visible beside the button. Restart is disabled while the row is known to be updating; OTA activity is polled in normal mode too. Narrow cards scroll horizontally to keep all six columns accessible.
 
 The Versions card shows **Current** and **Latest** side by side. Latest comes from each component's `target` in `/api/system/ota-versions`, including the active runtime via `agent`; it is the version published in the device's OTA feed, not an upstream release lookup. Metadata loads in normal and debug mode and refreshes after updates. Missing or empty targets, including Host, display `—`; an already-current component still shows its published target. Bootstrap and Device rows and update buttons remain debug-only.
 
-**Speech attention gate** lives in the public **General** settings card, not the debug-only Realtime section. Its checkbox writes the top-level `wakeword` flag; saving restarts HAL so the change applies. When enabled, speech must follow an attention trigger: a spoken phrase, single click, turning toward the lamp while speaking, or an enrolled person entering view (`presence.enter`). A stranger-only enter does not open the voice gate unless the deployment sets `HAL_PRESENCE_WAKE_STRANGERS=true`. The card lists the currently accepted **spoken** phrases, including the active agent's exact current name and the permanent `autonomous` and device-type aliases; the system manages that list. Reload Settings after an agent rename to see the new name. When disabled, every utterance is handled without a trigger.
+**Voice input mode** lives in public **General** settings as two equal choices under **How to talk**: **Automatic** (default, also for older configs without `voice_input_mode`) and **Tap to talk**. The selector saves `voice_input_mode: "automatic" | "tap_to_talk"` through the existing Settings save flow. Automatic preserves the current speech flow and shows the wake checkbox and phrases. Tap to talk hides those controls while retaining the stored `wakeword` preference: tap once to record and stream to STT and realtime in parallel, tap again to stop and commit realtime without waiting for STT finalization or speaker identity. Realtime can answer or delegate to the main agent; disabled/unavailable realtime falls back to an available STT transcript. Gemini/OpenAI support manual streaming; Pipecat retains internal STT finalization, and GPT Live buffers until finish because it lacks manual commit. Silence does not send. During TTS, a tap only stops playback; the next tap starts recording. Wake phrases and gaze do not open recording in this mode; the physical mic switch still applies. Returning to Automatic restores the previous wake preference. This setting controls on-device voice input when Harness-only mode is off; Harness-only mode keeps its existing tap behavior. Mode participates in loading, dirty detection, saving, and reload.
+
+Mode-only HTTP/MQTT updates are applied without restarting either process. OS saves config.json, then calls HAL `POST /voice/input-mode` with `{ "mode": "automatic" | "tap_to_talk", "wakeword": true | false }`. HAL serializes the transition, cancels pending input, reconfigures the voice worker and realtime session, and preserves sleep/privacy. Other hardware services stay running. The success response confirms local application, not cloud connectivity. A failed apply is reported and remains retryable with the same explicit mode. Updates that also change boot-only fields may still require a HAL restart.
+
+The monitor/settings sidebar uses a single-open-group accordion: expanding one top-level group collapses the previous one, clicking the open group collapses it, and navigation opens the group containing the destination. It has an independently scrolling navigation list with contained overscroll and a non-shrinking logout footer. On phones, the drawer follows the dynamic viewport height (`100dvh`) so all debug entries remain reachable.
+
+**Realtime form** (`/setting?debug=true#realtime`) uses short checkbox labels; provider names live in the Provider dropdown. Optional API Key and Base URL guidance appears below the inputs, keeping field labels compact on narrow screens.
+
+The same compact-label layout applies to General’s attention trigger, STT credentials, TTS provider/key fields, and Resting light. TTS key status stays intact when the row wraps. Wi-Fi provisioning places its Advanced explanation below the button, and Manual Move separates its description from the Live drag checkbox.
+
+**Speech attention gate** lives in the public **General** settings card, not the debug-only Realtime section. Its checkbox writes the top-level `wakeword` flag; saving a changed or pending wake value restarts HAL so the change applies. When enabled, speech must follow an attention trigger: a spoken phrase, single click, turning toward the lamp while speaking, or an enrolled person entering view (`presence.enter`). A stranger-only enter does not open the voice gate unless the deployment sets `HAL_PRESENCE_WAKE_STRANGERS=true`. The card lists the currently accepted **spoken** phrases and lets the owner edit them: remove a chip, add a phrase (Enter or **Add**, lowercased, up to 40 characters, at most 30, any language such as `ê bé na ơi`), or **Restore defaults**. **Save Changes** sends `wake_phrases` in `PUT /api/device/config`; the server normalizes and stores them in `config.json` and pushes them to HAL without a restart. A list equal to the built-in one is sent as `[]`, which restores the built-in phrases (`hello|hey|hi|alo|okay|ok|wake up` + `autonomous`, device type and current agent name) so they keep following agent renames. Single-word phrases get a warning because they can trigger in normal conversation. On Intern (`wake_name_anywhere: true` in `GET /api/device/config`) the list holds **names** instead (built-in `autonomous`, `intern` and the agent's name): the copy says a name anywhere in what you say wakes it ("hey intern", "what time is it, intern?"), the input hint is `e.g. sam`, and there is no single-word warning. **Play a chime when a wake phrase is heard** saves `wake_chime` (default on): the button-tap ack chime plays when a spoken wake phrase is heard; HAL reads it live. Below it, **Light up when a wake phrase is heard** saves `wake_light.enabled`, and **Customize light** opens an inline form (`WakeLightEditor.tsx`): colour chips, hue / white↔colour / brightness sliders (up to 128), effect chips Steady/Breathing/Spin/Blink (`solid`/`breathing`/`spin`/`blink`), a speed slider, an animated swatch preview, and a live device preview (`POST /api/hardware/led/wake-light/preview`, debounced 300 ms; a note shows when the strip is busy and the preview was skipped). The light is saved as `wake_light` with **Save Changes**. At least one cue stays on: the checkbox of the last enabled cue (chime or light) is disabled with a hint, and the server rejects an update that turns both off. **Keep listening for** (5/10/15/20/30 seconds, default 10) saves `wake_followup_s` (server accepts 3–30): how long the device keeps listening without a wake phrase after a wake or a reply; HAL reads it live. `GET /api/device/config` returns `wake_followup_s` only once the owner has set it; until then the form asks HAL (`GET /api/hardware/voice/wake-followup` → `{seconds, image_default_s}`) for the window in effect, so an image default such as the 5 s `.env` of the lamp and intern-v2 shows correctly. Colour helpers are shared with Resting light in `src/lib/ledColor.ts`. `GET /api/device/config` returns `wake_phrases` (effective), `wake_phrases_custom`, `wake_phrases_default`, `wake_followup_s`, `wake_light` and `wake_light_enabled`. Reload Settings after an agent rename to see the new name in the built-in list. When disabled, every utterance is handled without a trigger.
+
+Wake updates from HTTP Settings and MQTT are serialized. Saving waits for the required HAL `systemctl restart` to complete (the restart command has a 30-second timeout), without verifying voice pipeline readiness. Save or wake-apply failures use the existing Settings error response; config may already be saved if restart fails. Pending wake apply is retained in the current os-server process, so saving the same value again retries it. After success, an unchanged wake value does not cause another restart. Config updates without a pending wake apply retain the existing asynchronous HAL apply behavior. Updates combining wake and other settings use one HAL restart; other saved fields still receive their normal side effects.
 
 **Timezone** (`/setting#timezone`, internal `settings:timezone`, `TimezoneSection.tsx`) — an admin-gated section that, like Agent Runtime, is **not** part of the form's "Save Changes" flow: it has its own **Apply** button. It loads the current zone and the selectable IANA zone list via `GET /api/device/timezone`, lets the operator pick a zone from a single dropdown (`<select>` grouped by region via `<optgroup>`, each option labelled `(GMT+7) Ho Chi Minh` and ordered by UTC offset, the way common web timezone pickers work), and shows a live preview of the local time in the selected zone. On **Apply** it calls `POST /api/device/timezone {timezone}`; the change applies immediately (no device restart needed).
+
+**Resting light** (`/setting#led`, internal `settings:led`, `LedSection.tsx`) — shown only on devices with the `light` capability and, like Timezone, outside the "Save Changes" flow. It reads `GET /api/hardware/led/resting` and writes `PUT /api/hardware/led/resting` straight to HAL: a checkbox turns the resting light on/off, chips pick the device default or a dim preset (Warm white, Candle, Clean white, Peach, Brighter warm), and hue / white↔colour / brightness sliders build a custom colour, saved 250 ms after dragging pauses so the device follows live. A yellow notice warns when the colour looks like a status cue. Swatches are scaled to full brightness because the real strip values are too dark to show. See [led-control.md](../robots/lamp/docs/led-control.md#owner-choice-from-the-web-ui).
+
+**Privacy** (`/setting#privacy`, internal `settings:privacy`, `PrivacySection.tsx`) — shown on devices with the `vision` capability and outside the "Save Changes" flow. It lists the four camera perceptions that upload images to the perception service: **Posture reminders** (`pose`), **Fire and smoke hints** (`fire_hazard`, labelled as best effort and not a smoke or fire alarm), **Activity recognition** (`motion`) and **Facial emotion** (`emotion`), each with what the camera is used for, what is uploaded for cloud analysis and how often, then a **Microphone** block. Its paragraph says the robot listens on the device for speech, and only when VAD hears speech does it stream audio to the speech-to-text service (the `llm_base_url` host, or Deepgram if the owner set their own Deepgram key) to catch the wake word and understand requests, including speech not meant for the robot; during a live voice conversation audio also goes to the voice AI provider; muting the microphone stops all of it. Two toggles follow: **Voice recognition** (`speaker_id`, uploads a clip of each utterance, including voices of people not enrolled, plus enrollment samples; off means every speaker is unknown and voice enrollment fails) and **Voice emotion** (`speech_emotion`, uploads the audio of each conversation turn). The recipient line reads "Images and voice clips are sent to: <host>" (from `llm_base_url`). All six are off until the owner turns them on. When **Apply** would turn any of them on, a confirmation dialog first lists the newly enabled features, what each uploads and where, and asks to send "camera images", "voice audio" or both depending on what is newly enabled; turning features off applies without a prompt. **Apply** sends `PUT /api/device/config` with the whole `cloud_perception` object and shows "Applying…" until the robot confirms; the request returns only after HAL applied the change (see [os-server.md](os-server.md#cloud-camera-perception)), and a failure is shown as an error with Apply left available to retry. The intro states that on-device face detection, Face ID, presence and gaze are unaffected, that anyone in view is included, that turning a feature off stops new uploads once the robot confirms while an upload in progress may finish, and that the server deletes each image or voice clip as soon as it has been analysed (the relay only forwards the request); the confirm dialog repeats this. The **Posture reminders** text also says a reminder sent to the owner's Telegram includes the worst-posture photos (any other recipient gets the text only), and the intro says a face seen twice without a name keeps one photo on the device for 24 hours, that a photo of each arrival is kept for 72 hours, and that a few dozen recent gaze/bearing frames are kept for aiming, all on the device only (see [sensing-behavior.md](../robots/lamp/docs/sensing-behavior.md#familiar-stranger-enroll-prompt)). It also says unknown faces are remembered on the device as face data to count visits, are deleted after 30 days without a visit, and can be deleted sooner under **Unknown faces** (Monitor **Users**). Below the toggles a **Guard mode** line shows `GET /api/guard` and explains that, while on, each person, movement or fire hint is sent to Telegram with a camera photo; when on it offers **Turn off guard mode** (`POST /api/guard/disable`). Guard mode is only turned on by asking the robot, not from this page.
+
+**Unknown faces** (Monitor **Users**, `/monitor#face-owners`, `face-owners/UnknownFacesCard.tsx`) lists face strangers from `GET /face/stranger-stats`. A line under the header reads "Face data of people the lamp does not know, kept on the device to count visits. Deleted automatically after 30 days without a visit." Each row has a ✕ delete button (`DELETE /face/strangers/{id}`) and the header has **Clear all** (`DELETE /face/strangers`); both open a confirm dialog ("Delete this unknown face?" / "Delete every unknown face?") saying the face data, visit count(s) and snapshots are deleted and that a returning person is treated as new. See [sensing-behavior.md](../robots/lamp/docs/sensing-behavior.md#stranger-visit-tracking).
 
 The legacy standalone `/edit` page was removed; its `SettingsPanel` is now reachable only through the `/setting` tabs inside Monitor. `/edit` (and the Setup "update →" hint) now redirect to `/setting`.
 
@@ -322,7 +462,7 @@ saved but absent configures the device for a model it cannot load.
 
 ## 4. Polling & Data Sources
 
-Monitor polls system/HW APIs every **3 seconds**. Flow uses file-backed hybrid mode: REST seed + live stream.
+Monitor polls the active section's system/HW APIs every **5 seconds** (`usePolling` in `system/web/src/pages/monitor/index.tsx`; the sidebar's `GET /api/agent/status` runs every 10 s, and some cards poll on their own cadence). Flow is fed by the file-backed live stream (`GET /api/agent/flow-stream`), whose every frame is a full snapshot of the latest 500 events.
 
 ### 4.1 OS Server (Go, port 5000, prefix `/api`)
 
@@ -331,41 +471,50 @@ Monitor polls system/HW APIs every **3 seconds**. Flow uses file-backed hybrid m
 | `GET /api/system/info` | CPU load, RAM (KB), temperature, uptime, goroutines, version, deviceId, capabilities (declared capability names — both the Monitor and the Edit/Settings page gate hardware tabs on these; see the shared `useCapabilities` hook) |
 | `GET /api/system/network` | SSID, IP, public IP, Tailscale IP, signal (dBm), internet (bool), pingMs (internet probe RTT, 0 = unmeasured) |
 | `GET /api/agent/status` | active runtime name, connected (bool), sessionKey (bool), version, emotion, uptime (OS server connection uptime, secs), agentUptime (runtime process uptime when supplied, secs — survives OS server restarts). The Agent row in the Versions card probes its CLI version asynchronously and retries transient boot-time failures. |
-| `GET /api/agent/recent` | Latest flow events from today's JSONL file (`local/flow_events_<date>.jsonl`) |
-| `GET /api/agent/flow-events?date=YYYY-MM-DD&last=500` | File-backed flow events API used for Flow seed/history |
-| `GET /api/agent/flow-stream` | File-backed live stream (SSE) for Flow updates when JSONL changes |
+| `GET /api/agent/recent` | Last 500 flow events from today's JSONL file (`local/flow_events_<date>.jsonl`) |
+| `GET /api/agent/flow-events?date=YYYY-MM-DD&last=500` | File-backed flow events API (`last` defaults to 500, max 10000); used by the Chat section's history seed |
+| `GET /api/agent/flow-stream` | File-backed live stream (SSE): on every JSONL change it sends the latest 500 events as one full snapshot; the Flow section replaces its event list with it |
 | `GET /api/agent/events` | Monitor bus SSE endpoint (kept for compatibility) |
 | `GET /api/logs/tail?source=bootstrap&lines=N` | Authenticated Bootstrap log tail used to seed and manually refresh the Bootstrap Logs tab. |
 | `GET /api/logs/stream?source=bootstrap` | Authenticated SSE stream for live Bootstrap Logs-tab updates. |
 | `POST /api/agent/restart` | "Start + enable + restart" recovery: backend does best-effort `systemctl enable <unit>` (so the fix survives reboot) then calls the runtime's own `RestartAgent()` (which resolves to `systemctl restart <unit>` — starts if stopped). Powers the Agent Gateway card's small restart icon at bottom-right. |
-| `POST /api/system/force-update` | Triggers OTA check via bootstrap worker (proxies to `localhost:8080/force-check`) |
 | `GET /api/system/ota-versions` | Per-component `{current, target, min_version, update_available, held_by_floor}` (proxies bootstrap `/versions`, including the installed device profile from `devices.<device_type>`, plus an `agent` alias for the configured runtime's CLI). The Versions card shows an `update` button wherever `update_available` is true (`held_by_floor` is reported but NOT used for the button: the button installs the published version on this device, like `software-update <key>` over SSH, and the floor only stages the automatic fleet rollout) |
 | `GET /api/system/ota-updating` | Components the worker is installing right now (`{updating: [...]}`, plus the `agent` alias). Deliberately cheap — no metadata fetch — because the Versions card polls it every 2 s while an install runs and shows `updating…` on that row instead of the button |
-| `POST /api/system/software-update/:target` | Per-component OTA check. `target`: `os-server` \| `bootstrap` \| `web` \| `hal` \| `device` \| `agent`. Bootstrap self-updates by spawning the installer in the background, so its replacement can safely restart the worker; `device` installs the resolved `devices.<device_type>` profile. **`agent` is virtual** — os-server resolves it to the configured runtime's CLI (`codex`/`claudecode`/`opencode`/`picoclaw`) so the browser never needs to know which runtime runs; `hermes` returns 400 (it cannot be pinned, so bootstrap never auto-applies it). Rate-limited to one call per target per 30 s |
+| `POST /api/system/software-update/:target` | Per-component OTA install (the only web OTA trigger; os-server calls bootstrap `POST localhost:8080/force-update/<target>`). `target`: `os-server` \| `bootstrap` \| `web` \| `hal` \| `device` \| `agent`. Bootstrap self-updates by spawning the installer in the background, so its replacement can safely restart the worker; `device` installs the resolved `devices.<device_type>` profile. **`agent` is virtual** — os-server resolves it to the configured runtime's CLI (`codex`/`claudecode`/`opencode`/`picoclaw`) or `hermes`) so the browser never needs to know which runtime runs. Hermes is in the allowlist, but its row only gets an `update` button once its metadata entry is commit-pinned (an unpinned entry is not reported by `/versions`). Rate-limited to one call per target per 30 s |
 | `POST /api/system/reboot` | Admin-gated reboot request. OS server returns `202` first, then calls HAL's cue-aware reboot action. |
 | `POST /api/system/shutdown` | Admin-gated shutdown request. OS server returns `202` first, then calls HAL's cue-aware, servo-release shutdown action. |
 
 > **Note on format**: The OS server API returns `{ status: 1, data: <payload>, message: null }` on success.
 
-### 4.2 HAL (Python/FastAPI, port 5001, prefix `/hw`)
+### 4.2 HAL (Python/FastAPI, port 5001, via os-server `/api/hardware/*`)
+
+The web UI never calls nginx `/hw/*`: every HAL request goes through the admin-gated os-server reverse proxy `/api/hardware/<path>` (`HW` in `system/web/src/pages/monitor/types.ts`), which forwards to HAL `:5001/<path>` on loopback. Elsewhere in this doc, `/hw/<path>` names the same HAL route.
 
 | Endpoint | Data |
 |----------|------|
-| `GET /hw/health` | Status of 8 hardware: servo, led, camera, audio, sensing, voice, tts, display |
-| `GET /hw/presence` | state, enabled, seconds_since_motion |
-| `GET /hw/voice/status` | voice_available, voice_listening, tts_available, tts_speaking |
-| `GET /hw/servo` | available_recordings, current, bus_connected, robot_connected |
-| `POST /hw/servo/upload` | Upload a new servo recording CSV (`timestamp` + `<joint>.pos` columns) |
-| `GET /hw/display` | mode, hardware, available_expressions |
-| `GET /hw/audio/volume` | control, volume (0-100) |
-| `GET /hw/voice/mic-level` | SSE stream (~10Hz): level (voice-mic RMS, int16 scale), threshold (VAD), active, muted, sensing_level / sensing_age_s / sensing_threshold (noise mic — last SoundPerception sample, null when sensing is down), tts_speaking / music_playing (live playback state — the audio card flips "Speaking…/Playing music" off the stream instead of waiting out the 5s status poll) |
-| `GET /hw/led/color` | led_count, color [R,G,B], hex (#rrggbb) |
+| `GET /api/hardware/health` | Status of 8 hardware: servo, led, camera, audio, sensing, voice, tts, display |
+| `GET /api/hardware/presence` | state, enabled, seconds_since_motion |
+| `GET /api/hardware/voice/status` | voice_available, voice_listening, tts_available, tts_speaking |
+| `GET /api/hardware/servo` | available_recordings, current, bus_connected, robot_connected |
+| `POST /api/hardware/servo/upload` | Upload a new servo recording CSV (`timestamp` + `<joint>.pos` columns) |
+| `GET /api/hardware/display` | mode, hardware, available_expressions |
+| `GET /api/hardware/audio/volume` | control, volume (0-100) |
+| `GET /api/hardware/voice/mic-level` | SSE stream (~10Hz): level (voice-mic RMS, int16 scale), threshold (VAD), active, muted, sensing_level / sensing_age_s / sensing_threshold (noise mic — last SoundPerception sample, null when sensing is down), tts_speaking / music_playing (live playback state — the audio card flips "Speaking…/Playing music" off the stream instead of waiting out the 5s status poll) |
+| `GET /api/hardware/led/color` | led_count, color [R,G,B], hex (#rrggbb) |
 
 ---
 
 ## 5. Section Details
 
 ### 5.1 Overview Section
+
+Overview Services shows persisted update progress beneath each component. Only measurable artifact downloads show a byte-based percentage and progress bar; preparing, verification, installation, restart and health checks show named stages. Unknown download size shows bytes only. The previous run's completed/failed/interrupted outcome remains labeled “Last update”. Reconnection preserves the last known status rather than treating a network failure as completion. Active updates disable their update/restart controls. The API remains backward compatible with older updating-only workers; detailed progress requires the updated on-device updater and OS Server.
+
+While HAL dependencies install, the row shows recognized `uv` package activity or package-count summaries and “Last activity … ago” from optional `activity_at`, refreshed every five seconds. Silent or unrecognized logs leave the installation stage and latest known activity visible; they do not generate an installation percentage. Older snapshots without the timestamp remain supported.
+
+
+
+The monitor uses consistent overflow longhands so returning from Chat, Settings or embedded pages restores the outer content scrollbar.
 
 Returning to Overview immediately refreshes section data instead of waiting for the next 5-second poll. Existing card data stays visible while refreshing. The monitor retains successful OTA-version and emotion-preset snapshots across section unmounts, displays them immediately on return, and revalidates in the background. These snapshots are memory-only and expire when the monitor unmounts. Section changes abort the previous section poll; hidden sections do not keep their streams mounted.
 
@@ -397,7 +546,7 @@ Cards included:
 **Voice & TTS**
 - Mic available + listening (LIVE badge)
 - TTS available + speaking (SPEAKING badge)
-- Current volume
+- Volume is displayed and controlled on a normalized 0–100% scale: 100% maps to the robot’s `max_volume` safety limit (for example, 50% mixer volume on `pro-respeaker-lite`). Reads divide the mixer volume by the limit; writes multiply by the limit and round to an integer. The UI uses HAL’s applied value after a write and does not show the internal ceiling. A missing limit defaults to 100; a zero limit displays 0% and disables the slider. HAL continues enforcing safety for every caller.
 - **Mic level VU meters** (under the volume slider), fed by the `GET
   /hw/voice/mic-level` SSE stream (~10Hz, via the `/api/hardware` proxy);
   raw RMS is mapped to percent on a dBFS scale (-60dBFS → 0%, 0dBFS → 100%)
@@ -416,9 +565,7 @@ Cards included:
   independent of the mute switch) and closes while the browser tab is
   hidden.
 
-On phone widths of **480px or less**, the four Overview status cards use one
-column. This preserves room for the Audio controls and VU meters, and prevents
-the shorter Presence card from being stretched by the taller Audio card.
+Overview is organized into three always-visible zones: **System health** (Agent, Network, Presence, Hardware), **Live controls** (Audio and Scene beside Emotion and Servo), and **Services** (full-width versions and uptime table, followed by Power). Health cards use four columns above 1200px, two up to 1200px, and one below 768px; controls also stack below 768px. At 1500px and above, Audio/Scene, Emotion and Servo form three aligned columns with consistent bordered surfaces. Preset labels display spaces instead of underscores; command IDs are unchanged. Audio meters and all presets stay visible. Presets use a wrapping button grid, and Agent restart has a separate footer row. Existing device actions and confirmations are unchanged. Maintenance buttons use icons and readable labels, with amber Update and neutral Restart styling; Sending, Queued and Updating remain distinct states.
 
 **Hardware** (horizontal card)
 - 8 badges: Servo / LED / Camera / Audio / Sensing / Voice / TTS / Display
@@ -439,6 +586,10 @@ the shorter Presence card from being stretched by the taller Audio card.
 - Each can be played via `POST /hw/servo/play` (recording name)
 - UI also provides an `Upload CSV` button to add/replace recordings via `POST /hw/servo/upload` (multipart: `file`, `recording_name`)
 
+**Touch Sensitivity** (Servo section, `?debug=true`; shown when HAL reports a contact profile)
+- Status from `GET /hw/health` → `servo_overload.contact.profile`: learning (and which animation is playing), learned on this lamp (`recordings` count), or not learned yet (only the fixed floors stop the arm during animations)
+- `Learn` calls `POST /hw/servo/contact/learn` (`{"runs": 2}`): the lamp plays every animation except `music_*` twice and saves this unit's envelope. Clear the space around the lamp first; the button is disabled while a learn run is in progress. Before starting, the page reads `GET /hw/voice/status` and `GET /hw/camera`: when the mic or camera is on, a dialog explains that the lamp turning toward voices and faces cuts the animation being learned, and offers **Turn off and learn** (`POST /hw/voice/mute` and/or `POST /hw/camera/disable`, then learn; nothing starts if either fails), **Learn anyway**, or **Cancel**. When that run ends, finished or aborted, the page turns back on only what the dialog turned off (`POST /hw/voice/unmute`, `POST /hw/camera/enable`); a mic or camera the user had already turned off stays off. It watches `learning` in `/hw/health` (a run never seen there within 15 s counts as ended), so closing the page before the run ends leaves them off
+
 > **Layout & pill clouds.** The device cluster (row 2) splits into two equal
 > columns: the right column holds the expressive cards (Emotion, Servo Pose,
 > Versions) and the left column holds the compact status cards (Hardware, Scene,
@@ -456,6 +607,33 @@ the shorter Presence card from being stretched by the taller Audio card.
 > `sleepy` readable in dark mode. The summary reserves room for the emoji and
 > long names such as `acknowledge`; when a card is narrow, the pill cloud wraps
 > below it rather than overlapping the current state.
+
+### Connectors (Settings → Connectors)
+
+Third-party accounts the robot can use are grouped under **Settings → Connectors**, next to the other Settings sections. They have no shared Save Changes button; each page saves its own connection.
+
+- **Facebook** — a Page ID and a Page Access Token, saved through `POST /api/device/connectors/pat`.
+- **Shopify** — the store is linked with the customer's **own Shopify app**: the page asks for the **Store domain**, the app's **Client ID** and its **Client secret** (masked, with a show/hide toggle). The domain is cleaned up on submit (trimmed, lowercased, a pasted `https://…` or path removed, a bare handle completed to `<handle>.myshopify.com`) and the device checks all three against Shopify once before saving (`PUT /api/device/connectors/shopify`). The page then shows the connected store, with **Reconnect** and **Disconnect**; after a reload the Store domain and Client ID fields are filled in again from the saved link, and **Cancel** restores them. The secret is never shown again and is never returned by the API: its field says it is saved, and reconnecting or changing the store needs it pasted again. A collapsible **How to create your Shopify app** guide (six steps plus troubleshooting) sits under the form; it is the same text the autonomous.ai connect form shows. Tokens last 24 hours and the device renews them itself, so there is nothing to refresh by hand.
+
+The page saves the credentials on the device and only the connected status is reported to the account, so the privacy line reads "Saved on this device. Only the connected status is shared with your account."
+
+### Settings readability
+
+Settings dropdowns use themed Radix menus with an amber selection, viewport-aware placement, scrolling, keyboard navigation and Escape dismissal. Empty-value Auto/default choices remain selectable. General retains its existing controls.
+
+Settings sections other than General use visible keyboard focus, consistent control heights, and 16px mobile text inputs/selects. Language, Voice, Realtime and Channels use larger helper text. MCP Tools and Plugins apply their own actions and no longer show the shared Save Changes button.
+
+On phones, MCP header key/value fields stack with explicit labels; Plugin and Scheduled action groups move below names and status. My Voice handles long names and places recordings below filenames; Face photo removal has a larger hit target. Facebook connection actions wrap. Schedule editor labels are associated with controls and weekday toggles expose their pressed state. Runtime help buttons never submit the Settings form; the help dialog supports keyboard focus and dismissal.
+
+### Monitor readability
+
+Chat history covers the chat panel on phones instead of shrinking the conversation; Escape closes it, keyboard focus stays in the open mobile history, and selecting or creating a conversation returns to chat. Export and Clear are grouped in an accessible actions menu. History selection and rename/pin/delete actions work with keyboard and touch. Message actions have larger visible targets, metadata wraps, and the scroll-to-bottom button stays above the composer even with multiline drafts or attachments. Enter sends only outside IME composition; Shift+Enter still inserts a newline.
+
+Overview shows a neutral loading state until agent status arrives; version rows stack with field labels on phones. System stacks gauges above history charts at 768px. Camera puts snapshots below the stream on phones, labels tracking inputs, collapses optional bounding-box controls under Advanced tracking, and reports failed actions with pending controls disabled.
+
+Logs uses a source dropdown at 640px, larger log text and clearer timestamps. Flow has larger search and toolbar controls. CLI has keyboard-accessible session tabs, mobile terminal keys and a Reconnect button after disconnection; reconnect starts a fresh shell and clears the previous terminal scrollback. API Docs shows loading/failure states with Reload and Open in new tab actions. Monitor and Settings reserve a footer row so the source link does not cover content.
+
+Servo uses larger headings, high-contrast readouts and spacious controls in a two-column overview that becomes one column at 900px. At 600px, each joint stacks its name, current angle, target input and full-width slider; live drag and angle bounds are unchanged. Users has larger metadata and always-visible action buttons, compact person cards in an auto-filling grid (280px minimum tracks, cards capped at 340px) and two-column observation grids; both use one full-width column at 640px, collapsed profile files and a separate collapsed recognition-cooldown panel. Pairing uses larger connection titles, status badges, clear action/error blocks and responsive metadata rows; Buddy connection IDs are under collapsed Connection details.
 
 ### 5.2 Pairing Section
 
@@ -489,6 +667,9 @@ one column below 760px.
 
 **Harness-only voice**
 
+The Pairing page only shows the Harness-only voice switch and its description when the OS voice-mode response has `supported:true` (MPR121 configured for the active board). Missing support metadata hides the switch. Pairing and focused-agent information remain visible; API/MQTT also enforce the hardware requirement.
+
+
 - A paired computer exposes `HarnessVoiceMode.tsx` inside `HarnessCard.tsx`. **Focused Harness agent** mirrors the agent pane focused in the Harness app, including while voice mode is off. There is no local agent picker; normal `harness-use` conversation targets remain independent.
 - Enable **Harness-only voice** to send spoken requests directly to that focused agent; replies retain device TTS. Text chat keeps its normal behavior. State lives in RAM; restart turns the mode off and focus syncs again after reconnect. Focus changes during capture reject the old capture and require repeating the request. Already-sent work keeps its original response route.
 - Mode/focus refresh every 2 seconds through `GET /api/harness/voice-mode`. The switch sends only `{enabled}` by `PUT` and works offline or without focus, but a failed mode lookup disables it until refresh succeeds. Offline, missing focus and unsupported CLI capability states explain why voice delivery is unavailable.
@@ -517,7 +698,6 @@ Below the nav items and OpenClaw status, the sidebar shows versions for all thre
 - **Web** (teal): injected at build time from `package.json` via Vite `define` (`__WEB_VERSION__`)
 - **OS server** (amber): from `GET /api/system/info` → `version` field (Go ldflags)
 - **HAL** (blue): from `GET /api/system/info` → `halVersion` field. The OS server calls HAL `:5001/version` on the loopback once per minute (cached) and re-exposes it through the OS server API, so the browser doesn't need direct access to `/hw/*` (nginx gates `/hw/` to loopback only).
-- **Force Update** button: triggers `POST /api/system/force-update` → bootstrap OTA check. Shows "Checking…" while busy, then "Triggered"/"Failed" feedback for 3 seconds.
 
 ### 5.3 System Section
 
@@ -528,7 +708,7 @@ Below the nav items and OpenClaw status, the sidebar shows versions for all thre
 
 **CPU History / RAM History** — Sparkline chart (area + line):
 - Stores 60 history points (`HISTORY_LEN = 60`)
-- Updates every 3 seconds
+- Updates every 5 seconds
 
 **Process**: goroutines, uptime, version, deviceId
 **Network Detail**: SSID, IP, signal, internet
@@ -547,12 +727,10 @@ File-backed hybrid feed:
 
 Each event displays: type badge, phase (if any), runId (first 8 chars), timestamp, summary text, error (if any).
 
-- Initial/history load via `GET /api/agent/flow-events`.
-- Live updates via `GET /api/agent/flow-stream` (SSE emitted on file change).
-- Fallback polling (2s) is used only if live stream disconnects.
+- Load and live updates both come from `GET /api/agent/flow-stream` (SSE emitted on file change); each frame is a full snapshot of the latest 500 events and replaces the list. The stream opens only while the Flow or Chat section is active and closes while the tab is hidden; there is no polling fallback.
 - Displayed turns/events are fully derived from JSONL flow logs.
 
-**Turn Pipeline (SVG)** — Implemented by `FlowDiagram` in `system/web/src/pages/Monitor.tsx`. Full layout (three clusters: OS server / HAL / OpenClaw, column grid, Cron vs OpenClaw, HAL row aligned with Tool, approximate coordinates) is documented in **`docs/flow-monitor.md`**; Vietnamese summary in **`docs/vi/flow-monitor_vi.md`**.
+**Turn Pipeline (SVG)** — Implemented by `FlowDiagram` in `system/web/src/pages/monitor/FlowSection/FlowDiagram.tsx`. Full layout (three clusters: OS server / HAL / OpenClaw, column grid, Cron vs OpenClaw, HAL row aligned with Tool, approximate coordinates) is documented in **`docs/flow-monitor.md`**; Vietnamese summary in **`docs/vi/flow-monitor_vi.md`**.
 
 Turn Pipeline grouping behavior:
 - Turns are still started by input/trigger events (`sensing_input`, `chat_input`, `schedule_trigger`, etc.).
@@ -572,19 +750,18 @@ Turn Pipeline grouping behavior:
 - Flow Panel header uses Lucide icons throughout (brand `Hexagon`, `Summary→ClipboardList`, `Canvas→LayoutDashboard`, `Bundle→PackageOpen`, `Full day→CalendarDays`, `Clear→Trash2`) for a consistent icon set — no emoji glyphs.
 - **Current-user chip** — when the device recognizes an enrolled person, the header chip shows that person's **name + face avatar** (first enrolled photo via `GET /face/photo/<label>/<file>`, with `/face/owners` polled every 30s to map name→filename); on `unknown` or a missing/broken photo it falls back to a generic Lucide `UserRound` glyph. The name comes from `GET /identity/current-user` (polled every 5s), **not** `/face/current-user`: that endpoint answers only "who does the camera see", so the chip stayed blank whenever nobody was in frame — and permanently on a device with no camera — even right after speaker-ID recognized an enrolled user. HAL resolves face-then-voice, so the chip shows the face user whenever the camera has one and the recognized speaker otherwise. The value is the normalized label (`long`), so the chip's `capitalize` and the photo lookup behave identically for both modalities — the `Speaker - ` transcript prefix never reaches it. The tooltip says which modality the identity came from (*seen* vs *heard*).
 - Flow Panel header actions include **`↓ Bundle`**, **`full day`**, **`🗑 Log`**.
-- **`↓ Bundle`** — one click saves **two files**: (1) server JSONL tail via `fetch` + blob (`GET /api/agent/flow-logs?last=500`), (2) UI snapshot JSON (`events` + `groupIntoTurns` → `lamp_flow_ui_snapshot_*.json`).
+- **`↓ Bundle`** — one click saves **two files**: (1) server JSONL tail via `fetch` + blob (`GET /api/agent/flow-logs?last=10000`; the server clamps `last` to 2000, so the file is `flow_<date>_last2000.jsonl`), (2) UI snapshot JSON (`events` + `groupIntoTurns` → `flow_ui_snapshot_*.json`).
 - **`full day`** — `GET /api/agent/flow-logs` without `last` (whole day JSONL).
 - `🗑 Log` asks for confirmation and calls `DELETE /api/agent/flow-logs` to truncate the server flow log, then clears current Flow UI events.
 - **Filters modal** (`FlowSection/FiltersModal.tsx`) — the turn-list header keeps only a free-text search box and a **Filters** button (badged `Filters · N` with the count of active filter groups). Clicking it opens a centered modal hosting the full filter set: **Sources** (Mic / Cam / Btn / CH / Web / Cron / Sys quick-toggles, plus Dropped when present), **Sort** (Newest / Oldest / Slowest / Fastest / ↑↓ Tokens), **Sub-types** (per-type toggles with an All-on / Enable-all shortcut), and **Time range** (quick presets Last 15m / 1h / 6h / Today, plus two labeled clock-prefixed From/To pills joined by an arrow; the native `<input type="time">` is de-chromed via `.lm-time-input` and the active bound tints amber). A footer offers **Reset all** and **Done**. The modal renders inside the FlowSection tree (under `.lm-root`) so `--lm-*` tokens resolve in dark and light mode; it closes on overlay click, the ✕, **Done**, or `Esc`. All filter state lives in `FlowSection/index.tsx` and is threaded in as props, so opening/closing never resets a filter.
 - **Lucide icons for sub-types** — the source and sub-type chips use Lucide icons (`TYPE_LUCIDE` in `FlowSection/types.ts`, e.g. `voice→Mic`, `cmd→Mic2`, `motion→Eye`, `activity→Activity`, `voice_emo→Speech`, `emotion→Smile`, `web→Monitor`, `sys→Settings`) instead of emoji glyphs, inheriting the chip's `currentColor` and on/off opacity treatment.
-- Turn history list shows **all turns** for the day (newest first), derived from the **last 10 000** flow events — covers a full day of typical activity.
-- Flow event memory is capped at 10 000 events.
+- Turn history list shows all turns (newest first) derived from the events in memory — the latest 500 the flow stream delivers, not the whole day (use **`full day`** for that).
+- Flow event memory is capped at `FLOW_EVENTS_MAX` = 10 000 events, but the stream snapshot is 500, so that cap is not reached in practice.
 - Telegram stitching heuristic: if a Telegram fallback input turn (without real input text) is immediately followed by an agent-output turn within 30s, Monitor stitches them into one turn so the reply stays with the original Telegram input.
 
 ### 5.5 Camera Section
 
 - **Camera Stream**: MJPEG live stream from `GET /hw/camera/stream` (downscaled + throttled; default ~10fps, ~320px width). The `<img>` remounts with a fresh connection (bumped `streamEpoch` cache-buster) whenever the camera transitions to enabled — via the Enable button or an auto-enable picked up by polling — so live video returns immediately without a page refresh. A stream error that lands right after enable (HAL's capture loop needs ~1-2s to deliver the first frame) is not latched: it auto-retries on a short delay until a frame loads.
-- **Display Eyes (GC9A01)**: Round 1.28" screen snapshot from `GET /hw/display/snapshot`, displayed as circle with amber glow. Has Refresh button.
 - **Camera Snapshot**: Static image from `GET /hw/camera/snapshot`, with Capture button to take new shot.
 
 ### 5.6 Logs Section
@@ -647,14 +824,14 @@ The **New** dropdown also includes **Create with Agent**. It closes Manage skill
 
 **Skill catalog (Browse skills)**
 
-The catalog is the public read API of `bff-web-service` (`agent-skills-public-api.md`), wrapped device-side by `system/server/agent/delivery/http/handler_skills.go`. Both hops go through os-server, never the browser — same rationale as `GET /api/plugin/browse`: no CORS round-trip and the catalog host stays server-side. Base URL defaults to `https://apiv2.autonomous.ai`, overridable with `SKILL_STORE_BASE_URL`; every upstream call carries the `location: en-US` header the catalog's middleware requires.
+The catalog is the public read API of `bff-web-service` (`agent-skills-public-api.md`), wrapped device-side by `system/server/agent/delivery/http/handler_skills.go`. Both hops go through os-server, never the browser — same rationale as the (currently parked, commented out in `system/server/server.go`) `GET /api/plugin/browse`: no CORS round-trip and the catalog host stays server-side. Base URL defaults to `https://apiv2.autonomous.ai`, overridable with `SKILL_STORE_BASE_URL`; every upstream call carries the `location: en-US` header the catalog's middleware requires.
 
 | Device endpoint | Upstream | Notes |
 |-----------------|----------|-------|
 | `GET /api/agent/skills/browse` | `GET /api/v1/agent-skills` | Forwards `keyword` / `category_id` / `plan` / `page` / `limit`. `status` is deliberately **not** forwarded — upstream can't tell "unset" from `0`, so sending it would silently filter the listing. Returns `{data: [Skill], total}` (`domain.StoreSkillList`). |
 | `GET /api/agent/skills/bundle?id=<id>` | `GET /api/v1/agent-skills/:id/download` | Downloads the `.skill` archive to a temp dir, unzips it there, and returns `domain.SkillBundle` — the file list with UTF-8 contents inlined. The temp dir is removed before the response is written: this is a **preview**, nothing is installed. |
 
-The catalog returns business failures as **HTTP 200 with a non-1 `status`**, so the proxy checks the envelope status, not just the HTTP code, and surfaces the upstream message as a `502`. The id rides a query param rather than a path segment so the route can't collide with the sibling static `skills/browse`.
+The catalog returns business failures as **HTTP 200 with a non-1 `status`**, so the proxy checks the envelope status, not just the HTTP code, and surfaces the upstream message as a `502`. The id rides a query param rather than a path segment so the route can't collide with the sibling static `/api/agent/skills/browse`.
 
 Extraction is hardened: zip-slip guarded (any `..` or absolute entry fails the whole bundle), `.DS_Store` / `__MACOSX/` filtered, and capped at 16 MB per archive, 2 MB per file, 512 KB inlined as text (longer files are marked `truncated`), 500 files. Non-UTF-8 entries come back flagged `binary` with metadata only.
 
@@ -710,6 +887,7 @@ Neither path restarts the runtime: backends with a skills dir pick new files up 
 **Real-time Streaming**
 - **Thinking indicator**: collapsible purple block showing LLM reasoning tokens as they stream in (`thinking` events). Click to expand full text (max-height 200px scrollable). Auto-hides on response completion.
 - **Assistant delta streaming**: response text appears token-by-token via `assistant_delta` events, instead of waiting for final response. Fallback to `chat_response` partial events for non-agent paths.
+- **Harness lines in chat**: once a turn is handed to Harness, the device agent's own deferred text (usually `NO_REPLY`) is no longer streamed. Harness progress, tool, question and permission-notice deltas each end with a newline (`pushHarnessLine`, `system/server/agent/delivery/http/handler_harness.go`); a progress/tool line equal to the run's previous line is dropped. Progress/tool lines are live-only (not in JSONL), so a hidden tab misses them; questions and permission notices are replayed from `harness_question` flow events.
 - **Tool call chips**: teal badges showing tools the agent invoked during the response (emotion, LED, servo, audio, etc.). Displayed above the message bubble during streaming and persisted on completed messages. A single tool renders as one chip; **two or more collapse into a summary pill** ("N steps" with stacked tool icons + a live/`DONE` marker) that expands on click to reveal the individual chips.
 
 **Response Handling**
@@ -741,11 +919,13 @@ Chat UI → POST /api/sensing/event → SensingHandler
 
 ### 5.8 Device → Sensing
 
+The page leads with a presence summary and readable cards for people, movement, light and sound events. Expression and posture estimates follow when available. Backend status, buffers, timeouts, raw events and posture samples remain accessible in collapsed **Technical details**. A paused service is identified explicitly; failed reads show an error rather than old observations. Cards use one column at widths up to 600px. Environment follows with temperature, humidity, CO₂ and PM2.5; **More measurements** reveals the other five metrics. No air-quality thresholds or derived health scores are introduced.
+
 The Sensing navigation entry and read-only **Environment** card are always
 visible without debug mode, including when no sensing capability is declared.
 Camera sensing cards still require `vision`. While capabilities are loading or
-`environment` is absent, the Environment card shows `N/A` measurements and does
-not send sensor requests. Declared but disabled sensors also show `N/A` values.
+`environment` is absent, the Environment card shows a compact unavailable message and does
+not send sensor requests. Disabled sensors and missing samples also use a compact empty state.
 
 When `environment` is declared, the card reads `GET /api/hardware/environment/status`
 every 3 seconds through the existing authenticated OS hardware reverse proxy to
@@ -765,7 +945,8 @@ Source labels identify the component; each metric has its own timestamp.
 Unavailable components do not hide healthy readings from another component. Unavailable values appear as `N/A`, never
 zero. Stale measurements are also replaced with `N/A`; a request failure is shown
 as an error so previous readings cannot be mistaken for live data. No good/bad air
-quality labels, thresholds, or alerts are assigned. A collapsed technical
+quality labels, thresholds, or alerts are assigned. Sensor details use separate high-contrast panels with aligned label/value rows and state badges. Active sensors appear first; disabled sensors without errors are grouped in a nested collapsed list.
+A collapsed technical
 section exposes each component's state, I2C bus, sensor status register, and HAL
 polling/retry/staleness/recovery timings under `status.components`. Legacy
 single-sensor snapshots with top-level `status.timing` remain supported and use a
@@ -808,7 +989,7 @@ def get_led_color():
 
 ---
 
-## 7. Reusable Components (internal to Monitor.tsx)
+## 7. Reusable Components (`system/web/src/pages/monitor/components.tsx`)
 
 | Component | Description |
 |-----------|-------------|
@@ -887,3 +1068,13 @@ cards do not fetch directly. Both clients use the existing authenticated
 leaving the loading placeholder or old readings on screen.
 
 Harness delivery warnings no longer pause new voice requests or disable question answers. Check delivery inspects the current pending receipt; Dismiss without retrying clears that warning without cancelling or resending its task.
+
+### iMessage operator address
+
+The iMessage settings handle identifies the operator home conversation. It is not a promise of sender isolation: Hermes presync accepts customer messages from other addresses by default (`BLUEBUBBLES_ALLOW_ALL_USERS=true` unless explicitly overridden).
+
+### Settings Wi-Fi save and network handoff
+
+At `/setting#wifi` (also with `?debug=true`), saving can interrupt the browser connection when the device changes Wi-Fi. An acknowledged save means configuration was persisted, not that association succeeded. Settings shows a reconnect notice naming the target SSID and checks the live `GET /api/network/current` association every three seconds for up to two minutes (each request is capped at four seconds). Checks are cancelled when the panel unmounts; the configuration write is never retried automatically.
+
+A fetch transport failure during a Wi-Fi edit or a save from the Wi-Fi section is shown as an **unknown save result**, not a definite failure or success. Dirty fields remain in memory; even if the device later reports the target SSID, the user is asked to reload to confirm all settings. HTTP/API errors still show the server error. If the browser cannot reach the new network/address before the deadline, the notice asks the user to join the target network and reopen the device page. No credentials are stored in browser storage. The standalone `/wifi` provisioning page is unchanged.

@@ -2,6 +2,7 @@ package mqtthandler
 
 import (
 	"encoding/json"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -12,8 +13,7 @@ import (
 	"go.autonomous.ai/os/system/server/config"
 )
 
-// newTestStream builds a stream whose transport captures payloads instead of
-// reaching a broker.
+// newTestStream builds a stream whose transport captures payloads.
 func newTestStream() (*ChatStream, func() []domain.MQTTChatEventData) {
 	var mu sync.Mutex
 	var sent []domain.MQTTChatEventData
@@ -45,9 +45,7 @@ func newTestStream() (*ChatStream, func() []domain.MQTTChatEventData) {
 	}
 }
 
-// The bus carries every turn on the device, including voice ones. Only runs the
-// backend started may be mirrored — otherwise a spoken conversation in the room
-// would stream to whoever last opened the app.
+// The bus carries every turn on the device, including voice ones.
 func TestChatStreamIgnoresUntrackedRuns(t *testing.T) {
 	s, sent := newTestStream()
 
@@ -60,8 +58,7 @@ func TestChatStreamIgnoresUntrackedRuns(t *testing.T) {
 	}
 }
 
-// Deltas are accumulated, not forwarded 1:1 — at QoS 1 each publish is a
-// round-trip, and the bus emits one delta per model chunk.
+// Deltas are accumulated, not forwarded 1:1.
 func TestChatStreamCoalescesDeltas(t *testing.T) {
 	s, sent := newTestStream()
 	s.Track("run1", "sess1")
@@ -95,8 +92,7 @@ func TestChatStreamCoalescesDeltas(t *testing.T) {
 	}
 }
 
-// A tool chip must not overtake the sentence that preceded it: pending delta
-// text is flushed before any other event goes out.
+// Pending delta text is flushed before any other event.
 func TestChatStreamFlushesPendingBeforeOtherEvents(t *testing.T) {
 	s, sent := newTestStream()
 	s.Track("run1", "sess1")
@@ -116,8 +112,7 @@ func TestChatStreamFlushesPendingBeforeOtherEvents(t *testing.T) {
 	}
 }
 
-// chat_response ends the turn: it is published, then the run stops being
-// mirrored so late bus noise doesn't leak onto the wire.
+// A terminal chat_response is published, then the run stops being mirrored.
 func TestChatStreamStopsAtTerminalEvent(t *testing.T) {
 	s, sent := newTestStream()
 	s.Track("run1", "sess1")
@@ -142,11 +137,7 @@ func TestChatStreamStopsAtTerminalEvent(t *testing.T) {
 	}
 }
 
-// OpenClaw pushes chat_response repeatedly while a reply streams in — state
-// "delta"/"partial" chunks before the terminal one. Ending the mirror on the
-// FIRST chat_response regardless of state truncates every reply to its first
-// chunk; only state "complete"/"final"/"error" may end it (must match the web
-// monitor's own reducer — ChatSection.tsx).
+// Only a terminal chat_response state ends the mirror.
 func TestChatStreamChatResponseNotTerminalUntilFinalState(t *testing.T) {
 	s, sent := newTestStream()
 	s.Track("run1", "sess1")
@@ -194,8 +185,7 @@ func TestChatStreamSweepsExpiredRuns(t *testing.T) {
 	}
 }
 
-// The bus puts delta text on Summary; the flow_event shape nests it under
-// detail.text. Both must read.
+// Delta text is read from Summary and from detail.text.
 func TestDeltaText(t *testing.T) {
 	cases := []struct {
 		name string
@@ -360,4 +350,36 @@ func TestChatStreamLiveCannotOvertakeCaptureReplay(t *testing.T) {
 	if len(got) != 2 || got[0].Event.Summary != "early" || got[1].Event.Summary != "late" {
 		t.Fatalf("live event overtook replay: %+v", got)
 	}
+}
+
+// A permission notice arrives after the device agent deferred to Harness; the run is still
+// open, so the buffered line must reach the mobile client.
+func TestHarnessPermissionNoticeReachesMQTT(t *testing.T) {
+	t.Chdir(t.TempDir())
+	bus := monitor.ProvideBus()
+	events, unsubscribe := bus.Subscribe()
+	defer unsubscribe()
+	h := agenthttp.ProvideAgentHandler(nil, bus, nil, &config.Config{})
+	s, sent := newTestStream()
+	s.Track("device-chat-mqtt-perm", "mobile-session")
+	h.MarkHarnessResponseRun("device-chat-mqtt-perm", true, false)
+	const notice = "Agent test needs permission. Open OpenHarness to review and approve or deny."
+	if !h.DeliverHarnessQuestion("device-chat-mqtt-perm", "q1", notice) {
+		t.Fatal("notice rejected")
+	}
+	for drained := false; !drained; {
+		select {
+		case event := <-events:
+			s.handle(event)
+		default:
+			drained = true
+		}
+	}
+	s.flushAll()
+	for _, event := range sent() {
+		if event.Event.RunID == "device-chat-mqtt-perm" && strings.Contains(event.Event.Summary, notice) {
+			return
+		}
+	}
+	t.Fatalf("MQTT did not receive the permission notice: %+v", sent())
 }

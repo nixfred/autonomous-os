@@ -8,6 +8,37 @@ from hal.drivers.voice._internal.realtime_turn import RealtimeTurnResult
 from hal.test.test_turn_endpoint_capture import capture
 
 
+@pytest.mark.parametrize("transcripts_final", [False, True])
+@pytest.mark.parametrize("failure", ["unavailable", "prepare_error"])
+def test_realtime_fallback_never_arms_wait_filler(monkeypatch, transcripts_final, failure):
+    def prepare():
+        if failure == "prepare_error":
+            raise RuntimeError("provider unavailable")
+
+    with capture(
+        monkeypatch, [(1, True, "Please check my memory"), (4, False, None)],
+        realtime=True, wake_enabled=True, focus=lambda: True,
+        transcripts_final=transcripts_final, on_prepare=prepare,
+        realtime_available=failure != "unavailable",
+    ) as result:
+        result.wait_filler.return_value.arm.assert_not_called()
+        result.realtime.assert_not_called()
+        result.dispatch.assert_called_once()
+        assert result.dispatch.call_args.args[2] == "Please check my memory"
+
+
+@pytest.mark.parametrize("transcripts_final", [False, True])
+def test_admitted_realtime_keeps_wait_filler(monkeypatch, transcripts_final):
+    with capture(
+        monkeypatch, [(1, True, "Please check my memory"), (4, False, None)],
+        realtime=True, wake_enabled=True, focus=lambda: True,
+        transcripts_final=transcripts_final,
+    ) as result:
+        result.service._realtime.send_text.assert_called_once()
+        result.wait_filler.return_value.arm.assert_called_once()
+        result.realtime.assert_called_once()
+
+
 @pytest.mark.parametrize("wake_enabled,initial_focus", [(False, False), (True, True), (True, False)])
 def test_confirmed_speech_replies_while_stt_drains(monkeypatch, wake_enabled, initial_focus):
     focus = [initial_focus]
@@ -16,7 +47,7 @@ def test_confirmed_speech_replies_while_stt_drains(monkeypatch, wake_enabled, in
 
     def read(elapsed):
         if elapsed == 1 and wake_enabled:
-            focus[0] = True  # Gaze grants focus in the current capture.
+            focus[0] = True
 
     def close():
         closing.set()
@@ -73,7 +104,6 @@ def test_punctuation_final_cannot_bypass_noise_gate(monkeypatch):
     with capture(
         monkeypatch, [(1, True, "..."), (4, False, None)], realtime=True,
     ) as result:
-        # The ordinary path owns the noise verdict, never the early reply path.
         assert all("save_history" not in call.kwargs for call in result.realtime.call_args_list)
         result.stt.close.assert_called_once()
 

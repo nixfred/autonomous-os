@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -14,10 +15,12 @@ import (
 	"go.autonomous.ai/os/system/server/config"
 )
 
-// fakeBootstrap points bootstrapBaseURL at h for the test and resets the shared
-// rate limiter so tests stay independent.
+// fakeBootstrap points bootstrapBaseURL at h and resets the rate limiter.
 func fakeBootstrap(t *testing.T, h http.HandlerFunc) {
 	t.Helper()
+	oldRegistry := serviceRegistryPath
+	serviceRegistryPath = filepath.Join(t.TempDir(), "ownership.json")
+	t.Cleanup(func() { serviceRegistryPath = oldRegistry })
 	srv := httptest.NewServer(h)
 	prev := bootstrapBaseURL
 	bootstrapBaseURL = srv.URL
@@ -69,6 +72,26 @@ func TestTriggerUpdateResolvesAgentAndRateLimits(t *testing.T) {
 	// A different target is not limited.
 	if _, err := TriggerUpdate(context.Background(), hermesCfg(), "hal"); err != nil {
 		t.Fatalf("hal trigger: %v", err)
+	}
+}
+
+// The Agent update button sends "agent"; on an OpenClaw device that must reach
+// bootstrap as openclaw instead of being rejected as an unknown target.
+func TestTriggerUpdateAgentResolvesToOpenClaw(t *testing.T) {
+	var got string
+	fakeBootstrap(t, func(w http.ResponseWriter, r *http.Request) {
+		got = r.Method + " " + r.URL.Path
+		w.WriteHeader(http.StatusOK)
+	})
+	resolved, err := TriggerUpdate(context.Background(), &config.Config{AgentRuntime: "openclaw"}, AgentTarget)
+	if err != nil {
+		t.Fatalf("trigger agent on openclaw: %v", err)
+	}
+	if resolved != "openclaw" {
+		t.Fatalf("resolved = %q, want openclaw", resolved)
+	}
+	if got != "POST /force-update/openclaw" {
+		t.Fatalf("bootstrap call = %q, want POST /force-update/openclaw", got)
 	}
 }
 

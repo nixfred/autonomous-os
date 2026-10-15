@@ -30,6 +30,11 @@ def free_port():
 
 class TestStackChanServer(unittest.TestCase):
     def test_real_driver_boots_and_controls_loopback_firmware(self):
+        for bench in (False, True):
+            with self.subTest(bench=bench):
+                self._exercise_server(bench)
+
+    def _exercise_server(self, bench):
         with tempfile.TemporaryDirectory(prefix="stackchan-hal-") as directory:
             http_port, body_port = free_port(), free_port()
             while body_port == http_port:
@@ -44,9 +49,6 @@ class TestStackChanServer(unittest.TestCase):
                 "HAL_STRANGERS_DIR": directory + "/strangers",
                 "OS_CONFIG_PATH": directory + "/missing-config.json",
             })
-            # Exercise the documented profile env-file path, not an unrelated
-            # set of hand-built process variables. Only bench connection values
-            # change; board, device and transport defaults come from the profile.
             profile_env = dotenv_values(
                 REPO_ROOT / "robots/_experimental/stackchan/rootfs/opt/hal/.env"
             )
@@ -73,8 +75,10 @@ class TestStackChanServer(unittest.TestCase):
                     return json.load(response)
 
             with open(directory + "/server.log", "w+") as log:
+                entrypoint = (["robots._experimental.stackchan.commissioning:create_app", "--factory"]
+                              if bench else ["hal.server:app"])
                 server = subprocess.Popen(
-                    [sys.executable, "-m", "uvicorn", "hal.server:app", "--host",
+                    [sys.executable, "-m", "uvicorn", *entrypoint, "--host",
                      "127.0.0.1", "--port", str(http_port), "--env-file", str(env_file)],
                     cwd=REPO_ROOT, env=env, stdout=log, stderr=subprocess.STDOUT,
                 )
@@ -101,6 +105,21 @@ class TestStackChanServer(unittest.TestCase):
                     self.assertFalse(health["camera"])
                     self.assertFalse(health["led"])
 
+                    routes = request("/openapi.json")["paths"]
+                    bench_paths = {"/stackchan/home", "/stackchan/home/position", "/stackchan/home/move",
+                                   "/stackchan/stop", "/stackchan/release"}
+                    self.assertEqual(bench_paths.intersection(routes), bench_paths if bench else set())
+                    self.assertFalse(any(path.startswith("/servo/home") for path in routes))
+                    if bench:
+                        home = request("/stackchan/home")
+                        self.assertFalse(home["connected"])
+                        self.assertFalse(home["motion_enabled"])
+                    else:
+                        for path in bench_paths | {"/servo/home", "/servo/home/position", "/servo/home/move"}:
+                            with self.assertRaises(urllib.error.HTTPError) as caught:
+                                request(path, {} if path.endswith(("/move", "/stop", "/release")) else None)
+                            self.assertEqual(caught.exception.code, 404)
+
                     with connect(
                         f"ws://127.0.0.1:{body_port}/stackchan/body/v1",
                         additional_headers={"Authorization": f"Bearer {TOKEN}"},
@@ -109,10 +128,9 @@ class TestStackChanServer(unittest.TestCase):
                             "v": 1, "type": "hello", "device_id": "stackchan-test",
                             "capabilities": ["motion.pan_tilt", "motion.measured_position",
                                              "motion.halt_hold", "motion.torque_release",
-                                             "motion.timed_move"],
+                                             "motion.timed_move", "motion.home_degrees.v1"],
                         }))
                         self.assertEqual(json.loads(ws.recv(timeout=2))["type"], "hello.accepted")
-                        # Starting the host and authenticating must not move the body.
                         with self.assertRaises(TimeoutError):
                             ws.recv(timeout=0.1)
                         commands, peer_errors = [], []
@@ -143,6 +161,11 @@ class TestStackChanServer(unittest.TestCase):
                         peer.start()
                         try:
                             self.assertTrue(request("/health")["servo"])
+                            if bench:
+                                home = request("/stackchan/home")
+                                self.assertTrue(home["connected"])
+                                self.assertTrue(home["supported"])
+                                self.assertEqual(commands, [])
                             moved = request("/servo/move", {
                                 "positions": {"base_yaw.pos": 10}, "duration": 0.05,
                             })
@@ -150,7 +173,7 @@ class TestStackChanServer(unittest.TestCase):
                             self.assertEqual(moved["duration"], 1.0)
                             move = next(m for m in commands if m["op"] == "motion.move")
                             self.assertEqual(move["args"]["duration_ms"], 1000)
-                            self.assertEqual(request("/servo/stop", {})["status"], "ok")
+                            self.assertEqual(request("/stackchan/stop" if bench else "/servo/stop", {})["status"], "ok")
                             self.assertIn("motion.halt", [m["op"] for m in commands])
                         finally:
                             ws.close()

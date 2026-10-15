@@ -97,7 +97,7 @@ User says "Lamp, nhìn xem" / "look at me" / "camera on" → agent calls `[HW:/c
 
 ### 7. Telegram/web chat with visual context needed
 
-Agent needs snapshot (camera skill) → one shell call checks `GET /camera` first: `disabled` → the agent answers "camera is off" and stops (no auto-enable, no capture); `has_frame: false` → "camera is not working" and stops; otherwise `POST /api/vision/look` captures and describes. The check rides in the same tool call so it adds no model round.
+Agent needs snapshot (camera skill) → one shell call checks `GET /camera` first: `disabled` → the agent answers "camera is off" and stops (no auto-enable, no capture); `has_frame: false` → "camera is not working" and stops; otherwise `POST /api/vision/look` captures and answers the question (thinking off; `"read_text": true` only for reading text/labels/brands, which uses a 1280px frame and thinking). The check rides in the same tool call so it adds no model round. On a voice turn `/api/vision/look` says a short line before the photo ("Taking a look.") and another once it is taken ("Got it — give me a sec."), so the user knows when the picture was taken during the long describe wait. For "turn left/right and tell me what you see" the same shell call aims after the check and before the look (`servo-control` skill), so a camera that is off means no movement. `/api/vision/look` holds the body under HAL's internal `look` owner from the first cue through the photo, then releases it. The agent never calls `/servo/hold` in a turn-and-look ("hold it there" there means the look's own hold); it holds only for a pose request without a look.
 
 ## Manual Override
 
@@ -269,6 +269,6 @@ Both ISP watchdogs (freeze and color corruption) share one escalation ladder via
 
 - **Guard mode + camera off**: ✅ Done — guard SKILL.md step 1: `[HW:/camera/enable:{}]` before enabling guard. Overrides manual disable.
 - **Face enroll while camera off**: `/face/enroll` uses uploaded image, not live camera. No conflict.
-- **Snapshot request while camera off**: Return 503 with message "Camera disabled". Agent handles gracefully.
+- **Snapshot request while camera manually disabled or privacy-locked**: Return 409. Automatic pauses still allow temporary snapshots; concurrent snapshot requests serialize capture so their temporary stops cannot interrupt each other.
 - **Multiple rapid triggers**: Debounce camera start/stop — don't restart if already starting. `camera_capture.start()` already handles "already started" case.
 - **Sound spike false positive loop**: After sound spike auto-on, if no face detected within 30s → auto-off again. Prevents camera staying on from random noise.

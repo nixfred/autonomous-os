@@ -1,12 +1,5 @@
-"""A trigger the live noise-guard rejects must not erase the pre-roll.
-
-Device-observed on lamp-0c4e (ReSpeaker Lite) 2026-09-21: "Play song for me
-again" — the plosive "Play" opened a trigger the guard scored as noise (span
-0.32s, voiced 0.21) and skipped; "song for me again" re-triggered ~100ms later
-with pre-roll=0 because the skip path had cleared the lookback, so Gemini heard
-'song for me again.'. The lookback is a bounded deque, so keeping it after a
-skip costs nothing and the next trigger carries the rejected word.
-"""
+import threading
+"""A trigger the live noise-guard rejects must not erase the pre-roll."""
 
 from unittest.mock import Mock, patch
 
@@ -27,24 +20,34 @@ def test_pre_roll_after_skipped_trigger_keeps_the_rejected_frames(monkeypatch, f
     mic.read.side_effect = lambda _: (next(frames), False)
 
     service = Mock()
+    service._automatic_reply_lock = threading.Lock()
+    service._automatic_reply_stop = None
+    service._automatic_reply_cancelled_at = None
     service._running = True
+    service._stt_drain_worker = None
+    service._stt_drain_future = None
     service._np = np
     service._tts_is_speaking.return_value = False
     service._music_is_playing.return_value = False
     service._backchannel.self_audio_active = False
     service._webrtcvad_is_speech.return_value = True
+    # Exercise the real entry gates. A bare Mock makes the newly introduced
+    # hardware-AEC predicate truthy and incorrectly selects its 160 ms holdoff.
+    service._live_gate = None
+    service._hardware_aec_live_entry = module.VoiceService._hardware_aec_live_entry.__get__(service)
+    service._vad_entry_is_speech = module.VoiceService._vad_entry_is_speech.__get__(service)
     service._silero_vad = None  # energy + webrtc gate only; Silero is opt-in
     service._live_decision.side_effect = [first_decision, "live"]
-    service._live_session.return_value = True  # ends the loop
+    service._live_session.return_value = True
 
     monkeypatch.setattr(module.voice_cfg, "STT_KEEPALIVE", False)
     monkeypatch.setattr(module.voice_cfg, "WARM_MIC", True)
     monkeypatch.setattr(module.voice_cfg, "LIVE_MODE", True)
     monkeypatch.setattr(module.voice_cfg, "RMS_THRESHOLD", 0)
     monkeypatch.setattr(module.voice_cfg, "SPEECH_HOLDOFF_S", 0.0)
+    monkeypatch.setattr(module.voice_cfg, "SESSION_COOLDOWN_S", 0.0)
     monkeypatch.setattr(module.voice_cfg, "PRE_ROLL_FRAMES", 12)
-    with patch.object(module, "read_voice_mode", return_value={}), \
-         patch.object(module, "bypass_realtime", return_value=False), \
+    with patch.object(module, "read_voice_mode", return_value={"enabled": False, "generation": 0}), \
          patch.object(module, "resample_to_stt", side_effect=lambda f, *a: f):
         module.VoiceService._vad_loop(service, mic, 320, 16000)
 
@@ -56,3 +59,6 @@ def test_pre_roll_after_skipped_trigger_keeps_the_rejected_frames(monkeypatch, f
     else:
         # A session that actually opened ends the loop on the first trigger.
         assert values == [1000]
+    expected_triggers = 2 if first_decision == "skip" else 1
+    assert service._webrtcvad_is_speech.call_count == expected_triggers
+    assert service._live_decision.call_count == expected_triggers

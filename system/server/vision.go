@@ -2,23 +2,44 @@ package server
 
 import (
 	"encoding/base64"
+	"log/slog"
 	"net/http"
 	"os"
+	"time"
 
 	"github.com/gin-gonic/gin"
 
 	"go.autonomous.ai/os/system/lib/hal"
+	sensinghttp "go.autonomous.ai/os/system/server/sensing/delivery/http"
 	"go.autonomous.ai/os/system/server/serializers"
 	"go.autonomous.ai/os/system/vision"
 )
 
 // lookWidth/lookQuality shrink the JPEG (~50-80 KB instead of ~300-500 KB at
-// full 1920x1080) so the vision model uploads and tokenizes faster. 768 px wide
-// still reads text on a laptop screen and recognizes people and objects.
-// Server-side so the agent cannot drop them by paraphrasing the skill.
+// full 1920x1080) so the vision model uploads and tokenizes faster.
+// A read_text look uses lookReadWidth: at 768 px small labels are illegible.
 const (
-	lookWidth   = 768
-	lookQuality = 75
+	lookWidth     = 768
+	lookReadWidth = 1280
+	lookQuality   = 75
+)
+
+// The spoken cue before the photo is a cached phrase of about a second; these
+// bound how long the shutter waits for it so a stuck speaker never stalls a look.
+const (
+	cueMaxWait    = 2500 * time.Millisecond
+	cueStartGrace = 600 * time.Millisecond
+)
+
+// Seams for tests.
+var (
+	cueSpeakerBusy      = hal.SpeakerBusy
+	cuePoll             = 100 * time.Millisecond
+	lookClaimHold       = hal.ClaimLookHold
+	lookReleaseHold     = hal.ReleaseLookHold
+	lookSnapshot        = hal.Snapshot
+	lookSayCue          = sensinghttp.DefaultFillerManager.SayInVoiceRun
+	lookModelSeesImages = vision.ModelSupportsVision
 )
 
 // lookRequest is the body of POST /api/vision/look.
@@ -26,38 +47,59 @@ type lookRequest struct {
 	// Question is what the user asked, so the vision model answers it instead
 	// of narrating the frame generically. Optional.
 	Question string `json:"question"`
+	// ReadText asks to read text, labels or a brand: a sharper frame and the
+	// vision model's thinking, ~3x slower. Optional.
+	ReadText bool `json:"read_text"`
 }
+
+// lookFailedHint leads the describe-failure error: the agent reads the tool
+// output when it picks its next step, and a skill rule alone did not stop it from
+// re-snapshotting into vision_analyze (same vision model, +22-88 s on lamp-52e6).
+const lookFailedHint = "The vision model could not answer in time. Tell the user you couldn't see it this time and stop: " +
+	"do not take another snapshot or call vision_analyze or any other image tool, they use the same model. "
 
 // lookAndDescribe captures a frame and hands back text the agent can actually
 // read — one call, no branching for the agent to get wrong.
-//
-// Why this exists: the describe-first gate in the sensing handler only covers
-// images that enter a turn from OUTSIDE (a chat/Telegram attachment, HAL's
-// realtime look-frame handoff). When the agent looks around DURING a turn —
-// "turn right and tell me what you see" — HAL's /camera/snapshot hands back
-// only `{"path": ...}`, and a text-only main model (Auto-AI) can never see the
-// file. Observed on lamp-0c89 2026-09-04: the agent aimed the servo, saved a
-// valid frame, then invented a description of it ("pretty dark, just shadows").
-//
-// The vision-capability branch lives HERE rather than in the skill: when the
-// main model can read images itself, describing would be a wasted 8-38s round
-// trip that also throws away detail, but that is the server's business, not
-// something the agent should have to decide mid-turn. It gets `description`
-// when it needs one and `path` either way.
-//
-// Loopback-only: the caller is the agent's own shell tool on the device, and
-// the call moves hardware and spends a vision-model call.
 func (s *Server) lookAndDescribe(c *gin.Context) {
 	var req lookRequest
-	// Body is optional — a bare POST is a valid "just look".
 	_ = c.ShouldBindJSON(&req)
 
-	path, err := hal.Snapshot(lookWidth, lookQuality)
+	// Hold the pose from the cue through the shutter, so an idle or still-emotion
+	// timer cannot swing the head mid-photo. Best effort: an older HAL has no look
+	// owner, and the look then runs unheld as before.
+	held := true
+	if err := lookClaimHold(); err != nil {
+		held = false
+		slog.Info("look hold unavailable, capturing unheld", "component", "vision", "error", err)
+	}
+	release := func() {
+		if !held {
+			return
+		}
+		if err := lookReleaseHold(); err != nil {
+			slog.Warn("look hold release failed", "component", "vision", "error", err)
+		}
+	}
+
+	// On a voice turn, say that a photo is coming and let the line finish before
+	// the shutter; then say it was taken, since describing it takes far longer.
+	if lookSayCue("look_capturing_main") {
+		waitForCue(cueMaxWait, cueStartGrace)
+	}
+	width := lookWidth
+	if req.ReadText {
+		width = lookReadWidth
+	}
+	path, err := lookSnapshot(width, lookQuality)
 	if err != nil {
+		release()
 		c.JSON(http.StatusBadGateway, serializers.ResponseError("snapshot failed: "+err.Error()))
 		return
 	}
-	if vision.ModelSupportsVision(s.config) {
+	lookSayCue("look_analyzing")
+	// Idle or the due animation resumes while the photo is described.
+	release()
+	if lookModelSeesImages(s.config) {
 		c.JSON(http.StatusOK, serializers.ResponseSuccess(gin.H{"path": path}))
 		return
 	}
@@ -66,12 +108,25 @@ func (s *Server) lookAndDescribe(c *gin.Context) {
 		c.JSON(http.StatusBadGateway, serializers.ResponseError("snapshot not readable"))
 		return
 	}
-	desc, err := vision.DescribeWithRetry(s.config, base64.StdEncoding.EncodeToString(data), req.Question)
+	desc, err := vision.LookWithRetry(s.config, base64.StdEncoding.EncodeToString(data), req.Question, req.ReadText)
 	if err != nil {
-		// Fail LOUD, not with an empty description: the skill tells the agent to
-		// admit it could not see rather than guess, which is the whole point.
-		c.JSON(http.StatusBadGateway, serializers.ResponseError("describe failed: "+err.Error()))
+		c.JSON(http.StatusBadGateway, serializers.ResponseError(lookFailedHint+"describe failed: "+err.Error()))
 		return
 	}
 	c.JSON(http.StatusOK, serializers.ResponseSuccess(gin.H{"path": path, "description": desc}))
+}
+
+// waitForCue blocks until the speaker has played the cue and gone quiet. It
+// gives up after startGrace if speech never starts, and after maxWait overall.
+func waitForCue(maxWait, startGrace time.Duration) {
+	start := time.Now()
+	started := false
+	for time.Since(start) < maxWait {
+		if cueSpeakerBusy() {
+			started = true
+		} else if started || time.Since(start) >= startGrace {
+			return
+		}
+		time.Sleep(cuePoll)
+	}
 }

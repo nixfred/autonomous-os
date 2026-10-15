@@ -17,19 +17,29 @@ Khi OS server chưa được cấu hình (`SetUpCompleted = false`), thiết b�
       early-capture publish IP LAN (STA) vào setup state ngay khi wlan0 có
       IP (trước cả khi có internet), để Web UI đọc được lúc AP còn sống
       trong giây lát (xem "Tự Động Chuyển Hướng AP→STA")
-   b. Chờ internet (poll 60s)
-   c. Lưu config
+   b. Chờ internet (tối đa 60s tính theo đồng hồ; ICMP tới 8.8.8.8, nếu không
+      được thì bắt tay TLS với host cloud API — cho mạng chặn ICMP)
+   c. Lưu config, rồi đồng bộ lại đồng hồ (không có RTC: thiết bị khởi động
+      với giờ cũ và mọi lệnh TLS lỗi "certificate is not yet valid"): chrony
+      `online` + `refresh` (resolve lại tên NTP pool bị lỗi lúc ở AP mode) +
+      `burst`, hoặc restart systemd-timesyncd; chờ tối đa 15s tới khi
+      `NTPSynchronized`, nếu chưa thì tiếp tục đồng bộ ở background
+      (`system/lib/clocksync`). Ping backend về sau mà lỗi hiệu lực certificate
+      cũng khởi động đồng bộ lại ở background, tối đa mỗi phút một lần. Ảnh
+      OrangePi ghi giờ lúc build vào `/etc/fake-hwclock.data`, nên thiết bị mới
+      không bao giờ khởi động với giờ sớm hơn lúc build ảnh
    d. Ping backend sớm (fire-and-forget HTTP POST {llm_base}/ping, status
       "setting_up") — publish IP LAN mới (local_ip) lên backend mà KHÔNG chờ
       bước setup agent bên dưới, để trang đã mở popup Setup có thể tra IP và
       cứu cú redirect
    e. Setup agent gateway
    f. Chờ agent ready (poll 120s)
-   g. SetUpCompleted = true; xoá LED trắng setup tạm thời để nó không bị giữ
-      thành user LED preference và strip quay về ambient resting look (hiện
-      đang tối/tắt)
+   g. Lưu SetUpCompleted = true; chờ chuẩn bị runtime (tối đa 5 phút): agent
+      ổn định, restart HAL nếu cần, health HAL, khởi động voice đã cấu hình.
+      Sau đó mới xóa LED setup tạm và khôi phục lựa chọn đèn nghỉ.
    h. Ping backend (status "working", setup_completed=true)
-7. Nếu thất bại → quay lại AP mode
+7. Lỗi network/agent setup → quay lại AP mode; lỗi chuẩn bị runtime giữ
+   kết nối LAN và báo lỗi setup
 8. Web UI tự chuyển hướng browser sang http://<lan_ip>/setup ngay khi
    operator đã về Wi-Fi nhà (IP-first; mDNS .local là fallback discovery
    cuối cùng khi AP chết trước lúc đọc được lan_ip)
@@ -41,15 +51,16 @@ Khi OS server chưa được cấu hình (`SetUpCompleted = false`), thiết b�
 
 ```json
 {
-  "network_ssid": "MyWiFi",
-  "network_password": "...",
-  "llm_provider": "anthropic",
+  "device_id": "lamp-a1b2",
+  "ssid": "MyWiFi",
+  "password": "...",
   "llm_api_key": "sk-...",
   "llm_base_url": "https://api.anthropic.com",
   "llm_model": "claude-haiku-4-5-20251001",
-  "channel_type": "telegram",
-  "channel_token": "...",
-  "channel_id": "...",
+  "channel": "telegram",
+  "telegram_bot_token": "...",
+  "telegram_user_id": "...",
+  "admin_password": "...",
   "mqtt_endpoint": "broker.example.com",
   "mqtt_port": 8883,
   "mqtt_username": "...",
@@ -60,15 +71,21 @@ Khi OS server chưa được cấu hình (`SetUpCompleted = false`), thiết b�
 }
 ```
 
+Các field lấy từ `SetupRequest` trong `system/domain/device.go`. `device_id`, `llm_api_key` và `llm_base_url` có tag `validate:"required"`; mọi field khác là tuỳ chọn. `ssid` có thể để trống (đường wired/ethernet, xem bên dưới). `channel` là `telegram` (mặc định khi để trống), `slack`, `discord` hoặc `imessage`; các field credential tương ứng là `telegram_bot_token`/`telegram_user_id`, `slack_bot_token`/`slack_app_token`/`slack_user_id`, `discord_bot_token`/`discord_guild_id`/`discord_user_id`, hoặc `bluebubbles_server_url`/`bluebubbles_password`/`bluebubbles_user_address`. Override voice tuỳ chọn: `stt_api_key`, `tts_api_key`, `stt_base_url`, `tts_base_url`, `stt_language`, `tts_provider`, `tts_voice`.
+
+**Ai được nhắn bot Telegram.** Bot Telegram chỉ nhận tin từ `telegram_user_id`. Có bot token mà thiếu user ID thì không ai nhắn được (OpenClaw dùng `dmPolicy: allowlist` với `allowFrom` rỗng và gỡ `"*"` cũ; PicoClaw để kênh tắt; Hermes, Codex, Claude Code và OpenCode vốn đã từ chối mọi người gửi trong trường hợp này). Bot mở cho mọi người sẽ cho bất kỳ ai tìm thấy nó ra lệnh cho thiết bị, kể cả chụp ảnh camera.
+
+Tiếng Nhật dùng `stt_language: "ja"`. Setup có Japanese (日本語), các câu đăng ký giọng tiếng Nhật và sáu voice ElevenLabs chọn lọc; mặc định là Shizuka. Xem [danh mục giọng Nhật](realtime-voice_vi.md#tiếng-nhật-và-giọng-elevenlabs).
+
 **Response:** Trả về ngay `{"status": 1}`. Setup chạy async trong goroutine sau 2s delay.
 
-**Messaging channel:** Toàn bộ cấu hình Telegram, Slack hoặc Discord là tuỳ chọn ở lần setup đầu. Không gửi chúng không chặn setup; có thể cấu hình channel sau qua `POST /api/device/channel`. Credential gửi cùng `POST /api/device/setup` vẫn đi theo luồng setup hiện tại nhưng không được validate theo channel tại đây; `POST /api/device/channel` sẽ validate credential bắt buộc của channel được chọn.
+**Messaging channel:** Toàn bộ cấu hình Telegram, Slack, Discord hoặc iMessage là tuỳ chọn ở lần setup đầu. Không gửi chúng không chặn setup; có thể cấu hình channel sau qua `POST /api/device/channel`. Credential gửi cùng `POST /api/device/setup` vẫn đi theo luồng setup hiện tại nhưng không được validate theo channel tại đây; `POST /api/device/channel` sẽ validate credential bắt buộc của channel được chọn.
 
 **Admin password mặc định:** `admin_password` là optional. Khi để trống ở first-time setup (`SetUpCompleted=false` và chưa có `AdminPasswordHash`), handler mặc định lấy suffix 4 ký tự từ `device.GetDeviceMac()` — cùng suffix mà `scripts/provision/setup-ap.sh` dùng cho AP SSID (`<DEVICE_TYPE>-<xxxx>`). Suffix in trên nhãn dán dưới đế thiết bị, nên user có thể sign in trang admin mà không cần tự đặt password lúc setup. Web UI Setup V2 ẩn hẳn field DEVICE PASSWORD và dựa vào default này; V1 (Device step riêng) vẫn bắt user chọn. Fail 400 (`device hardware ID unreadable`) khi `GetDeviceMac()` trả empty (không có env `DEVICE_TYPE`, không có serial, không có eth MAC) — silent fallback sẽ khiến mọi device không identify được đều có cùng một password well-known.
 
 ### POST /api/device/channel
 
-Thay đổi messaging channel sau khi đã setup. Chấp nhận `telegram`, `slack`, `discord`.
+Thay đổi messaging channel sau khi đã setup. Chấp nhận `telegram`, `slack`, `discord`, `imessage`. Channel mà runtime đang chạy không hỗ trợ sẽ bị reject với `400 <channel> not supported on the active runtime` (hiện `imessage` chỉ chạy trên Hermes).
 
 **WhatsApp bị reject ở đây** (`400 whatsapp pairing not supported via HTTP; use MQTT add_channel`) — WhatsApp pairing stream rotating QR về caller, HTTP fire-and-forget không carry được. Đường chính tắc là MQTT `add_channel` command (xem `docs/mqtt.md`) — thiết bị publish một message fd_channel cho mỗi pairing event. Re-pair không re-bootstrap dùng MQTT `whatsapp_pair` command.
 
@@ -83,8 +100,11 @@ Toàn bộ phần sau đó (LLM config, channel, agent setup, `SetUpCompleted`) 
 1. Gọi `connect-wifi` CLI tool với SSID + password
 2. Poll kiểm tra:
    - SSID match? (`iwgetid`)
-   - Internet OK? (`ping`)
-3. Timeout 60s → fail
+   - Internet OK? (`ping 8.8.8.8`, nếu không được thì bắt tay TLS với host cloud
+     API của thiết bị — `system/network/reachability.go`)
+3. Timeout 60s tính theo đồng hồ → fail. (Trước đây đếm 60 lần thử, mà mỗi lần
+   ping thất bại chờ 5s, nên mạng chặn ICMP khiến thiết bị thử tới ~6 phút trong
+   khi web client đã bỏ cuộc sau 80s.)
 4. Thành công → lưu SSID + password vào config
 
 `connect-wifi` kết thúc bằng việc chạy `device-sta-mode` — đó chính là chỗ tắt AP.
@@ -182,7 +202,7 @@ setup bằng dây) mới vào được nhánh dây theo cách đó.
   vào được từ LAN dây qua `http://<device_type>-<suffix>.local/` chứ không chỉ
   `192.168.100.1` của AP. Chính địa chỉ dây đó là thứ khiến luồng setup-bằng-dây bên
   dưới khả thi.
-- **Tín hiệu LED:** ngay khi HTTP server bắt đầu listen, nếu `SetUpCompleted == false` thì OS server spawn goroutine background (`waitAndPaintSetupReady` trong `server/server.go`) poll `GET /health` của HAL mỗi giây tối đa 30s. Khi `health.led == true` thì gửi `POST /led/status` với state `setup`; HAL resolve state này thành strip trắng solid. Poll vì os-server bind :5000 thường nhanh hơn HAL FastAPI bind :5001 trên cold boot (Python load `rpi_ws281x`, SPI, audio, camera) — fire-and-forget paint sẽ rớt im lặng với `connection refused`. Trắng này chỉ là **cue tạm thời cho AP/pre-setup**, không phải user preference: sau `POST /api/device/setup` thành công, saved LED state của nó bị xoá và strip settle về ambient resting look (hiện đang tối/tắt). Blue-breathing booting vẫn show trong lúc init.
+- **Tín hiệu LED:** ngay khi HTTP server bắt đầu listen, nếu `SetUpCompleted == false` thì OS server spawn goroutine background (`waitAndPaintSetupReady` trong `system/server/config_watch.go`) cho thiết bị có capability light. Worker gọi HAL `POST /led/status` với state `setup` ngay lần đầu, rồi retry sau 1, 2, 4, 8 và tối đa 10 giây giữa các lần thử, không bỏ cuộc ở mốc 30 giây. LED API có thể nhận lệnh trước khi HAL health đầy đủ; HAL resolve state `setup` thành strip trắng solid. Lỗi HTTP hoặc thiếu xác nhận `status: "ok"` sẽ được retry. Worker dừng sau xác nhận, khi thấy setup hoàn tất, hoặc server shutdown (đồng thời hủy HTTP đang chờ). Trạng thái setup được kiểm tra trước mỗi lần gửi lệnh LED và sau request lỗi. Poll vì os-server bind :5000 thường nhanh hơn HAL FastAPI bind :5001 trên cold boot (Python và driver LED vẫn cần thời gian khởi tạo) — fire-and-forget paint sẽ rớt im lặng với `connection refused`. Trắng này chỉ là **cue tạm thời cho AP/pre-setup**, không phải user preference: sau `POST /api/device/setup` thành công, HAL xoá cue LED có `source: "status:setup"` khi nhận lệnh `/led/off` hiện có và restore lựa chọn đèn nghỉ của user (hoặc preset của device), thay vì lưu thành lệnh OFF của user. Blue-breathing booting vẫn show trong lúc init.
 - **Khử nhiễu LED trong AP mode:** openclaw WS reconnect loop (`runtimes/openclaw/service_ws.go`) skip Set/Clear `StateAgentDown` khi `config.SetUpCompleted == false`, để overlay cyan disconnect không đè lên trắng setup-needed lúc provisioning. WS vẫn chạy (`device.Setup` cần nó ready để `WaitForAgentReady` pass trước khi flip `SetUpCompleted=true`), chỉ gate side-effect LED thôi.
 - **Tín hiệu LED khi join Wi-Fi (`StateWifiConnecting`):** ngay khi setup handler vào `device.Setup()`, kích hoạt `statusled.StateWifiConnecting` (HAL preset `wifi_connecting` = blink màu xanh dương `[0,135,255]` speed 0.5) để ring chuyển từ trắng setup sang blink xanh trong lúc `wlan0` associate. `defer` trong `Setup()` clear state ở mọi return path, nên fail rồi rớt xuống `SwitchToAPMode()` cũng không để strip kẹt blink. Priority nằm trên `Booting` và dưới `OTA`/`Error`/`Connectivity` — tín hiệu này thắng state boot còn sót lại nhưng không che khuất fault thật. Device không có capability `light` sẽ short-circuit trong statusled (no-op).
 
@@ -483,14 +503,29 @@ Cả hai đường vẫn bắn `setup_failed` qua bridge. Màn hình chỉ bị 
 effect thường gửi nó bị gate bởi `setupWorking`, thứ mà đường này cố tình không
 bật.
 
-**Chưa xử lý.** Lý do từ phía thiết bị vẫn còn thô: `SetupNetwork` chỉ poll
-`CheckInternet()` + so khớp SSID, nên sai mật khẩu, mạng chỉ có 5GHz, và router
-từ chối client đều hiện ra như nhau là
-`"no internet or SSID did not match within 60s"` sau trọn 60s.
-`wpa_supplicant` biết ngay sự khác nhau (`4WAY_HANDSHAKE_FAILED`, `WRONG_KEY`);
-đọc `wpa_cli status` trong vòng poll sẽ fail trong ~5s với nguyên nhân chính xác
-— lúc đó AP vẫn còn sống nên phase poll sẽ chuyển được nó về, và timeout ở trên
-sẽ trở thành fallback hiếm dùng thay vì con đường chính.
+**Lý do setup thất bại.** Mọi lần setup thất bại đều được log với trường cố định
+`setup_failure_reason` — ở dòng `network setup failed` (component `network`) cho bước
+join WiFi, và ở dòng `setup failed` (component `device`) cho mọi bước — để gom nhóm
+theo nguyên nhân trên Graylog (`_exists_:setup_failure_reason AND spooled:true` ra các lần
+được replay sau khi thiết bị online). Bước join WiFi được phân loại từ chính log của
+`wpa_supplicant` cho lần thử đó cùng trạng thái quan sát được cuối cùng
+(`system/network/setup_failure.go`):
+
+| `setup_failure_reason` | Dấu hiệu | Thông báo trên màn hình setup |
+|---|---|---|
+| `wrong_password` | `4-Way Handshake failed` / `CTRL-EVENT-SSID-TEMP-DISABLED … reason=WRONG_KEY` | sai mật khẩu WiFi: router từ chối key |
+| `association_rejected` | `CTRL-EVENT-ASSOC-REJECT`, `reason=AUTH_FAILED`/`CONN_FAILED` | router từ chối kết nối |
+| `ssid_not_found` | `CTRL-EVENT-NETWORK-NOT-FOUND`, hoặc không hề thử associate | không tìm thấy mạng WiFi: ngoài vùng phủ hoặc kênh thiết bị không dùng được |
+| `no_dhcp` | `wpa_state=COMPLETED` nhưng router không cấp địa chỉ | đã vào WiFi nhưng router không cấp IP |
+| `no_internet` | có địa chỉ trên đúng SSID nhưng cả ICMP lẫn probe TLS tới cloud đều không ra được | đã vào WiFi nhưng không có internet (captive portal hoặc firewall?) |
+| `ssid_too_long` / `wifi_connect_error` | SSID quá 32 byte / helper `connect-wifi` lỗi | như trước |
+| `agent_setup_failed` / `agent_timeout` | không setup được agent runtime / agent không bao giờ sẵn sàng (sau khi join WiFi) | như trước |
+| `unknown` | không xác định được trường hợp nào ở trên | no internet or SSID did not match within 60s |
+
+Key bị từ chối thì fail nhanh: khi `wpa_supplicant` đã từ chối 2 lần, vòng lặp dừng
+thay vì chờ hết 60s. Dòng `network setup failed` còn mang `wpa_state`, `has_ip`,
+`ssid_matched`, `wrong_key_failures` và `elapsed_s`. Mạng 5 GHz không phải nguyên
+nhân lỗi trên phần cứng Intern 2 — bản ghi sai mật khẩu ở trên là trên mạng 5745 MHz.
 
 ### Đánh dấu bước Wi-Fi đã xong sau khi reload
 
@@ -610,7 +645,22 @@ tiên — bị chặn khi một deep-link hash hợp lệ đã được honor (`
 
 ## Post-Setup
 
-Sau khi `SetUpCompleted = true`:
+Onboarding lưu `SetUpCompleted = true` khi cấu hình xong để kích hoạt startup
+worker hiện có. Request onboarding sau đó đợi tối đa **5 phút** để worker hoàn
+tất restart HAL (nếu cấu hình thay đổi), kiểm tra health HAL và khởi động voice
+đã cấu hình. Trong thời gian này `/api/device/setup/status` trả
+`runtime_phase: "preparing"`, `set_up_completed: false`. Network
+`phase: "connected"` chỉ có nghĩa Wi-Fi đã kết nối, chưa có nghĩa voice sẵn sàng.
+
+Web setup hiển thị “Preparing your robot’s voice…” và giữ màn hình này khi
+chuyển từ AP sang LAN hoặc reload. Chỉ khi `runtime_phase: "ready"` mới cho
+hoàn tất wizard; lỗi runtime trả `runtime_phase: "failed"` kèm lỗi và nút quay
+lại setup. Lỗi runtime giữ kết nối LAN đang hoạt động, không chuyển lại hotspot.
+Backend ping vẫn là `setting_up` cho tới khi sẵn sàng; sau đó setup mới xóa LED
+tạm và báo hoàn tất. Luồng boot bình thường, OTA và restart khi đổi cấu hình
+ngoài onboarding giữ nguyên hành vi.
+
+Startup worker được kích hoạt bởi cờ đã lưu thực hiện:
 1. Kết nối OpenClaw WebSocket
 2. Kết nối MQTT (subscribe fa_channel)
 3. Start voice pipeline (nếu có Deepgram key)
@@ -619,21 +669,19 @@ Sau khi `SetUpCompleted = true`:
 
 ## Config
 
-Config lưu tại `config/config.json`. Managed bởi `server/config/config.go`.
+Config lưu tại `config/config.json`. Managed bởi `system/server/config/config.go`.
 
 | Field | Mô tả |
 |-------|-------|
-| `SetUpCompleted` | `true` khi setup xong |
+| `SetUpCompleted` | Cờ cấu hình đã hoàn tất trên đĩa; trạng thái onboarding công khai còn đợi runtime sẵn sàng |
 | `NetworkSSID` | WiFi SSID |
 | `NetworkPassword` | WiFi password |
-| `LLMProvider` | anthropic, openai, google, ... |
-| `LLMApiKey` | API key cho LLM |
-| `LLMBaseUrl` | LLM API base URL |
+| `LLMAPIKey` | API key cho LLM |
+| `LLMBaseURL` | LLM API base URL |
 | `LLMModel` | Model name |
-| `ChannelType` | telegram, slack |
-| `ChannelToken` | Channel bot token |
-| `ChannelID` | Channel/chat ID |
-| `DeepgramApiKey` | Deepgram STT API key |
+| `Channel` | telegram (mặc định khi trống), slack, discord, whatsapp, imessage |
+| `TelegramBotToken` / `TelegramUserID` | Credential Telegram (Slack/Discord/WhatsApp/BlueBubbles có field riêng `Slack*`, `Discord*`, `WhatsappUserID`, `Bluebubbles*`) |
+| `DeepgramAPIKey` | Deepgram STT API key |
 | `LocalIntent` | Enable/disable local intent matching (default: true) |
 | `MQTTEndpoint` | MQTT broker host |
 | `MQTTPort` | MQTT broker port |
@@ -706,3 +754,36 @@ listener đầy đủ nằm ở phần header của file `lib/setupBridge.ts`.
 | `system/server/config/config.go` | Config load/save |
 | `scripts/imager/build-orangepi.sh`, `scripts/imager/build.sh`, `scripts/provision/setup.sh` | nginx config bake vào image (gồm CSP `connect-src`) |
 | `scripts/maintenance/patch-security.sh` | Patch bảo mật OTA cho thiết bị đã provision (migrate CSP) |
+
+### Credentials iMessage khi setup
+
+Setup và Wi-Fi provisioning nhận URL server BlueBubbles, mật khẩu và địa chỉ người vận hành khi `channel=imessage`. Credentials phải được lưu trước khi setup runtime; Wi-Fi provisioning chuyển credentials đã lưu vào `SetupAgent`. Hermes đọc config đã lưu qua presync.
+
+## Log setup lên được Graylog kể cả khi setup thất bại
+
+Lần setup đầu chạy khi chưa có device key và, trước khi join WiFi, chưa có
+internet, nên setup thất bại trước đây **không gửi được gì**: os-server và HAL chỉ
+bật log relay lúc process khởi động, bootstrap không bao giờ bật, và record không
+gửi được thì bị drop. Hiện tại:
+
+- **Spool từ lúc boot.** os-server, bootstrap và HAL ghi các record chưa gửi được —
+  chưa có key, chưa có internet, relay hoặc collector lỗi — vào spool trên đĩa có
+  giới hạn trong `OS_GELF_SPOOL_DIR` (mặc định `/var/lib/autonomous/gelf-spool` — trên thẻ
+  SD, không phải `/var/log` vốn nằm trong RAM (zram) trên thiết bị — nên rút điện
+  vẫn giữ): `<service>.jsonl` + `<service>.1.jsonl`, tối đa 1 MiB mỗi
+  service, bỏ record cũ nhất trước.
+- **Bật ngay khi có key.** os-server bật lại relay từ config-change listener (ngay
+  lúc setup lưu key, và khi re-setup thay key); bootstrap và HAL đọc lại
+  `config.json` mỗi phút / 30s. Chỉ dùng credential Autonomous của thiết bị, không
+  bao giờ gửi tới provider riêng của chủ máy.
+- **Replay đúng thứ tự.** Khi gửi thành công, spool được xả trước log live, có giãn
+  nhịp (~10 record/s — cloud relay drop im lặng khi vượt trần in-flight), mỗi record
+  gắn `_spooled: "true"` và được chuyển từ host tạm lúc chưa có config sang device
+  id, nên lần setup hỏng hiện ra dưới thiết bị, cạnh lần setup thành công.
+- **Không bao giờ gửi record của thiết bị khác.** Replay chỉ gửi record ghi trước khi
+  có device id hoặc dưới device id hiện tại; record dưới id khác (lần setup trước
+  hoặc chủ máy trước) bị bỏ, không bao giờ gửi bằng key hiện tại. Factory reset cũng
+  xóa `OS_GELF_SPOOL_DIR`.
+
+Thiết bị không bao giờ online lại thì không gửi được spool; nó nằm trên máy cho tới
+khi thiết bị online.

@@ -9,7 +9,7 @@ export interface NetworkItem {
   security: string;
 }
 
-export type ChannelType = "telegram" | "slack" | "discord";
+export type ChannelType = "telegram" | "slack" | "discord" | "imessage";
 
 /** Initial setup may defer messaging-channel configuration entirely. */
 export type SetupChannelType = ChannelType | "none";
@@ -49,8 +49,6 @@ export interface SetupRequest {
   fd_channel?: string;
   /** Disable extended thinking/reasoning for all LLM models (default false). */
   llm_disable_thinking?: boolean;
-  /** Admin password the operator picks at setup. Server bcrypts it into
-   *  config.admin_password_hash and uses it to gate post-setup browser
-   *  access via /api/login. Empty allowed (legacy clients). */
+  /** Admin password the operator picks at setup. */
   admin_password?: string;
 }

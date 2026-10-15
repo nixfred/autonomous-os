@@ -3,6 +3,7 @@ import { getApiToken, withApiToken } from "@/lib/api";
 import { S } from "./styles";
 import { API } from "./types";
 import { StatusBadge } from "./components";
+import "./technical-panels.css";
 
 type LogSource = "hal" | "os-server" | "bootstrap" | "openclaw" | "openclaw-service" | "buddy";
 const LOG_SOURCES: { id: LogSource; label: string; color: string }[] = [
@@ -17,9 +18,7 @@ const LOG_SOURCES: { id: LogSource; label: string; color: string }[] = [
 const LOG_LEVELS = ["ALL", "DEBUG", "INFO", "WARN", "ERROR"] as const;
 type LogLevel = (typeof LOG_LEVELS)[number];
 
-// Word-boundary level detection — avoids false positives like `error_count=0`
-// reporting as ERROR. Looks for the level token surrounded by non-word chars
-// or at start/end of line.
+// Word-boundary level detection avoids false positives like `error_count=0`.
 const LEVEL_RE = {
   ERROR: /\b(ERROR|ERR)\b/i,
   WARN:  /\b(WARN(?:ING)?)\b/i,
@@ -42,9 +41,6 @@ const levelColor: Record<LogLevel, string> = {
   ERROR: "var(--lm-red)",
 };
 
-// Level → (accent, soft bg) for the active level-filter dropdown, so picking
-// ERROR reads red, WARN amber, DEBUG purple, INFO blue — purely a visual tweak
-// to the dropdown chrome; the filtering logic itself is unchanged.
 const levelFilterTone: Record<Exclude<LogLevel, "ALL">, { fg: string; bg: string }> = {
   DEBUG: { fg: "var(--lm-purple)", bg: "rgba(167,139,250,0.14)" },
   INFO:  { fg: "var(--lm-blue)",   bg: "rgba(96,165,250,0.14)" },
@@ -52,9 +48,7 @@ const levelFilterTone: Record<Exclude<LogLevel, "ALL">, { fg: string; bg: string
   ERROR: { fg: "var(--lm-red)",    bg: "var(--lm-red-dim)" },
 };
 
-// chipTone maps a raw level token (as captured by formatLine — e.g. "DEBUG",
-// "INF", or the Go "[abcDEBUG]" form) to a chip color. Display-only: it just
-// looks at which level word the token contains, and never changes parsing.
+// Maps a raw level token ("DEBUG", "INF", "[abcDEBUG]") to a chip color.
 function chipTone(token: string): { fg: string; bg: string } {
   const u = token.toUpperCase();
   if (/ERR/.test(u))   return levelFilterTone.ERROR;
@@ -113,10 +107,6 @@ function LogPanel({ source, label, color, initialFilter, initialLevel, onFilterC
   useEffect(() => {
     if (paused) return;
 
-    // Gate the log-stream EventSource on tab visibility. Without this the
-    // stream stays connected (and a TCP slot occupied) even when the user
-    // is on another browser tab, contributing to the monitor page's
-    // connection-pool starvation.
     let es: EventSource | null = null;
     const onLog = (e: Event) => {
       const line = stripAnsi((e as MessageEvent).data);
@@ -124,9 +114,7 @@ function LogPanel({ source, label, color, initialFilter, initialLevel, onFilterC
     };
     const open = () => {
       if (es !== null) return;
-      // EventSource can't set custom headers; cookies attach automatically
-      // with `withCredentials: true` for same-origin connections. Legacy
-      // Bearer fallback (?token=) still rides along when a token is set.
+      // EventSource cannot set headers; cookies attach and a legacy ?token rides along.
       es = new EventSource(withApiToken(`${API}/logs/stream?source=${source}`), { withCredentials: true });
       sseRef.current = es;
       es.addEventListener("log", onLog);
@@ -167,8 +155,6 @@ function LogPanel({ source, label, color, initialFilter, initialLevel, onFilterC
     return result;
   }, [lines, level, filter]);
 
-  // Per-level counts for the toolbar summary chips. Uses the same detectLevel()
-  // as filtering/rendering — purely a display aggregate, no logic change.
   const counts = useMemo(() => {
     const c = { ERROR: 0, WARN: 0 };
     for (const l of lines) {
@@ -199,8 +185,7 @@ function LogPanel({ source, label, color, initialFilter, initialLevel, onFilterC
   const highlightLine = (line: string) => {
     if (!filter.trim()) return formatLine(line);
     try {
-      // Capture group + split → every other piece is a match. This avoids
-      // re.test() with the /g flag mutating lastIndex between checks.
+      // Split with a capture group instead of re.test() with /g (lastIndex mutation).
       const re = new RegExp(`(${filter})`, "gi");
       const parts = line.split(re);
       if (parts.length <= 1) return formatLine(line);
@@ -214,7 +199,7 @@ function LogPanel({ source, label, color, initialFilter, initialLevel, onFilterC
     }
   };
 
-  // Format log line: dim timestamp, bold level, dim %key=value metadata
+  // Formats a log line: dim timestamp, bold level, dim %key=value metadata.
   const formatLine = (line: string) => {
     // HAL: 2026-04-13 17:47:52,944 INFO hal.voice: message
     const pyMatch = line.match(/^(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}[,.\d]*)\s+(DEBUG|INFO|WARN(?:ING)?|ERROR|ERR|DBG|INF)\s+([\s\S]*)$/i);
@@ -227,7 +212,6 @@ function LogPanel({ source, label, color, initialFilter, initialLevel, onFilterC
     const lvl = pyMatch ? pyMatch[2] : goMatch![2];
     const rest = pyMatch ? pyMatch[3] : goMatch![3];
 
-    // Split message from %key=value metadata
     const metaIdx = rest.search(/\s%\w+=/);
     let msg = rest;
     let meta = "";
@@ -239,7 +223,7 @@ function LogPanel({ source, label, color, initialFilter, initialLevel, onFilterC
     const tone = chipTone(lvl);
     return (
       <>
-        <span style={{ opacity: 0.35 }}>{ts}</span>
+        <span style={{ color: "var(--lm-text-dim)" }}>{ts}</span>
         {" "}
         <span
           style={{
@@ -257,19 +241,18 @@ function LogPanel({ source, label, color, initialFilter, initialLevel, onFilterC
         >{lvl}</span>
         {" "}
         {msg}
-        {meta && <span style={{ opacity: 0.3 }}>{meta}</span>}
+        {meta && <span style={{ color: "var(--lm-text-dim)" }}>{meta}</span>}
       </>
     );
   };
 
   const btnStyle: React.CSSProperties = {
-    fontSize: 12, padding: "5px 10px", borderRadius: 6,
+    fontSize: 13, minHeight: 36, padding: "7px 10px", borderRadius: 6,
     background: "var(--lm-surface)", border: "1px solid var(--lm-border)",
     color: "var(--lm-text-dim)", cursor: "pointer", fontWeight: 600, lineHeight: 1,
   };
-  // Shared sizing for the two <select>s so they line up with the buttons.
   const selectStyle: React.CSSProperties = {
-    fontSize: 12, padding: "5px 8px", borderRadius: 6,
+    fontSize: 13, minHeight: 36, padding: "7px 8px", borderRadius: 6,
     background: "var(--lm-surface)", border: "1px solid var(--lm-border)",
     color: "var(--lm-text)", cursor: "pointer",
   };
@@ -283,11 +266,11 @@ function LogPanel({ source, label, color, initialFilter, initialLevel, onFilterC
         <span style={{ width: 8, height: 8, borderRadius: "50%", background: color, flexShrink: 0, boxShadow: `0 0 6px ${color}` }} />
         <span style={{ ...S.cardLabel, marginBottom: 0, fontSize: 13 }}>{label}</span>
 
-        {/* group: stream controls */}
-        <button onClick={fetchLines} style={btnStyle} title="Refresh">↻</button>
+        <button onClick={fetchLines} style={btnStyle} title="Refresh" aria-label="Refresh logs">↻</button>
         <button
           onClick={() => setPaused((p) => !p)}
           title={paused ? "Resume live stream" : "Pause live stream"}
+          aria-label={paused ? "Resume live stream" : "Pause live stream"}
           style={{
             ...btnStyle,
             background: paused ? "var(--lm-amber-dim)" : "var(--lm-surface)",
@@ -307,9 +290,8 @@ function LogPanel({ source, label, color, initialFilter, initialLevel, onFilterC
 
         <span className="lm-log-sep" />
 
-        {/* group: filtering — the active level dropdown takes that level's own
-            accent (ERROR=red, WARN=amber, DEBUG=purple, INFO=blue). */}
         <select
+          aria-label="Minimum log level"
           value={level}
           onChange={(e) => { const v = e.target.value as LogLevel; setLevel(v); onFilterChange(source, filter, v); }}
           style={{
@@ -326,9 +308,11 @@ function LogPanel({ source, label, color, initialFilter, initialLevel, onFilterC
           type="text"
           value={filter}
           onChange={(e) => { setFilter(e.target.value); onFilterChange(source, e.target.value, level); }}
-          placeholder="grep…"
+          aria-label="Search logs"
+          placeholder="Search logs…"
+          className="lm-log-search"
           style={{
-            fontSize: 12, padding: "5px 10px", borderRadius: 6, width: 150,
+            fontSize: 13, minHeight: 36, padding: "7px 10px", borderRadius: 6, width: 150,
             background: filter ? "var(--lm-amber-dim)" : "var(--lm-surface)",
             border: `1px solid ${filter ? "var(--lm-amber)" : "var(--lm-border)"}`,
             color: "var(--lm-text)", fontFamily: "monospace",
@@ -341,7 +325,6 @@ function LogPanel({ source, label, color, initialFilter, initialLevel, onFilterC
 
         <span className="lm-log-sep" />
 
-        {/* group: actions */}
         <button
           onClick={() => {
             const text = (filtered.length ? filtered : lines).join("\n");
@@ -354,13 +337,11 @@ function LogPanel({ source, label, color, initialFilter, initialLevel, onFilterC
             URL.revokeObjectURL(url);
           }}
           title="Download visible lines as .log"
+          aria-label="Download visible logs"
           style={btnStyle}
         >↓</button>
         <button onClick={() => setLines([])} style={btnStyle} title="Clear view">Clear</button>
 
-        {/* error/warn pressure chips — reuse the shared StatusBadge tones so they
-            match the ONLINE/OFFLINE pills used across Overview/System. Counts
-            come from the same detectLevel() used everywhere else. */}
         {counts.ERROR > 0 && <StatusBadge text={`${counts.ERROR} ERR`} tone="error" />}
         {counts.WARN > 0 && <StatusBadge text={`${counts.WARN} WARN`} tone="active" />}
 
@@ -378,7 +359,6 @@ function LogPanel({ source, label, color, initialFilter, initialLevel, onFilterC
         </span>
       </div>
 
-      {/* scroll body wrapper is relative so the jump pill can float over it */}
       <div style={{ position: "relative", flex: 1, minHeight: 0 }}>
         <div
           ref={scrollRef}
@@ -386,7 +366,7 @@ function LogPanel({ source, label, color, initialFilter, initialLevel, onFilterC
           style={{
             height: "100%", overflowY: "auto", padding: "6px 0",
             fontFamily: "'JetBrains Mono', 'Fira Code', 'Consolas', monospace",
-            fontSize: 11, lineHeight: 1.55,
+            fontSize: 13, lineHeight: 1.65,
             whiteSpace: "pre-wrap" as const,
             overflowWrap: "anywhere" as const,
           }}
@@ -429,7 +409,6 @@ function LogPanel({ source, label, color, initialFilter, initialLevel, onFilterC
           )}
         </div>
 
-        {/* float a jump-to-bottom pill while the user has scrolled up */}
         {!autoScroll && !isEmpty && (
           <button className="lm-log-jump" onClick={jumpToBottom}>
             ↓ Jump to latest
@@ -453,13 +432,11 @@ function loadLogState(): { active: LogSource; filters: Record<string, { filter: 
       };
     }
   } catch {
-    // Unreadable or corrupt saved state: fall through to the defaults below
-    // rather than leaving the Logs panel without a selected source.
+    // Corrupt saved state: fall through to the defaults.
   }
   return { active: "openclaw", filters: {} };
 }
 
-// saveLogState is debounced so per-keystroke filter edits don't hammer localStorage.
 let _saveTimer: number | null = null;
 function saveLogState(active: LogSource, filters: Record<string, { filter: string; level: LogLevel }>) {
   if (_saveTimer != null) clearTimeout(_saveTimer);
@@ -467,8 +444,7 @@ function saveLogState(active: LogSource, filters: Record<string, { filter: strin
     try {
       localStorage.setItem(STORAGE_KEY, JSON.stringify({ active, filters }));
     } catch {
-      // Persisting the filter is a convenience; a full or blocked
-      // localStorage just means the panel reopens with defaults.
+      // Best-effort persistence.
     }
   }, 250);
 }
@@ -494,16 +470,23 @@ export function LogsSection() {
   };
 
   return (
-    <div style={{ display: "flex", flexDirection: "column", gap: 0, height: "100%" }}>
-      <div style={{ display: "flex", gap: 4, padding: "0 0 8px 0", flexShrink: 0 }}>
+    <div className="lm-logs-panel" style={{ display: "flex", flexDirection: "column", gap: 0, height: "100%", minWidth: 0 }}>
+      <label className="lm-log-source-picker">
+        Log source
+        <select value={active} onChange={(event) => handleTabChange(event.target.value as LogSource)}>
+          {LOG_SOURCES.map((source) => <option key={source.id} value={source.id}>{source.label}</option>)}
+        </select>
+      </label>
+      <div className="lm-log-source-tabs" style={{ display: "flex", gap: 4, padding: "0 0 8px 0", flexShrink: 0, flexWrap: "wrap" }}>
         {LOG_SOURCES.map((s) => (
           <button
             key={s.id}
             onClick={() => handleTabChange(s.id)}
+            aria-pressed={active === s.id}
             style={{
-              fontSize: 11, padding: "5px 14px", borderRadius: 6, cursor: "pointer",
+              fontSize: 13, minHeight: 36, padding: "7px 14px", borderRadius: 6, cursor: "pointer",
               border: active === s.id ? `1px solid ${s.color}` : "1px solid var(--lm-border)",
-              background: active === s.id ? `${s.color}22` : "var(--lm-surface)",
+              background: active === s.id ? `color-mix(in srgb, ${s.color} 14%, var(--lm-surface))` : "var(--lm-surface)",
               color: active === s.id ? s.color : "var(--lm-text-dim)",
               fontWeight: active === s.id ? 700 : 500,
               transition: "all 0.15s",

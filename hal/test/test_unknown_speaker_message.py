@@ -1,21 +1,10 @@
-"""An unknown speaker's turn must not carry an order to ask for their name.
-
-The message HAL builds here is glued onto the transcript the model answers, so
-anything imperative in it competes with the silence rules in the persona — and a
-nearer, more specific instruction wins. That is how one word of somebody else's
-conversation ("program.") produced a spoken "I don't think we've met, what's
-your name?".
-"""
-
-from unittest import mock
+"""An unknown speaker's turn must not carry an order to ask for their name."""
 
 from hal.drivers.voice._internal.speaker_decorate import SpeakerDecorator
 
 
 def _decorator():
-    with mock.patch.object(SpeakerDecorator, "_init_speaker", return_value=None), \
-         mock.patch.object(SpeakerDecorator, "_init_speech_emotion", return_value=None):
-        return SpeakerDecorator(wake_words=["lamp"], nudge_cooldown_s=0)
+    return SpeakerDecorator(wake_words=["lamp"], nudge_cooldown_s=0, enable_people_perception=False)
 
 
 def test_a_short_fragment_carries_no_instruction_to_speak():
@@ -24,7 +13,6 @@ def test_a_short_fragment_carries_no_instruction_to_speak():
     )
 
     assert "ask" not in msg.lower()
-    # The path and the tag still ride along, so a later real turn can enrol.
     assert "/tmp/v.wav" in msg
     assert "voice_460" in msg
 

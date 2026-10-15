@@ -2,8 +2,10 @@
 
 import os
 import time
+import threading
+from functools import wraps
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 import hal.app_state as state
@@ -12,8 +14,19 @@ from hal.models import CameraInfoResponse, CameraZoomRequest, StatusResponse
 from hal.config import CAMERA_WIDTH, CAMERA_HEIGHT
 
 router = APIRouter(tags=["Camera"])
+_snapshot_lock = threading.Lock()
 
-# Lazy import -- cv2 may not be available
+
+def _serialized_snapshot(fn):
+    @wraps(fn)
+    def wrapped(*args, **kwargs):
+        # Serialize temporary starts/stops, without holding the privacy lock:
+        # physical and manual disable must remain responsive during capture.
+        with _snapshot_lock:
+            return fn(*args, **kwargs)
+    return wrapped
+
+
 cv2 = None
 try:
     import cv2
@@ -30,14 +43,8 @@ def _camera_info_payload() -> dict:
     actual_fps = getattr(cap, "actual_fps", None) if available else None
     return {
         "available": available,
-        # `available` only says a capture object exists. It stays True when the
-        # USB camera never enumerated (no /dev/video*, every open failed) because
-        # the capture object is still created; the only truthful signal for
-        # "can this device see" is whether a frame ever arrived — the same test
-        # GET /health uses for its `camera` flag.
+        # Truthful "can this device see": a frame ever arrived (same test as /health `camera`).
         "has_frame": bool(available and cap.last_frame is not None),
-        # Prefer the device-negotiated mode; fall back to configured values
-        # until the capture loop has reported (e.g. camera disabled at boot).
         "width": actual_w if actual_w else (CAMERA_WIDTH if available else None),
         "height": actual_h if actual_h else (CAMERA_HEIGHT if available else None),
         "fps": actual_fps,
@@ -55,12 +62,7 @@ def get_camera_info():
 
 @router.post("/camera/zoom", response_model=CameraInfoResponse)
 def set_camera_zoom(req: CameraZoomRequest):
-    """Set digital zoom factor (1.0 = no zoom, applies to all frame consumers).
-
-    Side effect: zoom > 1 narrows the FOV seen by sensing (face recog, motion,
-    pose, emotion) and tracking. Use for focusing on a small subject (e.g.
-    laptop screen in a video call); set back to 1.0 to restore wide view.
-    """
+    """Set digital zoom factor (1.0 = none); applies to every frame consumer (sensing, tracking)."""
     if not state.camera_capture:
         raise HTTPException(503, "Camera not available")
     state.camera_capture.zoom = req.zoom
@@ -80,6 +82,9 @@ def disable_camera():
         state._persist_camera_state()
         return {"status": "already_disabled"}
     if state._camera_disabled:
+        # An explicit disable must claim manual ownership even after an auto-pause.
+        state._camera_manual_override = True
+        state._persist_camera_state()
         return {"status": "already_disabled"}
     state._camera_disabled = True
     state._camera_manual_override = True
@@ -89,9 +94,25 @@ def disable_camera():
     return {"status": "ok"}
 
 
+# Set by os-server's /api/hardware proxy only for a logged-in owner session; the proxy
+# strips any client-supplied value.
+OWNER_ACTION_HEADER = "X-OS-Owner-Action"
+# Someone spoke to the lamp this recently: a voice "camera on" relayed by the agent.
+OWNER_VOICE_WINDOW_S = 60.0
+
+
+def _owner_is_here(request: Request) -> bool:
+    """True when the owner can be the one asking: a logged-in web session, or a person
+    speaking to the lamp just now. Sensing events, schedules, remote chat channels and
+    an agent acting on its own have neither."""
+    if request.headers.get(OWNER_ACTION_HEADER) == "1":
+        return True
+    return state.someone_spoke_within(OWNER_VOICE_WINDOW_S)
+
+
 @router.post("/camera/enable", response_model=StatusResponse)
 @privacy.serialized
-def enable_camera():
+def enable_camera(request: Request):
     """Restart the camera capture loop (manual). Clears manual override."""
     if privacy.camera_muted:
         raise HTTPException(409, "Privacy switch is on -- flip the switch to enable camera")
@@ -99,6 +120,16 @@ def enable_camera():
         raise HTTPException(503, "Camera not available")
     if not state._camera_disabled:
         return {"status": "already_enabled"}
+    # Only the person who turned the camera off may turn it back on: an automatic
+    # pause can be lifted by anyone, a manual "camera off" only from the room or the
+    # local web page.
+    if state._camera_manual_override and not _owner_is_here(request):
+        state.logger.warning("Camera enable refused -- turned off by the user, no owner present")
+        raise HTTPException(
+            403,
+            "The camera was turned off by the user; it can only be turned back on by "
+            "speaking to the lamp or from its local web page",
+        )
     state._camera_disabled = False
     state._camera_manual_override = False
     state.camera_capture.start()
@@ -108,27 +139,20 @@ def enable_camera():
 
 
 @router.get("/camera/snapshot")
+@_serialized_snapshot
 def camera_snapshot(
     save: bool = False,
     width: int | None = Query(default=None, ge=1, le=4096, description="Resize output width (preserves aspect ratio). Capped at source width — never upscales."),
     height: int | None = Query(default=None, ge=1, le=4096, description="Resize output height (preserves aspect ratio). Capped at source height — never upscales."),
     quality: int = Query(default=85, ge=1, le=100, description="JPEG quality 1-100."),
 ):
-    """Capture a single JPEG frame from the camera (freezes servos for stability).
-
-    Optional resize: pass width and/or height to downscale the output. Aspect
-    ratio is preserved; if both given, the frame is fit inside the requested
-    box. Upscaling above source is not allowed (just blurs without detail) —
-    requests above source are clamped.
-    """
-    if privacy.camera_muted:
-        raise HTTPException(409, "Privacy switch is on -- camera capture is blocked")
+    """Capture a single JPEG frame (freezes servos); optional width/height downscale, never upscales."""
+    if state.camera_blocked_by_user():
+        raise HTTPException(409, "Camera is disabled by the user or privacy switch")
     if not state.camera_capture or cv2 is None:
         raise HTTPException(503, "Camera not available")
 
-    # Lazy import: video_capture_device imports cv2 at module level, and this
-    # route module must stay importable on cv2-less devices (server.py imports
-    # it unconditionally). Guarded by the cv2 check above.
+    # Lazy: video_capture_device imports cv2 at module level.
     from hal.drivers.camera.video_capture_device import capture_still
 
     was_disabled = state._camera_disabled
@@ -136,11 +160,6 @@ def camera_snapshot(
         state.camera_capture.start()
 
     try:
-        # Freezes servos (animation loop + tracker worker, when the device has
-        # them) and waits for a frame captured after the arm went quiet, using
-        # frame/bus-write timestamps instead of a blind sleep. Zero added
-        # latency when the servos are already still. animation_service is None
-        # on servo-less devices — capture_still then just grabs the frame.
         frame = capture_still(
             state.camera_capture,
             state.animation_service,
@@ -148,11 +167,7 @@ def camera_snapshot(
             timeout_s=2.5,
         )
         if frame is None:
-            # Distinguish "hardware never delivered a frame" from a transient
-            # miss. lamp-0c4e 2026-09-16: the USB camera was not enumerated at
-            # all, every capture failed since boot, but the bare 500 read as a
-            # hiccup and the agent retried through a second endpoint — another
-            # 6s LLM hop for the same failure. Say it is not retryable.
+            # Never-delivered-a-frame is not retryable; say so instead of a bare 500.
             if getattr(state.camera_capture, "last_frame_ts", 0.0) == 0.0:
                 raise HTTPException(
                     503,
@@ -162,16 +177,14 @@ def camera_snapshot(
                 )
             raise HTTPException(500, "Failed to capture frame")
     finally:
-        if was_disabled:
+        if was_disabled and state._camera_disabled:
             state.camera_capture.stop()
 
-    if privacy.camera_muted:
-        raise HTTPException(409, "Privacy switch is on -- camera capture is blocked")
+    if state.camera_blocked_by_user():
+        raise HTTPException(409, "Camera is disabled by the user or privacy switch")
 
     if width is not None or height is not None:
         src_h, src_w = frame.shape[:2]
-        # Compute target scale honoring aspect ratio, clamped so we never
-        # upscale (digital upscale adds no detail, only blur).
         scale_w = (width / src_w) if width else 1.0
         scale_h = (height / src_h) if height else 1.0
         if width and height:
@@ -186,8 +199,8 @@ def camera_snapshot(
 
     _, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, quality])
 
-    if privacy.camera_muted:
-        raise HTTPException(409, "Privacy switch is on -- camera capture is blocked")
+    if state.camera_blocked_by_user():
+        raise HTTPException(409, "Camera is disabled by the user or privacy switch")
     if not save:
         return Response(content=buf.tobytes(), media_type="image/jpeg")
 
@@ -196,14 +209,7 @@ def camera_snapshot(
     filepath = os.path.join(state._SNAPSHOT_DIR, filename)
     with open(filepath, "wb") as f:
         f.write(buf.tobytes())
-    state._snapshot_paths.append(filepath)
-
-    while len(state._snapshot_paths) > state._SNAPSHOT_MAX:
-        oldest = state._snapshot_paths.pop(0)
-        try:
-            os.remove(oldest)
-        except OSError:
-            pass
+    state.prune_snapshot_dir()
 
     return JSONResponse({"path": filepath})
 
@@ -236,7 +242,6 @@ def camera_stream():
                     time.sleep(0.05)
                     continue
 
-                # Draw tracking bbox overlay if active
                 if state.tracker_service and state.tracker_service.is_tracking:
                     ts = state.tracker_service.status
                     bbox = ts.get("bbox")

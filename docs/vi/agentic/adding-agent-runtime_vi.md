@@ -19,7 +19,8 @@ install, migration, skills, hooks, reset.
 > [`hermes_vi.md`](hermes_vi.md) (Hermes, backend đầy đủ) ·
 > [`picoclaw_vi.md`](picoclaw_vi.md) (PicoClaw, gateway chỉ-client kèm script install/presync) ·
 > [`claudecode_vi.md`](claudecode_vi.md) (Claude Code sau một bridge cục bộ,
-> channel plugin native cho Telegram/Discord, claude.ai OAuth login). Protocol/quirk
+> kênh Telegram/Slack/Discord do device sở hữu — cố ý không dùng channel plugin
+> native — claude.ai OAuth login). Protocol/quirk
 > đặc thù từng backend nằm ở các file kia; cơ chế generic + checklist nằm ở đây.
 
 ---
@@ -28,10 +29,14 @@ install, migration, skills, hooks, reset.
 
 - `config.agent_runtime` (`/root/config/config.json`) chọn backend đang chạy.
 - `system/agent/factory.go` `ProvideGateway` resolve lúc boot qua Wire DI:
-  `config.agent_runtime` > ROBOT.md `gateway.default` > openclaw.
+  `config.agent_runtime` > `/root/config/f_r_default_agent` (bake vào image qua
+  `DEFAULT_AGENT`, sống sót qua factory reset) > ROBOT.md `gateway.default` > openclaw.
+  Hai mức giữa được resolve bởi `device.ResolveDefaultAgent`
+  (`system/device/runtime.go`), dùng chung với bước seed bên dưới.
 - **Seed-khi-rỗng:** lúc boot `device.ProvideService` gọi
   `SeedAgentRuntimeFromGateway` — khi `config.agent_runtime` rỗng/null **và**
-  ROBOT.md `gateway.default` là runtime hợp lệ, giá trị đó được ghi vào config.json
+  `ResolveDefaultAgent` trả về runtime hợp lệ (`f_r_default_agent`, nếu không thì
+  ROBOT.md `gateway.default`), giá trị đó được ghi vào config.json
   (idempotent; chỉ boot đầu của config fresh/legacy mới ghi). Khi đã có giá trị cụ
   thể trên đĩa, device **sở hữu** runtime của nó: dev đã set (qua switch hoặc sửa
   tay) thì để nguyên, và fallback-resolve ở trên thành no-op. Hệ quả: sửa
@@ -52,6 +57,18 @@ install, migration, skills, hooks, reset.
   vì giá trị lạc quan).
 
 ---
+
+### Quyền quản lý cấu hình LLM
+
+`llm_config_mode` là một lựa chọn chung cho thiết bị, độc lập với `agent_runtime`:
+
+- Thiếu/rỗng: giữ hành vi cũ, gồm nhận diện subscription của Codex/Claude Code.
+- `os`: áp dụng rõ ràng provider, model và credentials đã lưu trong OS, kể cả khi có native auth.
+- `runtime`: giữ cấu hình provider/model/auth native. Onboarding vẫn quản lý gateway, workspace, skills và channels; presync, sync định kỳ và migration cấu hình không được ghi đè LLM native.
+
+Settings → Runtime chọn mode qua `PUT /api/device/config`. Native mode không chọn model mới hoặc đăng nhập: cấu hình hiện có, kể cả model OS trước đó, vẫn giữ nguyên đến khi người vận hành chọn provider/model bằng CLI/config của runtime. Dùng đúng user/home của daemon, restart runtime sau thay đổi native và mở terminal mới để bỏ environment proxy cũ. Đổi runtime không migrate credentials subscription; cần cấu hình riêng từng runtime.
+
+Giữ key/base URL trong OS cho voice/backend. Khôi phục mặc định AI Brain chọn rõ `os` và áp dụng lại kể cả khi giá trị đã lưu không đổi. Nếu áp dụng mode lỗi, caller nhận lỗi nhưng mode đã được lưu; sửa nguyên nhân rồi thử áp dụng lại. Áp dụng thành công không xác nhận tài khoản/subscription hợp lệ. Luồng này chưa được test trên device bằng tài khoản subscription thật.
 
 ## 1. Hợp đồng — implement `domain.AgentGateway`
 
@@ -165,7 +182,7 @@ Mẫu fix (dùng cho mọi thứ có state):
 Presync của Hermes (`runtimes/hermes/presync.sh`) giờ làm chủ **cả** model wiring
 trong `config.yaml` (idempotent — coerce `model: ''` bị reset về map, khẳng định
 structure `provider`/`custom_providers`, sync `llm_*`/secrets) **lẫn** restore
-skills (chạy lại `claw migrate` khi `skills/openclaw-imports` rỗng). Giữ `verify`
+skills (chạy lại `claw migrate` khi `~/.hermes/skills/openclaw-imports` rỗng). Giữ `verify`
 chỉ-CLI (`command -v <bin>`) — structure-check trong `verify` sẽ ép full reinstall
 nặng trong khi presync tự lành đủ rồi.
 
@@ -324,13 +341,18 @@ Harness được nối thêm. Envelope rỗng/sai định dạng và câu phụ 
 (như “brighter”, “continue”) chuyển cho runtime. Yêu cầu gốc chuyển tiếp không đổi. Không retry, redirect, fallback provider trực tiếp hoặc
 upload lịch sử hội thoại. Tổng ngân sách chọn tối đa 3 giây, cooldown lỗi 30 giây
 và bỏ qua ngay khi bộ chọn đang bận. Ngưỡng xác suất >= 0.70, margin >= 0.20 và
-fit độc lập >= 0.60. Hơn 32 skill đủ điều kiện thì abstain, không cắt danh sách.
+fit độc lập >= 0.60. Toàn bộ request sau serialize có ngân sách cục bộ 256 KiB
+thay cho giới hạn 32 skill. Vượt ngân sách thì bỏ qua với `catalog_budget`, không
+cắt danh sách và không tạo cooldown lỗi.
 Đây là ngưỡng tìm skill, khác ngưỡng intent phần cứng nghiêm ngặt hơn.
 
 Preload chứa toàn bộ SKILL.md trong giới hạn kích thước và thư mục tuyệt đối.
-Adapter Go chỉ nạp skill tĩnh đơn giản từ thư mục cài đặt của runtime; template
-động, frontmatter điều khiển riêng, thư mục skill project xung đột và policy
-native chưa hỗ trợ đều chuyển về tìm skill native. Sau inference, adapter kiểm
+Adapter Go nạp skill tĩnh đơn giản từ các thư mục global và project được công bố
+(xem docs từng runtime). Project dừng ở ranh giới repo/worktree gần nhất; nếu
+không xác định được thì chỉ lấy thư mục làm việc. Tên skill trùng, template động,
+metadata invocation và policy chưa hỗ trợ đều nhường native discovery; không
+tự quét cache plugin. Skill Codex có `agents/openai.yaml` vẫn do native xử lý.
+OpenClaw và PicoClaw dùng roster runtime công bố, gồm skill đủ điều kiện ngoài workspace. Sau inference, adapter kiểm
 tra lại điều kiện và nội dung skill. Lượt system/slash/attachments giữ đường cũ.
 Các tích hợp mới ngoài Hermes đều **mặc định tắt** trong khi chờ kiểm chứng native;
 Hermes giữ nguyên. Mỗi runtime mới có cờ build Go `const jevEnabled = false`: bridge dùng `gatewayd/jev.go`, PicoClaw dùng `jev_hook.go`, OpenClaw dùng `jev_plugin.go`. Khi tắt, bridge không tạo selector; onboarding native không cài asset hay tạo đăng ký Jev mới. Nếu có đăng ký Jev cũ, Go chỉ tắt đăng ký đó; các cấu hình khác được giữ nguyên. Không đọc skill, gọi provider hay thêm nội dung Jev vào yêu cầu khi tắt. Muốn bật phải đổi cờ, build và restart qua luồng quản lý runtime; env/config không thay thế cờ build. `JEV_CONFIG_PATH` chọn file cấu hình OS của bridge.

@@ -1,6 +1,6 @@
 ---
 name: servo-control
-description: "Use to aim/point/look the device in a DIRECTION, toggle servo state (hold/resume/release), or play a named servo animation (nod/shake/etc). ALSO the skill for SEARCHING — \"where are you\", \"find my keyboard/cup/phone\", \"look around for X\", \"scan the whole room\" — which sweeps the room with the camera via /servo/search (run it with curl DURING the turn and answer from its result), and for DEMONSTRATING the movement range ONLY when the request names MOVEMENT — \"show me how far you can move\", \"how far can you turn\", \"show me your range of motion\" — via /servo/demo. A bare \"show me what you can do\" or \"what is your maximum capability\" is a general question about abilities, NOT a movement request, and must not start the demo. Never answer a search or a range demo with an emotion. Directions are fixed named locations or axes — supported: desk, wall, left, right, up, down, center, user. Furniture and surfaces (\"desk\", \"table\", \"floor\", \"ceiling\", \"wall\", \"door\", \"workspace\") are ALWAYS directions, never tracking targets — map them to the closest of the supported names (table/workspace → desk). MUST use /servo/aim (not /servo/track) for: \"look at the desk\"→desk, \"point at my table\"→desk, \"look at the wall\"→wall, \"look left\"→left, \"point up\"→up, \"look at me\"→user. For following a movable OBJECT by vision (cup, phone, hand, person, pet) use servo-tracking instead. Compound: if user names a direction AND an object (\"look at desk and follow cup\"), fire THIS aim skill first, then tracking."
+description: "Use to aim/point/look the device in a DIRECTION, toggle servo state (hold/resume/release), or play a named servo animation (nod/shake/etc). In a movement/hold context, \"back to normal\", \"turn to normal position\" and \"return to idle\" mean resume; \"look straight ahead\" only means aim center. ALSO the skill for SEARCHING — \"where are you\", \"find my keyboard/cup/phone\", \"look around for X\", \"scan the whole room\" — which sweeps the room with the camera via /servo/search (run it with curl DURING the turn and answer from its result), and for DEMONSTRATING the movement range ONLY when the request names MOVEMENT — \"show me how far you can move\", \"how far can you turn\", \"show me your range of motion\" — via /servo/demo. A bare \"show me what you can do\" or \"what is your maximum capability\" is a general question about abilities, NOT a movement request, and must not start the demo. Never answer a search or a range demo with an emotion. Directions are fixed named locations or axes — supported: desk, wall, left, right, up, down, center, user. Furniture and surfaces (\"desk\", \"table\", \"floor\", \"ceiling\", \"wall\", \"door\", \"workspace\") are ALWAYS directions, never tracking targets — map them to the closest of the supported names (table/workspace → desk). MUST use /servo/aim (not /servo/track) for: \"look at the desk\"→desk, \"point at my table\"→desk, \"look at the wall\"→wall, \"look left\"→left, \"point up\"→up, \"look at me\"→user. For following a movable OBJECT by vision (cup, phone, hand, person, pet) use servo-tracking instead. Compound: if user names a direction AND an object (\"look at desk and follow cup\"), fire THIS aim skill first, then tracking."
 ---
 
 # Servo Control
@@ -9,7 +9,7 @@ description: "Use to aim/point/look the device in a DIRECTION, toggle servo stat
 Controls the device's servo motors for directional aiming and physical animations. Use `/servo/aim` for directional pointing, `/servo/play` for expressive animations.
 
 ## Workflow
-1. Determine if the user wants to **aim** the light or **play an animation**.
+1. Determine whether the user wants to **aim**, **play an animation**, or **change motion state** (hold, resume, release). Apply the resume-vs-direction rules below before choosing a marker.
 2. Prefix reply with the appropriate `[HW:...]` marker — the device fires it before TTS.
 3. Confirm the action to the user.
 
@@ -54,14 +54,23 @@ Controls the device's servo motors for directional aiming and physical animation
 **Output:** `[HW:/servo/aim:{"direction":"right"}][HW:/servo/hold:{}]` Turned right and holding.
 → Compound movement: emit **one marker per clause**, in order. They fire sequentially before TTS. Dropping the `hold` half means the device drifts back — never confirm a step you did not fire.
 
-**Input:** "Turn right, hold it there, and tell me what you see"
-**Output:** move FIRST with curl (so the camera sees the NEW view), then snapshot, then reply:
+**Input:** "Turn right and tell me what you see" / "Look left, what's there?" / "Turn right, hold it there, and tell me what you see"
+**Output:** ONE bash call — camera check, aim, look — then reply from the result:
 ```bash
-curl -sX POST http://127.0.0.1:5001/servo/aim -H 'Content-Type: application/json' -d '{"direction":"right"}'
-curl -sX POST http://127.0.0.1:5001/servo/hold -d '{}'
-curl -sX POST http://127.0.0.1:5000/api/vision/look -H 'Content-Type: application/json' -d '{"question":"What do you see to the right?"}'
+c=$(curl -s http://127.0.0.1:5001/camera); case "$c" in
+  *'"disabled":true'*) echo "CAMERA_OFF" ;;
+  *'"has_frame":false'*) echo "CAMERA_UNAVAILABLE" ;;
+  *) curl -sX POST http://127.0.0.1:5001/servo/aim -H 'Content-Type: application/json' -d '{"direction":"right"}' >/dev/null
+     curl -sX POST http://127.0.0.1:5000/api/vision/look -H 'Content-Type: application/json' -d '{"question":"What do you see to the right?"}' ;;
+esac
 ```
-→ Answer from the returned `description`, or inspect the returned `path` with an image tool when only a path is returned. On error, do not guess. Do **not** use `[HW:...]` markers for these movements — markers fire only *after* your reply is written, so a snapshot taken during the turn would show the OLD position. See the Camera skill.
+→ **No `/servo/hold`.** The look keeps the head still for the photo by itself, and the head returns to idle afterwards. `CAMERA_OFF` / `CAMERA_UNAVAILABLE` → say so and stop; the head did not move. Answer from the returned `description`, or open `path` with an image tool when only a path comes back. On error, do not guess.
+
+Rules:
+- In a turn-and-look, "hold it there" / "stay there" / "keep it still" means keep still **for the photo**, which `/api/vision/look` already does. Never add `/servo/hold` to a turn-and-look; the head returns to idle after the photo.
+- `/servo/hold` is only for a pose request **without** a look ("turn right and hold that position", "stay there", "freeze").
+- Keep the camera check, the aim and the look in **one** bash call. A separate call costs a model round (~5 s); the turned pose lasts only about 5 s, so the photo would show idle.
+- Do **not** use `[HW:...]` markers for these movements. Markers fire only *after* your reply is written, so the photo would show the OLD position. See the Camera skill.
 
 **Input:** "Where are you?" / "Can you find me?" / "Look around for me" / "Where did I go?"
 **Output:** run it DURING the turn, then answer from what comes back:
@@ -127,7 +136,7 @@ curl -sX POST http://127.0.0.1:5001/servo/search -H 'Content-Type: application/j
 **Input:** "I moved you" / "You're in a new place" / "I put you somewhere else" / "Forget where I sit"
 **Output:** `[HW:/servo/bearing/reset:{}]` Got it — I'll forget where you usually are and learn it again.
 
-**Input:** "Resume" / "Move again" / "You can move now" / "Start moving"
+**Input:** "Resume" / "Move again" / "You can move now" / "Start moving" / "Resume normal movement" / "Return to idle"
 **Output:** `[HW:/servo/resume:{}]` Alright, back to normal!
 
 ## Tools
@@ -225,9 +234,39 @@ Suppresses idle and ambient animations — the device freezes in current pose. E
 [HW:/servo/resume:{}] Back to normal!
 ```
 
-Exits hold mode and resumes idle animations.
+Exits hold mode and resumes idle animations while keeping motor torque on.
 
-**Triggers:** "resume", "move again", "you can move now", "start moving"
+**Triggers:** "resume", "move again", "you can move now", "start moving", "resume normal movement", "return to idle".
+
+**Normal movement vs direction:**
+- In an established servo/hold context, "back to normal", "return to normal", or
+  "turn to normal position" means leave hold and resume idle. Use `/servo/resume`,
+  not just `/servo/aim` with `center` or `/servo/play` with `idle`: those do not
+  clear hold. Do not make the user know the API word "resume".
+- "Face forward", "look straight ahead", or "turn to center" requests only a
+  direction. Use `/servo/aim` with `center`; preserve the current hold state.
+- If the user explicitly requests both, such as "face forward and move normally
+  again", emit aim center followed by resume, in that order.
+- Explicit "keep holding", "stay still", or "don't resume" overrides an inferred
+  return to normal motion. "Return to your normal position but stay still" means
+  aim center then hold, never resume.
+- A bare "back to normal" during an unrelated task is not a servo command. Use
+  conversation context. If the request concerns this body's motion but its state
+  is unknown, read `GET /servo` (`motion_mode`) before interpreting it as leaving
+  hold; ask briefly if the intended action is still ambiguous.
+- Never use `/servo/release` to return to idle: release disables motor torque.
+
+**Input (currently holding, discussing posture):** "Turn to normal position"
+**Output:** `[HW:/servo/resume:{}]` Back to normal movement.
+
+**Input (currently holding):** "Look straight ahead"
+**Output:** `[HW:/servo/aim:{"direction":"center"}]` Facing forward.
+
+**Input:** "Face forward and move normally again"
+**Output:** `[HW:/servo/aim:{"direction":"center"}][HW:/servo/resume:{}]` Back to normal movement.
+
+**Input:** "Return to your normal position but stay still"
+**Output:** `[HW:/servo/aim:{"direction":"center"}][HW:/servo/hold:{}]` Facing forward and holding still.
 
 ### Release servos (disable motors)
 

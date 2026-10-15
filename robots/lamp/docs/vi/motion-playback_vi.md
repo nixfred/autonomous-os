@@ -95,6 +95,60 @@ clip thì không. Phải tính lại hằng số này nếu phân bố khối l�
 
 [#271]: https://github.com/autonomous-ai/autonomous-os/issues/271
 
+## Dừng khi chạm và cắt torque khi quá tải
+
+Playback cũng là nơi lộ ra việc tay đèn bị chặn: quỹ đạo vẫn tiến trong khi một khớp
+không theo kịp, và servo đẩy hết mức. Vì vậy `AnimationService` lấy mẫu `Present_Load`
+của mọi khớp ở 20 Hz (`hal/drivers/motors/overload.py`).
+
+- **Dừng khi chạm.** `base_yaw` ở 55 %, `wrist_roll` ở 75 % hoặc `wrist_pitch` ở 65 %
+  trong 0.05 s làm recording dừng tại chỗ, ghim tư thế với torque bật (tay không rơi),
+  không phát âm thanh, và chặn lệnh ghi
+  goal trong 3 s. Sau đó chạy tiếp vào idle từ tư thế
+  đã dừng. Tay vẫn giữ tay đèn sau 1 s trong lúc dừng (`release_after_s`), tức khớp
+  vừa dừng vẫn ở sàn tải/lag đã làm nó dừng hoặc bị đẩy lệch 1° khỏi tư thế đã ghim (`base_pitch`/`elbow_pitch` chỉ theo sàn
+  `off_playback` hoặc cut-off, vì chúng gánh trọng lượng tay đèn kể cả khi không ai chạm), thì nhả torque như cut-off quá tải. Trên lamp-52e6 các khớp này đạt đỉnh 52 % khi chuyển động tự do, và lấy tay
+  chặn `base_yaw` đẩy nó lên 94-100 %. `base_pitch` và `elbow_pitch` gánh trọng lượng
+  tay đèn và lên 83-100 % khi chuyển động tự do, nên không có sàn cố định; chúng
+  (cùng `base_yaw`) bị giới hạn ở 60 % torque (`torque_limit`): trên lamp-52e6
+  trần 70 % làm recording tệ nhất (`shock`) trễ từ 17° lên 18°, 50 % lên 24°; 60 % cho
+  lực đẩy nhẹ hơn.
+- **Envelope đã học.** Trong playback mọi khớp, kể cả các khớp gánh trọng lượng, bị giữ
+  ở mức load mà một lượt chạy tự do đạt ở frame đó cộng 12 % (`contact.profile_margin`),
+  và ở mức trễ so với goal tại đó cộng 3,5° (`contact.lag_margin`), nên vẫn thấy được
+  tay chặn một khớp đã chạm trần torque. Envelope được học riêng từng máy bằng
+  `POST /servo/contact/learn` hoặc nút **Learn** trên trang Servo của web Monitor (mỗi recording chạy tự do hai lần, giữ giá trị tối đa từng
+  frame, lưu vào `/var/lib/hal/contact_profile.json`), và được học ngầm từ mọi lần phát
+  sạch của recording (xem [an toàn](../../../../docs/vi/safety_vi.md)). Chỉ số frame được tra là frame
+  playback, nên envelope bám theo recording sau khi resample theo giới hạn tốc độ; học
+  lại sau khi hiệu chuẩn. Đổi `torque_limit` thì envelope bị bỏ, và recording nào đổi
+  độ dài thì các lần chạy học ngầm của nó bắt đầu lại. Ngoài playback
+  (gaze, tracking, `/servo/move`, giữ tư thế) dùng sàn `contact.off_playback`:
+  `base_pitch` 57 % (elbow chỉ xét lag), lag 9-14° tuỳ khớp; trừ lúc đang chạy một lệnh
+  xoay trực tiếp và 0,5 s sau đó (lệnh nhanh chạy trước đà tăng tốc của servo).
+  Idle đã ổn định dùng envelope của chính máy nếu máy đã học idle, không thì `off_playback`.
+- **Cắt torque khi quá tải.** Khớp nào ở mức 80 % trở lên trong 1.5 s (tay đang giữ vẫn
+  bị ép) sẽ cắt torque mọi servo, phát ack chime và chặn mọi lệnh ghi goal trong 120 s. Sau đó
+  thân máy resume vào idle từ vị trí tay đang nằm. Với trần 60 %, thực tế cut-off chỉ
+  còn trip được trên `wrist_roll` và `wrist_pitch`.
+
+Frame recording gửi trong lúc goal bị chặn sẽ bị bỏ, không xếp hàng lại. Ngưỡng
+(`contact.load`/`hold_s`/`pause_s`, `load`, `hold_s`, `retry_s`, `torque_limit`) do
+device quản lý trong `robots/lamp/servo_overload.json`; hành vi đầy đủ nằm ở phần
+fail-safe của [`docs/vi/safety_vi.md`](../../../../docs/vi/safety_vi.md).
+
+## Giữ tư thế sau aim
+
+`POST /servo/aim` dừng vòng lặp phát, xoay đầu, rồi khởi động lại vòng lặp với một
+recording một khung, `__aim_hold__`: tư thế vừa xoay tới, giữ 5 s (`_hold_until`) rồi
+mới quay về idle (lâu hơn nếu đang có servo hold). Lệnh aim cũng bỏ mọi đoạn blend còn
+sót từ trước đó (`_interpolation_frames` / `_interpolation_target`). Vòng lặp chạy blend
+đang dở trước mọi khung của recording và không kiểm hold trong lúc blend, nên một blend
+về idle bắt đầu ngay trước aim (ví dụ idle chạy lại sau một lượt thu giọng) từng kéo đầu
+quay về phía idle rồi giật lại tư thế đã xoay, khoảng 1,5 s sau khi hold; ảnh của lượt
+quay-rồi-nhìn chụp trong khoảng đó ra phía trước thay vì phía được yêu cầu.
+`move_and_hold` và `halt` vốn đã bỏ blend theo cùng cách.
+
 ## Demo tầm chuyển động — tính ra, không thu sẵn
 
 `POST /servo/demo` (`hal/drivers/motors/range_demo.py`) trình diễn một vòng dạo

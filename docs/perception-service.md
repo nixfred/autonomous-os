@@ -5,6 +5,10 @@ deep-learning models a device's HAL can't run locally (action recognition, facia
 and speech emotion, pose + ergonomics, object detection, speaker embedding) and
 exposes them over WebSocket and HTTP behind an optional encrypting load balancer.
 
+On the device, the camera perceptions that call this backend (motion, facial
+emotion, pose, fire hazard) are opt-in and default off; see
+[Sensing Behavior](../robots/lamp/docs/sensing-behavior.md#cloud-camera-perceptions-are-off-by-default).
+
 This page is the **platform overview** — what the backend is and where it sits.
 The **full reference lives next to the code** in
 [`integrations/perception-service/docs/`](../integrations/perception-service/docs/); schemas, model lists, endpoints and env
@@ -36,8 +40,9 @@ HAL / clients
 - **`dlserver`** (`:8001`) — loads the ML models, serves the perception endpoints.
 - **`lbserver`** (`:7999`) — round-robin proxy over one or more `dlserver`
   instances; terminates RSA+AES encryption so `dlserver` stays plaintext.
-- **`nginx`** (`:8899`) — public front door; maps the device-facing `/lelamp/`
-  prefix onto the internal `/hal/` prefix and upgrades WebSockets.
+- **`nginx`** (`:8899`) — public front door; passes `/hal/...` (the prefix
+  current HAL defaults use, e.g. `/hal/api/dl/ser/recognize`) straight through,
+  maps the legacy `/lelamp/` prefix onto `/hal/`, and upgrades WebSockets.
 
 For single-node dev you can hit `dlserver:8001` directly with encryption off.
 
@@ -51,7 +56,24 @@ per-label gate on the device. Face and person detection run internally to feed
 those pipelines. Requests from concurrent sessions are batched before GPU dispatch —
 tune `BATCH_SIZE` and `BATCH_TIMEOUT` per model. SER input is bounded to 2–8 s
 at batch 1 server-side, which stays inside the cached TensorRT engine's shape
-range, so no clip length can trigger an engine rebuild during a request. Model choices and outputs:
+range, so no clip length can trigger an engine rebuild during a request.
+Speaker-embedding input is likewise cropped to 3000 frames (30 s) before
+inference, below the cached engine's 5546-frame limit, so a long clip is
+embedded from its first 30 s instead of rebuilding the engine (#555).
+OWLv2 object detection runs as two ONNX graphs: a text graph turns prompts into query
+embeddings and an image graph detects with them. Named prompt presets (today only
+`fire_hazard_v1`, the 46 fire-hazard prompts HAL uses) are encoded once when dlserver
+starts and kept in memory, not on disk, so they are re-encoded on every restart and a
+preset request runs only the image graph. The HTTP detect request takes an optional
+`preset` (up to 64 characters): a known preset wins over `classes`, an unknown one gets
+a 400. Changing the prompts means a new preset name shipped with a server deploy, and the
+server must be deployed before a HAL build that sends the new name (an older server
+ignores `preset` and answers 200 with its default classes). Both graphs use explicit
+TensorRT profiles (1–500 queries, optimized for 46) and are warmed at 46 and 1 queries,
+so engines are built at startup, on the idle slot during a two-slot deploy (about 97 s
+on the current GPU), never in the middle of a request. Request schema:
+[`integrations/perception-service/docs/api.md`](../integrations/perception-service/docs/api.md#object-detection--websocket--http).
+Model choices and outputs:
 [`integrations/perception-service/docs/perceptions.md`](../integrations/perception-service/docs/perceptions.md).
 
 ## Using it from a device
@@ -66,9 +88,9 @@ the server only computes the embedding (the endpoint is embed-only and defaults
 to `preprocess=false`; pass `true` only to upload raw audio for server-side
 cleaning). HAL also sets `use_sliding_window`: enroll sends `false` so the whole
 reference is embedded in a single shot (one clean vector), while recognize sends
-`true` to slide overlapping windows and vote per chunk. The embed response (and
-`/health`) also report an
-`embed_model_version` fingerprint of the loaded weights, so HAL can tell when the
+`true` to slide overlapping windows and vote per chunk. The embed response
+(`embed_model_version`) and `/health` (`audio_embedder_version`) also report a
+fingerprint of the loaded weights, so HAL can tell when the
 server model changed and re-embed its stored voice profiles instead of matching
 against stale vectors (see
 [`robots/lamp/docs/speaker-enrollment.md`](../robots/lamp/docs/speaker-enrollment.md)). Exact endpoints
@@ -82,6 +104,12 @@ config knob is in
 and a `Makefile`; the two processes launch via `python -m dlserver` and
 `python -m lbserver`. Install, single-node vs master/slave GPU scaling, RunPod,
 Docker and TLS: [`integrations/perception-service/docs/deployment.md`](../integrations/perception-service/docs/deployment.md).
+
+New dlserver code is deployed with `make deploy-dlserver`: it starts the new code
+on a second port on the same GPU and switches lbserver over (state file +
+`SIGHUP`) only once every model is loaded, so devices see no errors. Dependency
+changes still use a planned in-place restart. Details:
+[Zero-downtime deploy](../integrations/perception-service/docs/deployment.md#zero-downtime-deploy-two-slots).
 
 ---
 

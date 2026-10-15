@@ -73,6 +73,8 @@ OS_AGENT_HOME       ?= $(OS_STATE_DIR)
 OS_AGENT_STATE_PATH ?= $(OS_STATE_DIR)/config/agent_state.json
 OS_BOOTSTRAP_CONFIG ?= $(OS_STATE_DIR)/config/bootstrap.json
 OS_LOG_FILE         ?= $(OS_STATE_DIR)/os-server.log
+# Unshipped device log records (system/lib/logger spool); /var/lib/autonomous on a device.
+OS_GELF_SPOOL_DIR   ?= $(OS_STATE_DIR)/gelf-spool
 # `make codex-dev` tees the bridge here; os-server reads it for the Agent tab.
 OS_AGENT_BRIDGE_LOG ?= $(OS_STATE_DIR)/codex-gatewayd.log
 # HAL writes it (HAL_LOG_DIR, HAL section below); os-server reads it for the HAL tab.
@@ -91,6 +93,7 @@ OS_DEV_ENV = \
 	OS_BACKEND_UPLINK=$(OS_BACKEND_UPLINK) \
 	OS_HAL_LOG_FILE=$(OS_HAL_LOG_FILE) \
 	OS_AGENT_BRIDGE_LOG=$(OS_AGENT_BRIDGE_LOG) \
+	OS_GELF_SPOOL_DIR=$(OS_GELF_SPOOL_DIR) \
 	OS_LOG_FILE=$(OS_LOG_FILE)
 
 .PHONY: os-dev os-dev-all os-dev-build os-dev-seed os-dev-config codex-dev
@@ -445,6 +448,10 @@ upload-os-server:
 upload-bootstrap:
 	bash scripts/release/upload-bootstrap.sh
 
+.PHONY: upload-lamp-os
+upload-lamp-os:
+	bash scripts/release/upload-lamp-os.sh
+
 upload-hal:
 	bash scripts/release/upload-hal.sh
 
@@ -590,8 +597,9 @@ upload-device:
 #   make promote-hal                # min_version = hal.version
 #   make promote-os-server V=1.4.0  # pin floor explicitly
 #   make promote-device DT=lamp     # devices.lamp profile
+#   make promote-hal FOR=lamp       # hal.min_version_by_device.lamp only
 promote-os-server promote-bootstrap promote-web promote-hal promote-claude-desktop-buddy promote-openclaw promote-codex promote-claudecode promote-opencode promote-hermes promote-picoclaw:
-	bash scripts/release/promote-ota.sh $(patsubst promote-%,%,$@) $(V)
+	FOR="$(FOR)" bash scripts/release/promote-ota.sh $(patsubst promote-%,%,$@) $(V)
 
 promote-device:
 	@if [ -z "$(DT)" ]; then echo "Usage: make promote-device DT=<type> [V=<min_version>]" >&2; exit 1; fi
@@ -636,3 +644,13 @@ clean:
 	rm -f $(TWITCH_DIR)/twitch-irc
 	rm -rf $(HAL_DIR)/.venv $(HAL_DIR)/__pycache__
 	rm -rf $(WEB_DIR)/dist $(WEB_DIR)/node_modules
+
+# Publish prebuilt service packages without assuming their implementation language.
+.PHONY: upload-service promote-service
+upload-service:
+	COMPONENT="$(COMPONENT)" V="$(V)" PACKAGE="$(PACKAGE)" REPLACES="$(REPLACES)" bash scripts/release/upload-service.sh
+
+promote-service:
+	@test -n "$(COMPONENT)" || (echo "COMPONENT is required" >&2; exit 1)
+	@test -n "$(OTA_SIGNING_PRIVATE_KEY)" -a -n "$(OTA_SIGNING_KEY_ID)" || (echo "Service metadata requires OTA signing credentials" >&2; exit 1)
+	FOR="$(FOR)" ACTIVATE="$(ACTIVATE)" bash scripts/release/promote-ota.sh "$(COMPONENT)" $(V)

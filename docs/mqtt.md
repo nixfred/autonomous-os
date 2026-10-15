@@ -6,7 +6,7 @@ The OS server uses MQTT to communicate with the backend server (status reporting
 
 - Client: Eclipse Paho autopaho (Go)
 - Auto-reconnect on connection loss
-- Client ID format: `device-{DeviceID}`
+- Client ID format: `os-server-{DeviceID}`
 
 ## Configuration
 
@@ -40,6 +40,8 @@ The OS server uses MQTT to communicate with the backend server (status reporting
 }
 ```
 
+`ota` is a defined constant but has no router case; see [`ota` — not handled](#ota--not-handled).
+
 ### `info` — Report device information
 
 **Receive:** `{"cmd": "info"}`
@@ -54,6 +56,8 @@ The OS server uses MQTT to communicate with the backend server (status reporting
   "mac": "{MAC address}",
   "time": "2026-03-26T17:00:00Z",
   "wakeword_enabled": false,
+  "voice_input_mode": "automatic",
+  "cloud_perception": { "motion": false, "emotion": false, "pose": false, "fire_hazard": false, "speaker_id": false, "speech_emotion": false },
   "agent_runtime": "openclaw"
 }
 ```
@@ -66,7 +70,9 @@ The OS server uses MQTT to communicate with the backend server (status reporting
 `codex_version`, `claudecode_version`, `opencode_version`, `local_ip`, `tts_provider`, `tts_voice`,
 `stt_language`, `timezone`, `unsupported_channels`, `skills`. `wakeword_enabled` is always
 present and reports the effective top-level wake-word gate from config
-(`true` or `false`; a missing legacy config value reports `false`). `timezone` is the device's
+(`true` or `false`; a missing legacy config value reports `false`). `cloud_perception` is always
+present and reports the saved camera and voice cloud opt-ins (a missing legacy value reports all `false`); see
+[`cloud_perception.set`](#cloud_perceptionset). `timezone` is the device's
 **live** IANA zone (e.g. `Asia/Ho_Chi_Minh`), read fresh from `/etc/timezone`
 (falling back to config), not just the config record. The six per-runtime
 versions are all probed at startup (each from its own `--version`) and
@@ -351,6 +357,11 @@ before synthesis; valid requests acknowledge `starting`, then `success` or
 | `tts.set` | Persist TTS voice/provider/language/speed config | `provider`, `voice`, `language`, optional `speed` |
 | `tts.preview` | One-shot TTS preview (no config write) | `text` (required), optional `provider`/`voice`/`language`/`speed` |
 | `wakeword.gate` | Set the top-level wake-word gate (async; acks `starting`) | `enabled` (required boolean) |
+| `wakeword.settings.get` | Read the wake settings: gate, phrases, chime, wake light, listening window, plus limits (synchronous) | _(none)_ |
+| `wakeword.settings.set` | Save any subset of the wake settings through the `PUT /api/device/config` path; replies once with the saved settings | any of `enabled`, `phrases`, `chime`, `light`, `followup_s` |
+| `wakeword.light.preview` | Play a candidate wake light for 3 s via HAL `POST /led/wake-light/preview`; nothing is saved (synchronous) | `color`, optional `effect`/`speed` |
+| `cloud_perception.set` | Turn camera or voice cloud perceptions **off** (opt-out only; async; acks `starting`) | any of `motion`, `emotion`, `pose`, `fire_hazard`, `speaker_id`, `speech_emotion` (must be `false`) |
+| `voice.input_mode` | Select voice input behavior (async ack) | `mode`: `automatic` or `tap_to_talk` |
 | `timezone.set` | Apply the device's IANA timezone (async; acks `starting`) | `timezone` (required, e.g. `Asia/Ho_Chi_Minh`) |
 | `oauth.set` | Store/replace an OAuth token for a provider | `provider`, `access_token`, optional `refresh_token`/`token_type`/`expires_at`/`scopes`/`user_email`/`client_id` |
 | `oauth.remove` | Delete the stored OAuth token for a provider | `provider` |
@@ -362,6 +373,22 @@ before synthesis; valid requests acknowledge `starting`, then `success` or
 | `skills.uninstall` | Remove one installed skill from the active runtime (synchronous) | `name` |
 | `skills.save` | Write one authored skill into the active runtime's skills dir (synchronous) | `name`, `description`, `instructions` |
 | `skills.upload` | Install one `.md`, `.zip`, or `.skill` file on the active runtime (synchronous) | `filename`, `content_base64` |
+| `face.enroll` | Enroll one face photo via HAL `POST /face/enroll` (async; acks `starting`) | `image_base64`, `label`, optional `telegram_username`/`telegram_id` |
+| `face.owners` | List enrolled people via HAL `GET /face/owners` (synchronous) | _(none)_ |
+| `face.remove` | Delete one person's whole `users/<label>/` folder (face, voice, Telegram, history) via HAL `POST /face/remove` (async; acks `starting`) | `label` |
+| `voice.enroll` | Record 15s on the lamp's own mic and enroll the voice via HAL `POST /speaker/record-enroll` (async; acks `starting` with the duration) | `label` |
+| `voice.owners` | List everyone's voice sample files from `users/<label>/voice/` (synchronous) | _(none)_ |
+| `voice.remove` | Delete one person's whole voice profile via HAL `POST /speaker/remove`; face data stays (async; acks `starting`) | `label` |
+| `voice.file.get` | Return one voice sample file as base64 for playback (synchronous) | `label`, `file` |
+| `voice.file.remove` | Delete one voice sample and its `.npy`, like `POST /api/voice/file/remove` (synchronous) | `label`, `file` |
+| `led.resting.get` | Read the owner's resting light choice, device default and look in effect via HAL `GET /led/resting` (synchronous) | _(none)_ |
+| `led.resting.set` | Save the resting light (`default`, `off` or `custom` colour) via HAL `PUT /led/resting`; survives reboots (synchronous) | `mode`, `color` for `custom` |
+| `led.resting.preview` | Paint a candidate colour without saving via HAL `POST /led/resting/preview`; reverts 10 s after the last preview; acks failures only | `color` |
+| `volume.get` | Read the speaker volume as 0-100% of the allowed range (synchronous) | _(none)_ |
+| `volume.set` | Set the speaker volume, 0-100% of the allowed range, via HAL `POST /audio/volume` (synchronous) | `volume` |
+| `mic.get` | Read the mic mute state and the hardware mic switch (synchronous) | _(none)_ |
+| `mic.set` | Mute or unmute the mic via HAL `POST /voice/mute` / `/voice/unmute`; the hardware switch wins (synchronous) | `muted` |
+| `realtime.get` | Read the realtime settings (key only as `has_api_key`) and the valid provider/voice/reasoning options (synchronous) | _(none)_ |
 | `chat.file.get` | Fetch one device-local file a turn named (synchronous) | `path` (required), optional `session_id`/`run_id` |
 | `chat.send` | Start an agent turn from the backend and stream it back (acks a run id, then emits `chat.event`) | `message` (required), optional `images[]`/`files[]`/`session_id`/`speak` |
 | `environment.status` | Read the HAL environment snapshot by capability, independent of sensor model | _(none)_ |
@@ -372,6 +399,18 @@ before synthesis; valid requests acknowledge `starting`, then `success` or
 | `system.shutdown` | Queue HAL's cue- and servo-aware OS shutdown | _(none)_ |
 | `system.ota_versions` | Per-component OTA versions + what bootstrap is installing now (the web Versions card's data) | _(none)_ |
 | `system.software_update` | Force-install the published version of one component (the Versions card's `update` button); replies `success`/`started`, then an unsolicited completion report | `target` (required) |
+| `device.rename` | Rewrite the agent name in `IDENTITY.md` (new wake words follow via WatchIdentity); then tells the agent its new name | `name` (required) |
+| `device.soft_reset` | Delete `config.json` and restart os-server into AP setup mode (no reboot, firmware kept). Fire-and-forget: **no ack** is published | _(none)_ |
+| `openclaw.setup` / `hermes.setup` / `picoclaw.setup` / `claudecode.setup` / `codex.setup` / `opencode.setup` | Switch the agentic backend to the runtime the kind names (acks `starting`, then `success` after the readiness probe passes, or `failure` after rollback; each ack echoes the kind). os-server restarts after `success` | _(none)_ |
+| `schedule.sync` | Replace the whole scheduled-task list (backend is authoritative); acks `success` with each schedule's `next_run_at` | `timezone`, `schedules[]` |
+| `schedule.run` | Run one stored schedule now (cadence and `next_run_at` unchanged); `failure` when the agent is busy | `id` (required) |
+| `schedule.mutate.ack` | Backend verdict on one device proposal; the device drops the queued intent on any terminal verdict | `intent_id`, `applied`, `conflict`, optional `reason` |
+| `harness.pair.start` | Start Harness pairing; replies with the pairing info (live code) | _(none)_ |
+| `harness.status` | Harness pairing/connection status | _(none)_ |
+| `harness.pair.cancel` | Cancel a pending Harness pairing; replies `{cancelled:true}` | _(none)_ |
+| `harness.pair.revoke` | Remove the Harness pairing and turn Harness-only voice off; replies `{unpaired:true}` | _(none)_ |
+
+`schedule.mutate` is **outbound** only (published on `fd_channel`, never received): when the user creates, edits or deletes a task from the device's own UI (`POST`/`PATCH`/`DELETE /api/schedule…`), the device publishes a proposal `{intent_id, op, schedule_id?, base_rev?, schedule?}` and retries it until `schedule.mutate.ack` arrives; the next `schedule.sync` is what the device treats as truth.
 
 `system.reboot` and `system.shutdown` publish `status:"starting"` before the
 device schedules the action, so the backend receives an acknowledgement before
@@ -538,19 +577,123 @@ those — poll `system.ota_versions` for the final state.
 
 An unrecognized `kind` replies with `status:"failure"` and `error:"unknown kind: <kind>"`.
 
+#### `voice.input_mode`
+
+**Receive:** `{"cmd":"data","kind":"voice.input_mode","data":{"mode":"tap_to_talk"}}`
+
+`automatic` is the default, including older configs without the field; it preserves the current flow and saved `wakeword` flag. `tap_to_talk` applies to the device runtime with Harness-only OFF: tap once to record with parallel STT/realtime upload, again to stop and commit realtime for a response or delegation without waiting for STT finalization or speaker identity; disabled/unavailable realtime falls back to an available STT `voice_command`. Gemini/OpenAI use manual streaming; Pipecat retains internal STT finalization, while GPT Live buffers until finish because it lacks manual commit. Silence does not auto-submit. It bypasses the wake gate/window without deleting the saved wake flag. During TTS, a tap only interrupts playback; the next tap records. The physical mic lock always applies.
+
+`mode` is required and accepts only `automatic` or `tap_to_talk`; invalid payloads return `failure` before mutation. Valid commands acknowledge `starting`, then `success` or `failure` with `data.mode`. HTTP/MQTT share the persistence/apply lock: save `voice_input_mode` to config.json, then call HAL `POST /voice/input-mode` with a 30-second timeout. Mode-only changes do not restart HAL or os-server; HAL cancels in-flight capture and reconfigures its voice worker/session. Success follows HAL application. Save/apply failures remain pending for a same-value retry; duplicates after success do not reapply. A combined change involving restart-required wake/boot/realtime fields still restarts once. MQTT info and BE ping report configured values, not proof of application; consult the terminal ack. Harness ON retains its separate tap flow.
+
 #### `wakeword.gate`
 
 Turns the top-level `wakeword` flag on or off. It uses the same asynchronous
-acknowledgement pattern as `realtime.set`: the device acknowledges receipt,
-persists the flag to `config.json`, restarts HAL when the value changes, then
-publishes the outcome.
+acknowledgement pattern as `realtime.set`: the device immediately acknowledges
+receipt with `starting`, then saves the flag and applies it in a background worker.
+Wake updates from MQTT and HTTP Settings are serialized.
 
 **Receive:** `{"cmd":"data","kind":"wakeword.gate","data":{"enabled":true}}`
 
 The terminal success acknowledgement echoes `{"enabled":true}`. Omitting
 `enabled` or supplying invalid JSON returns `status:"failure"`. `success`
-means the flag was saved and HAL is restarting; it does not wait for HAL to be
-ready.
+means the flag was saved and any required `systemctl restart` of HAL completed
+successfully (the restart command has a 30-second timeout); it does not verify
+voice pipeline readiness.
+Save errors, restart errors, and restart timeouts return `failure`. The config may
+already be saved when a restart fails. Within the current os-server process, a
+pending wake apply is retained after a save or restart failure, so retrying the
+same desired value retries the apply. Once applied successfully, an unchanged
+wake value does not trigger another restart.
+
+#### `wakeword.settings.*` — Wake settings over MQTT
+
+The phone and website twin of the web **Settings > Device > How to talk** wake
+controls. `set` goes through the same validation and save path as
+`PUT /api/device/config`, so HTTP and MQTT edits are serialized and follow the
+same rules.
+
+| App action | MQTT kind |
+|------------|-----------|
+| Open the screen | `wakeword.settings.get` |
+| Save | `wakeword.settings.set` |
+| Try a light colour/effect on the device | `wakeword.light.preview` |
+
+```json
+{"cmd": "data", "kind": "wakeword.settings.get", "data": {}}
+{"cmd": "data", "kind": "wakeword.settings.set", "data": {"phrases": ["sam", "hey sam"], "chime": true,
+  "light": {"enabled": true, "color": [16, 9, 3], "effect": "spin", "speed": 1.5}, "followup_s": 5}}
+{"cmd": "data", "kind": "wakeword.light.preview", "data": {"color": [16, 9, 3], "effect": "spin", "speed": 1.5}}
+```
+
+`get` and `set` reply `success` with:
+
+```json
+{"enabled": true, "voice_input_mode": "automatic", "agent_name": "sam",
+ "phrases": ["sam", "hey sam"], "phrases_custom": true, "phrases_default": ["wake up sam", "hello sam", "..."],
+ "name_anywhere": false, "max_phrases": 30, "max_phrase_chars": 40,
+ "chime": true, "has_light": true,
+ "light": {"enabled": true, "color": [16, 9, 3], "effect": "spin", "speed": 1.5},
+ "light_effects": ["solid", "breathing", "spin", "blink"], "light_speed_min": 0.25, "light_speed_max": 3,
+ "followup_s": 5, "followup_custom": true, "followup_min_s": 3, "followup_max_s": 30}
+```
+
+- `enabled` is the **Require attention trigger** gate (config `wakeword`). The
+  wake settings only matter while `voice_input_mode` is `automatic`; hide them
+  for `tap_to_talk`.
+- `phrases` is the list in effect. `phrases_custom` is false while it is the
+  built-in list (which follows agent renames). In `set`, `phrases` replaces the
+  whole list; `[]` restores the built-in list. Phrases are lowercased, spaces
+  collapsed and duplicates dropped; each needs a letter and at most
+  `max_phrase_chars` characters, and there are at most `max_phrases`.
+- `name_anywhere` is true on Intern: each entry is a **name** that wakes the
+  device anywhere in a sentence ("hey intern", "what time is it, intern?"), and
+  the built-in list is `["autonomous", "intern"]` plus the agent's name. Show
+  the entries as names and drop the single-word warning. On Lamp it is false:
+  entries are greeting + name phrases matched at a sentence start or end.
+- `chime` and `light.enabled` are the two wake cues; at least one stays on, so
+  turning both off fails with `keep the wake chime or the wake light on, so a
+  wake is noticeable`.
+- `light` is the look in effect: the owner's saved look over the board's
+  listening look (`[4, 8, 16]`, `breathing`, `1.2`). In `set`, `light`
+  replaces the saved look and toggle; send all four fields. `color` is
+  `[r, g, b]` 0-255 and not black; `effect` is one of `light_effects`; `speed`
+  is `light_speed_min`–`light_speed_max`. Devices with `has_light: false`
+  ignore it.
+- `followup_s` is how long the device keeps listening after a wake or a reply
+  without the wake phrase (`followup_min_s`–`followup_max_s`). While
+  `followup_custom` is false it is HAL's image default (5 s on Intern v2 and
+  Lamp), or 10 s when HAL is down.
+
+`set` changes only the fields it sends, and an empty payload fails with
+`nothing to change`. Phrases, chime, light and the listening window apply live.
+Changing `enabled` restarts HAL (up to 30 s): if the update is still running
+after 5 s, the reply is `success` with the saved settings and `applying: true`,
+and a later restart failure is published as a separate `failure` for the same
+kind. Validation errors always reply `failure` before anything is saved.
+
+`wakeword.light.preview` plays the look for 3 s, then restores the strip.
+`effect` defaults to `breathing` and `speed` to `1.2`. It replies `success`
+with `{"status": "ok", "painted": false}` while sleep, speech, music or the
+mic-muted light owns the strip. Devices without the `light` capability reply
+`failure` with `this device has no light`.
+
+#### `cloud_perception.set`
+
+Turns perceptions that upload camera images or voice audio to the DL backend **off**. MQTT has no
+sender authentication, so it can only withdraw consent: any key set to `true` is
+rejected with `status:"failure"` and the config is not changed. Turning a perception
+on stays a local choice in the device's web **Settings > Privacy**
+([os-server.md](os-server.md#cloud-camera-perception)). Keys left out keep their saved value.
+
+**Receive:** `{"cmd":"data","kind":"cloud_perception.set","data":{"pose":false}}`
+
+Valid requests ack `starting`, then go through the same serialized path as
+`PUT /api/device/config`: the named keys are merged into the latest saved value under
+the shared lock (so two concurrent opt-outs cannot undo each other), HAL applies it
+live (or, if that fails, is restarted and must answer the apply call again), and only then the device acks `success` or
+`failure` with the resulting six values in `data`. An empty payload,
+invalid JSON or any `true` value acks `failure` before mutation. `info` reports the
+saved state in `cloud_perception`.
 
 #### `timezone.set`
 
@@ -625,6 +768,43 @@ expired an hour after it was stored.
 carrying BOTH a `refresh_token` AND `refresh:true` (the backend owns refresh
 eligibility via the `refresh` flag) once it is within 10 minutes of expiry, via the
 backend `/connector/refresh-token` endpoint.
+
+**Per-connection variables:** a connector whose API or token endpoint is specific to
+one account (for example a store domain) can carry those values in the relayed
+`credentials` map: individual keys (e.g. `shop`) plus `connector_vars`, a JSON object
+of string values. For a connector that refreshes through the backend, the device stores
+them with the rest of `credentials` and, on every refresh, sends the parsed object as
+`vars` in the `/connector/refresh-token` body
+(`{"connector","refresh_token","vars":{...}}`) so the backend can address the same
+account. `vars` is omitted when the connector has none, so connectors with static
+endpoints send exactly the same body as before. An unparseable `connector_vars` is
+logged (connector name only) and treated as absent. The refresh re-write keeps the
+stored `credentials` intact, so the values survive every rotation.
+
+**Connector skill (`skills/connectors`):** the agent calls linked services through
+`scripts/connector.py`, which only sends a credential to the connector's official host.
+Most hosts are fixed per connector; **Shopify** is per account: the helper sends the
+token (in `X-Shopify-Access-Token`, not `Authorization`) only to the single store host
+stored in `credentials.shop` and refuses every other host. The skill documents draft
+product and article creation and gates anything customer-visible behind a read-back.
+
+**Shopify is a client-credentials connector.** The customer creates their own Shopify
+app and enters the store domain, client ID and client secret in the Autonomous app. The
+backend checks them by minting a token, then relays `connector.set.shopify` with
+`auth_type: "pat"`, an `access_token` that lasts about 24 hours, **no** refresh token,
+`refresh: false`, and `credentials` `{shop, client_id, client_secret}`. Because there is
+no refresh token the entry never enters the `/connector/refresh-token` loop (the loop
+only picks entries with a `refresh_token` and `refresh:true`). Instead the skill helper
+renews the token itself: before a call, if the stored token is missing or has under five
+minutes left, it POSTs `grant_type=client_credentials` with the saved client ID and
+secret to `https://<stored shop>/admin/oauth/access_token` (that host only, no redirects
+followed) and caches the result in `shopify.token.json` next to the entry file. The cache
+is helper-owned (mode `0600`, written atomically), is keyed by a hash of shop + client ID
+so it is ignored when either changes, never holds the secret, and is dropped the next
+time the helper finds the connector gone. The helper never rewrites the entry file that the connector writer
+manages, retries a call once with a freshly minted token after a `401`, and prints neither
+tokens nor the secret. If Shopify rejects the saved credentials the helper exits with a
+"reconnect" message instead of looping.
 
 #### `channel.refresh_config`
 
@@ -743,6 +923,12 @@ skills root, so it includes the skill dir). A basename or a `..` attempt does no
 resolve — lookup is an exact match against the listing, never a filesystem join.
 When `path` is supplied, the device reads only that file; a reference-heavy skill
 does not delay the reply by loading all of its other files first.
+
+Only skill content is listed. Dotfiles and build or editor leftovers are skipped
+and cannot be read by `path` either: `__pycache__/` and `node_modules/`
+directories, `Thumbs.db`, and files ending in `.pyc`, `.pyo`, `.swp`, `.swo`,
+`.tmp` or `.log` (the same set `scripts/release/upload-skills.sh` leaves out of a
+skill zip). The same rule applies to `GET /api/agent/skills/files`.
 
 **Synchronous** — reading a skill dir is local disk, so there is no `starting` ack.
 
@@ -934,6 +1120,350 @@ After its `success` response, the device immediately publishes its normal MQTT
 `info` uplink with the refreshed `skills` inventory. A failure to publish that
 best-effort follow-up is logged, but does not change the successful upload result.
 
+#### `face.enroll`
+
+Enrolls one face photo for a person. This is the MQTT counterpart of HAL
+`POST /face/enroll` (the call the web Face settings make): os-server validates
+the payload and forwards it to HAL, which saves the photo under
+`users/{label}/`, trains its embeddings, and records the Telegram fields in
+`metadata.json`.
+
+**Receive:**
+```json
+{"cmd": "data", "kind": "face.enroll", "data": {
+  "image_base64": "/9j/4AAQSkZJRgABAQ...",
+  "label": "alice",
+  "telegram_username": "alice_tg",
+  "telegram_id": "123456789"
+}}
+```
+
+| Field | Required | Notes |
+|-------|----------|-------|
+| `image_base64` | yes | JPEG or PNG bytes, standard base64. A `data:image/...;base64,` prefix is stripped. Decoded size at most 10 MiB |
+| `label` | yes | Person name, 1–64 characters after trimming; HAL normalizes it (the folder name is the `label` in the reply) |
+| `telegram_username` | no | Stored in the person's metadata |
+| `telegram_id` | no | Telegram user ID for DM targeting |
+
+Send one command per photo; to enroll several photos of one person, repeat
+the command with the same `label`. Large photos can use the `privacy`
+envelope, which fetches `data` over TLS instead of carrying it on the broker.
+
+**Async**: invalid payloads fail at once, without calling HAL. Valid ones ack
+`starting`, then `success` or `failure` once HAL finishes. Enrollments run
+one at a time on the device because HAL rewrites the person's metadata file
+without a lock (`face.remove` shares that lock). A `failure` carries HAL's reason in `error`, for example
+`POST /face/enroll returned 400: <detail>` for a photo HAL rejects, or a
+`503` when sensing is not running. The image is never logged.
+
+```json
+{
+  "device": "lamp", "type": "data", "kind": "face.enroll",
+  "status": "starting | success | failure",
+  "error": "<message>",
+  "data": { "status": "ok", "label": "alice", "telegram_username": "alice_tg",
+            "telegram_id": "123456789", "photo_path": "/root/.../users/alice/<file>.jpg",
+            "enrolled_count": 2 }
+}
+```
+
+`data` is present only on `success`. `enrolled_count` is the number of people
+face recognition knows after this photo (not photos, and not voice-only
+people). It is not the same count as `face.owners`' `enrolled_count`.
+
+#### `face.owners` / `face.remove`
+
+`face.owners` lists enrolled people via HAL `GET /face/owners`. It runs
+synchronously (a directory scan), so there is no `starting` ack. HAL's shared
+`unknown` bucket for unidentified people is dropped from the list, and only
+identity fields are returned; the per-day logs HAL also reports are not.
+
+The list holds everyone with a face photo, a voice sample or a
+`metadata.json`, so a voice-only person appears with `photo_count: 0`.
+`enrolled_count` counts those same people, so it can be higher than the
+face-only count that `face.enroll` and `face.remove` return. `photos` are
+filenames only; there is no MQTT kind to fetch the image bytes.
+
+```json
+{"cmd": "data", "kind": "face.owners"}
+```
+```json
+{
+  "kind": "face.owners", "status": "success | failure", "error": "<message>",
+  "data": { "enrolled_count": 1, "persons": [
+    { "label": "alice", "telegram_username": "alice_tg", "telegram_id": "123456789",
+      "photo_count": 2, "photos": ["1711929600000.jpg", "1711929700000.jpg"] } ] }
+}
+```
+
+`face.remove` deletes the person, not only their face: HAL `POST /face/remove`
+removes the whole `users/<label>/` folder, taking the face photos, enrolled
+voice samples, `metadata.json` (Telegram) and the mood, wellbeing, posture
+and habit history with it. It cannot be undone, so clients should label the
+action "remove this person" and confirm first. HAL then retrains every
+remaining person from disk, so the time grows with people and photos. It acks `starting`, then `success`
+or `failure`, and shares the `face.enroll` lock so a remove never overlaps an
+enrollment. `label` is required (1–64 characters); `unknown` is rejected
+without calling HAL. An unknown label fails with `POST /face/remove returned
+404: person not found`.
+
+```json
+{"cmd": "data", "kind": "face.remove", "data": {"label": "alice"}}
+```
+```json
+{
+  "kind": "face.remove", "status": "starting | success | failure", "error": "<message>",
+  "data": { "status": "ok", "label": "alice", "enrolled_count": 0 }
+}
+```
+
+#### `voice.*` — Voice settings over MQTT
+
+The `voice.*` kinds give the phone exactly what the web Voice settings
+(`VoiceSection.tsx`) do over HTTP:
+
+| Web action | Web HTTP call | MQTT kind |
+|------------|---------------|-----------|
+| Start Recording (15s on robot) | HAL `POST /speaker/record-enroll` | `voice.enroll` |
+| Voice Files list | `voice_samples` of HAL `GET /face/owners` | `voice.owners` |
+| Play a sample | HAL `GET /face/file/<label>/voice/<file>` | `voice.file.get` |
+| × on a sample | os-server `POST /api/voice/file/remove` | `voice.file.remove` |
+| Remove all (face data is preserved) | HAL `POST /speaker/remove` | `voice.remove` |
+
+`label` is trimmed and lowercased, as the web does (1–64 characters).
+Enroll and both removals run one at a time on the device.
+
+**`voice.enroll`** records from the **lamp's own microphone** — never phone
+audio, because speaker recognition listens through that mic. Recording is
+15 seconds, the web's length; the person should stand near the lamp and read
+aloud for the whole time (the web shows phrases from
+`components/setup/voice-phrases.ts`; any 3-second "get ready" countdown is
+the app's own). Invalid payloads fail at once, without calling HAL. A valid
+one acks `starting` when recording begins — `data` carries `label` and
+`duration_sec` for the countdown — then `success` with the voice profile, or
+`failure` with HAL's reason, a few seconds after the recording ends. If
+another voice change is running, `starting` waits for it. Repeating the
+command for the same `label` adds another sample. Samples carry HAL's
+default origin, `web`.
+
+```json
+{"cmd": "data", "kind": "voice.enroll", "data": {"label": "alice"}}
+```
+```json
+{
+  "kind": "voice.enroll", "status": "starting | success | failure", "error": "<message>",
+  "data": { "label": "alice", "duration_sec": 15 }
+}
+```
+
+On `success`, `data` is the profile:
+
+```json
+{ "name": "alice", "display_name": "alice", "enrollment_sources": ["web"],
+  "num_samples": 2, "num_extended": 0,
+  "enrolled_at": "2026-10-01T07:00:00Z", "updated_at": "2026-10-01T07:05:00Z" }
+```
+
+Failure examples: `POST /speaker/record-enroll returned 409: Privacy switch
+is on -- microphone recording is blocked`, `503: voice enroll needs a real
+microphone` in the simulator, `503: embedding service unavailable — please
+try again`.
+
+**`voice.owners`** lists everyone with at least one file in
+`users/<label>/voice/`, with the sorted file names — the same `voice_samples`
+the web shows. The list includes `.npy` embeddings and other files next to
+the WAVs, as the web does. os-server reads the folder directly; HAL is not
+called. HAL's `unknown` bucket and hidden folders are skipped.
+
+```json
+{"cmd": "data", "kind": "voice.owners"}
+```
+```json
+{
+  "kind": "voice.owners", "status": "success | failure", "error": "<message>",
+  "data": { "persons": [
+    { "label": "alice", "voice_samples": ["sample_web_1711929600_ab12.npy", "sample_web_1711929600_ab12.wav"] } ] }
+}
+```
+
+**`voice.file.get`** returns one file from `users/<label>/voice/` inline as
+base64 for playback. `file` must be one name from `voice_samples`; paths,
+symlinks out of the folder and files over 2 MiB fail. A 15-second sample is
+about 480 KB.
+
+```json
+{"cmd": "data", "kind": "voice.file.get", "data": {"label": "alice", "file": "sample_web_1711929600_ab12.wav"}}
+```
+```json
+{
+  "kind": "voice.file.get", "status": "success | failure", "error": "<message>",
+  "data": { "label": "alice", "file": "sample_web_1711929600_ab12.wav",
+            "content_type": "audio/wav", "size": 480044, "content_base64": "UklGR..." }
+}
+```
+
+**`voice.file.remove`** deletes one audio sample (`.wav`, `.ogg`, `.mp3`,
+`.webm`, `.m4a`) and its `.npy` embedding. It runs the same code as
+`POST /api/voice/file/remove` (`system/lib/voicefile`): other files are
+refused with `only audio samples can be deleted`, and a missing sample fails
+with `file not found`. When the last WAV is gone, HAL `POST /speaker/remove`
+drops the whole voice profile and `profile_removed` is `true`. It fails with
+`voice enrollment in progress — try again` while a voice change is running.
+
+```json
+{"cmd": "data", "kind": "voice.file.remove", "data": {"label": "alice", "file": "sample_web_1711929600_ab12.wav"}}
+```
+```json
+{
+  "kind": "voice.file.remove", "status": "success | failure", "error": "<message>",
+  "data": { "deleted": "sample_web_1711929600_ab12.wav", "remaining": 1, "profile_removed": false }
+}
+```
+
+**`voice.remove`** deletes the person's whole voice profile via HAL
+`POST /speaker/remove`; face photos, `metadata.json` and history stay. It
+acks `starting`, then `success` or `failure`. A person with no voice profile
+fails with `POST /speaker/remove returned 404: voice profile not found: <label>`.
+
+```json
+{"cmd": "data", "kind": "voice.remove", "data": {"label": "alice"}}
+```
+```json
+{
+  "kind": "voice.remove", "status": "starting | success | failure", "error": "<message>",
+  "data": { "status": "ok", "name": "alice", "removed": true }
+}
+```
+
+#### `led.resting.*` — Resting light over MQTT
+
+The `led.resting.*` kinds give the phone the web **Resting light** settings
+(`LedSection.tsx`). HAL owns the look and saves the choice in
+`/var/lib/hal/resting_led.json`; os-server only validates and relays.
+
+| App action | HAL call | MQTT kind |
+|------------|----------|-----------|
+| Open the screen | `GET /led/resting` | `led.resting.get` |
+| Drag a colour (live on the device) | `POST /led/resting/preview` | `led.resting.preview` |
+| Save / toggle off / back to default | `PUT /led/resting` | `led.resting.set` |
+
+```json
+{"cmd": "data", "kind": "led.resting.set", "data": {"mode": "custom", "color": [8, 4, 1]}}
+{"cmd": "data", "kind": "led.resting.preview", "data": {"color": [20, 0, 10]}}
+```
+
+`mode` is `default` (device preset), `off`, or `custom`; `custom` needs `color`
+`[r, g, b]` with channels 0-255, and black is stored as `off`. `color` is
+ignored for the other modes. `get` and `set` reply `success` with HAL's snapshot:
+
+```json
+{"mode": "custom", "color": [8, 4, 1],
+ "default": {"effect": "solid", "color": [5, 4, 3]},
+ "effective": {"effect": "solid", "color": [8, 4, 1]}}
+```
+
+**Live preview.** While the owner drags, send `led.resting.preview`, throttled
+to about 5 per second (one every ~200 ms) plus the final position. Each preview
+paints immediately without touching the saved choice or the SD card, and does
+not reply on success, so a drag does not flood fd_channel. HAL skips the paint
+while the device sleeps, speaks, plays music or shows the mic-muted light. If no `set` follows, the strip
+returns to the saved look 10 s after the last preview, so an abandoned screen
+never leaves a colour behind. Send `led.resting.set` when the owner taps Save;
+it cancels any pending preview, stores the choice, clears an earlier explicit
+off/colour and repaints. Expect the round trip through the broker to add a few
+hundred milliseconds of lag.
+
+Devices without the `light` capability reply `failure` with
+`this device has no light`. Invalid input fails before HAL is called.
+
+#### `volume.*` / `mic.*` — Speaker volume and mic over MQTT
+
+The phone twin of the web Overview **Audio** card. Both need the `audio`
+capability (`this device has no audio` otherwise) and reply synchronously.
+
+| App action | HAL call | MQTT kind |
+|------------|----------|-----------|
+| Show the volume | `GET /audio/volume` | `volume.get` |
+| Release the volume slider | `POST /audio/volume` | `volume.set` |
+| Show the mic | `GET /voice/status` | `mic.get` |
+| Mute / Unmute button | `POST /voice/mute` / `/voice/unmute` | `mic.set` |
+
+```json
+{"cmd": "data", "kind": "volume.set", "data": {"volume": 90}}
+{"cmd": "data", "kind": "mic.set", "data": {"muted": false}}
+```
+
+**Volume** uses the slider's scale, like the web: `volume` is 0-100% of the
+allowed range, where 100% is the SAFETY.md `audio.max_volume` ceiling (or the
+mixer's 100% when the device declares none). os-server maps it onto raw mixer
+percent (`raw = round(volume × max_volume / 100)`); HAL clamps and persists it.
+`volume.get` and `volume.set` reply with:
+
+```json
+{"volume": 90, "raw": 72, "max_volume": 80}
+```
+
+Show `volume`; `raw` and `max_volume` are informational. Send `volume.set` when
+the user releases the slider, as the web does. If the app also wants the
+speaker to follow during the drag, throttle to about one per 200 ms and always
+send the final value. Each call writes the mixer and replies.
+
+**Mic**: `muted` is required (`true` mutes, `false` unmutes). `mic.get` and a
+successful `mic.set` reply with:
+
+```json
+{"muted": true, "hw_switch_muted": true, "available": true}
+```
+
+`hw_switch_muted` is the physical mic switch, `null` on devices without one.
+While it is `true` the mic cannot be unmuted: `mic.set` with `muted: false`
+fails with `Hardware mic switch is off — flip the physical switch to unmute`.
+Disable the Unmute button and show that line. `available` is false when the
+voice pipeline is down. Muting also lights the mic-muted LED, and the choice
+survives HAL restarts.
+
+#### `realtime.get` / `realtime.set` — Realtime voice settings over MQTT
+
+The phone twin of the web **Settings → Realtime** page (debug-only on the web).
+
+```json
+{"cmd": "data", "kind": "realtime.get"}
+```
+
+`realtime.get` replies `success` synchronously with the saved settings and the
+choices to offer:
+
+```json
+{
+  "config": {"enabled": true, "provider": "gemini", "model": "…", "voice": "Kore",
+             "reasoning": "LOW", "base_url": "", "has_api_key": false},
+  "options": {"providers": ["gemini", "openai", "gptlive", "pipecat_v1", "none"],
+              "voices": {"gemini": ["…"], "openai": ["…"], "gptlive": ["…"], "pipecat_v1": []},
+              "reasoning": {"gemini": ["MINIMAL", "LOW", "MEDIUM", "HIGH"], "openai": ["…"], "gptlive": [], "pipecat_v1": []}}
+}
+```
+
+The key is never returned; `has_api_key` says whether an override is stored.
+`base_url` is only the explicit override (empty means derived from the AI brain).
+`web_search` appears only for `pipecat_v1`. An empty voice or reasoning list
+means that provider has no such knob, so hide the selector.
+
+`realtime.set` saves any subset of `enabled`, `provider`, `model`, `voice`,
+`reasoning`, `api_key`, `base_url` and `web_search` (pipecat_v1 only). Omitted
+fields stay unchanged. It acks `starting`, validates against the same option
+lists, saves `config.json`, restarts HAL, then acks `success` or `failure`:
+
+```json
+{"cmd": "data", "kind": "realtime.set", "data": {"enabled": true, "provider": "gemini", "voice": "Kore", "reasoning": "LOW"}}
+```
+
+Model, voice and reasoning are stored per provider and apply to the provider
+being set (or the current one). A switch without them keeps that provider's
+saved choices; a voice or reasoning not in that provider's list is rejected.
+An empty string leaves a field unchanged, so a stored `api_key` or `base_url`
+cannot be cleared over MQTT. The ack echoes the request without `api_key`. Expect HAL to be unavailable for a few seconds after
+`success` while it restarts.
+
 #### `chat.send` + `chat.event`
 
 Internal `NO_REPLY` handoff sentinels are suppressed from `chat.event`; clients receive Harness progress and the final Harness response instead.
@@ -1042,7 +1572,8 @@ Implementation notes that matter to a backend author:
   opening filler, queued the same way when the agent is busy, same `[user] `
   prefix to the model). The separate type exists so the Flow Monitor's turn
   badge shows **where the message was typed** — 📱 `mqtt_chat` for a phone app
-  vs 🖥 `web_chat` for the monitor composer. With `speak: true` the turn forwards
+  vs 🖥 `web_chat` for the monitor composer — and so the message ends with
+  `[via:mobile]` instead of `[via:web]` (see os-server.md, "Source marker"). With `speak: true` the turn forwards
   as `voice` instead and shows as a voice turn.
 - **A dedicated broker client** (`device-<id>-chat`) is held open for the stream.
   The shared `publish` helper opens and closes a connection per message, which is
@@ -1098,6 +1629,10 @@ are optional, since a file can be requested long after its run ended.
   `workspace/` per runtime plus `/tmp`; `.json` and `.log` are not served (a
   runtime's config JSON holds gateway tokens); the path must resolve
   (`EvalSymlinks`) inside a root, so `..` and symlink escapes both fail.
+- **MQTT also refuses HAL's camera output in `/tmp/hal-*`** (sensing, motion,
+  emotion and posture snapshots). MQTT has no sender auth and those file names
+  are guessable timestamps, so only the logged-in web chat shows them. Agent
+  photos ("take a photo") live under a runtime's `media/` and are still served.
 - **Every refusal is the same message**, `"file not available"`. Which of wrong
   type / outside the roots / absent it was would tell a prober about the
   device's filesystem; the real reason is logged on the device.
@@ -1118,6 +1653,9 @@ back. It cannot back a chat UI; this pair replaces it for that purpose.
 
 ### `harness.voice-mode.get` / `harness.voice-mode.set` — Harness-only voice
 
+Enabling requires HAL to confirm MPR121 configured for the active board. Missing/false support metadata or a failed HAL lookup returns `status:"failure"` and leaves the mode off. Disabling remains allowed. The snapshot includes `supported`; see [Harness integration](harness.md#harness-only-voice-mode).
+
+
 **Receive on `fa_channel`:**
 ```json
 {"cmd":"data","kind":"harness.voice-mode.get"}
@@ -1135,10 +1673,10 @@ Both commands reply on `fd_channel` with the standard `MQTTDataResponse`
 metadata, `type:"data"`, the request's `kind`, and the same snapshot returned
 by `GET /api/harness/voice-mode` (device metadata omitted here):
 ```json
-{"type":"data","kind":"harness.voice-mode.set","status":"success","data":{"enabled":true,"generation":1789350000000000,"machineId":"computer-id","agentId":"agent-id","agentName":"Mike","focusRevision":"instance:3","focusAvailable":true}}
+{"type":"data","kind":"harness.voice-mode.set","status":"success","data":{"enabled":true,"supported":true,"generation":1789350000000000,"machineId":"computer-id","agentId":"agent-id","agentName":"Mike","focusRevision":"instance:3","focusAvailable":true}}
 ```
 
-The snapshot is `{enabled,generation,machineId,agentId,agentName?,focusRevision,focusAvailable,pending?,error?}`.
+The snapshot is `{enabled,supported,generation,machineId,agentId,agentName?,focusRevision,focusAvailable,pending?,error?}`.
 An unavailable focus can appear as `focusAvailable:false` with a snapshot
 `error` even when the command succeeds. Invalid input or an unavailable
 controller uses `status:"failure"` with the envelope's `error` field.
@@ -1247,11 +1785,11 @@ existing `buddy.pair.start` / `buddy.pair.revoke` commands on `fa_channel`. No B
 code change is required. ACL permissions and broker reachability from mobile
 networks must be verified against the real deployment. This supports a connected
 foreground app; it does not deliver mobile push notifications when the app is
-closed. See the [mobile handoff prompt](buddy-mobile-handoff_vi.md).
+closed. See the [mobile handoff prompt](vi/buddy-mobile-handoff_vi.md).
 
-### `ota` — Trigger OTA update
+### `ota` — not handled
 
-Handled by bootstrap worker, not through MQTT handler directly.
+There is no `ota` case in the os-server MQTT router: the message is logged as `unknown command` and ignored. OTA runs on the bootstrap worker's own schedule; to install one component now over MQTT use `data` kind `system.software_update`.
 
 ## Code
 
@@ -1268,6 +1806,12 @@ Handled by bootstrap worker, not through MQTT handler directly.
 | `system/server/device/delivery/mqtt/data_handler.go` | Handle `data` command kinds `oauth.set`/`oauth.remove` (+ access-token store) |
 | `system/server/device/delivery/mqtt/skills_install_store_handler.go` | Handle `skills.install_store` (async catalog download → `AgentGateway.InstallSkillArchive`) |
 | `system/server/device/delivery/mqtt/skills_upload_handler.go` | Handle `skills.upload` (inline SKILL.md → `AgentGateway.InstallSkillMarkdown`) |
+| `system/server/device/delivery/mqtt/face_enroll_handler.go` | Handle `face.enroll` (validate, then async `hal.FaceEnroll` → HAL `POST /face/enroll`) |
+| `system/server/device/delivery/mqtt/face_owners_handler.go` | Handle `face.owners` (→ HAL `GET /face/owners`, `unknown` bucket dropped) and `face.remove` (async → HAL `POST /face/remove`) |
+| `system/server/device/delivery/mqtt/led_resting_handler.go` | Handle `led.resting.get`, `led.resting.set` and `led.resting.preview` (HAL `/led/resting`, capability `light`) |
+| `system/server/device/delivery/mqtt/audio_handler.go` | Handle `volume.get`, `volume.set` (0-100% of the SAFETY.md range → HAL `/audio/volume`), `mic.get` and `mic.set` (HAL `/voice/status`, `/voice/mute`, `/voice/unmute`; 409 → hardware-switch message) |
+| `system/server/device/delivery/mqtt/voice_enroll_handler.go` | Handle `voice.enroll` (async → HAL `POST /speaker/record-enroll`, lamp mic, 15s), `voice.owners`, `voice.file.get`, `voice.file.remove` (via `system/lib/voicefile`) and `voice.remove` (async → HAL `POST /speaker/remove`) |
+| `system/lib/voicefile/voicefile.go` | List, read and delete voice samples under `users/<label>/voice/`; shared by `POST /api/voice/file/remove` and the `voice.*` kinds |
 | `system/server/device/delivery/mqtt/skills_files_handler.go` | Handle `skills.files` (read one installed skill's files: list, or one file's contents) |
 | `system/server/device/delivery/mqtt/skills_uninstall_handler.go` | Handle `skills.uninstall` |
 | `system/server/device/delivery/mqtt/chat_send_handler.go` | Handle `chat.send` — forwards the turn over loopback to the sensing endpoint |

@@ -104,3 +104,43 @@ def test_tracking_timeout_stops_even_when_camera_has_no_frames(monkeypatch):
     assert animation.robot.actions == []
     assert animation._current_state == animation.positions
     assert animation.dispatched == [("play", "idle")]
+
+
+def test_a_tracking_session_leaves_a_scene_hold_in_place(monkeypatch):
+    from hal.drivers.motors import hold
+
+    service = object.__new__(TrackerService)
+    state = TrackingState(target_label="object")
+    state.running.set()
+    service._state = state
+    service._follower = _FakeFollower()
+    service._yaw_pid = _FakePID()
+    service._pitch_pid = _FakePID()
+
+    from hal import app_state
+
+    monkeypatch.setattr(app_state, "_active_scene", "reading", raising=False)
+    animation = _FakeAnimationService()
+    hold.claim(animation, hold.SCENE)
+    clock = iter((0.0, C.MAX_TRACK_DURATION_S + 0.1, C.MAX_TRACK_DURATION_S + 0.1))
+    monkeypatch.setattr(tracker_service.time, "perf_counter", lambda: next(clock))
+    monkeypatch.setattr(tracker_service.time, "sleep", lambda _seconds: None)
+
+    service._track_loop(_NoFrameCamera(), animation)
+
+    assert not animation._tracking_active
+    assert animation._hold_mode
+    assert hold.owners(animation) == {"scene"}
+    # Idle would play once and then freeze at its last frame under the scene's hold.
+    assert animation.dispatched == []
+
+
+def test_a_per_call_duration_shortens_but_never_extends_the_cap():
+    """A greeting asks for a short look; nobody may ask for more than the cap."""
+    svc = TrackerService()
+    svc.start(target_label="face", max_duration_s=3)
+    assert svc._max_duration_s == 3
+    svc.start(target_label="face", max_duration_s=C.MAX_TRACK_DURATION_S * 10)
+    assert svc._max_duration_s == C.MAX_TRACK_DURATION_S
+    svc.start(target_label="face")
+    assert svc._max_duration_s == C.MAX_TRACK_DURATION_S

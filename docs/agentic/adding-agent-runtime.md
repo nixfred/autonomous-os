@@ -18,8 +18,9 @@ wire the switch, install, migration, skills, hooks, and reset.
 > **Agentic-backend docs:** this file (generic contract + how to add one) ·
 > [`hermes.md`](hermes.md) (Hermes, a full backend) · [`picoclaw.md`](picoclaw.md)
 > (PicoClaw, client-only gateway with install/presync scripts) ·
-> [`claudecode.md`](claudecode.md) (Claude Code behind a local bridge, native
-> channel plugins for Telegram/Discord, claude.ai OAuth login). Per-backend
+> [`claudecode.md`](claudecode.md) (Claude Code behind a local bridge,
+> device-owned Telegram/Slack/Discord channels — native channel plugins
+> deliberately not used — claude.ai OAuth login). Per-backend
 > protocol/quirks live in those; the generic mechanics + checklist live here.
 
 ---
@@ -28,10 +29,14 @@ wire the switch, install, migration, skills, hooks, and reset.
 
 - `config.agent_runtime` (`/root/config/config.json`) selects the active backend.
 - `system/agent/factory.go` `ProvideGateway` resolves it at boot via Wire DI:
-  `config.agent_runtime` > ROBOT.md `gateway.default` > openclaw.
+  `config.agent_runtime` > `/root/config/f_r_default_agent` (image-baked via
+  `DEFAULT_AGENT`, survives factory reset) > ROBOT.md `gateway.default` > openclaw.
+  The middle two are resolved by `device.ResolveDefaultAgent`
+  (`system/device/runtime.go`), shared with the seed below.
 - **Seed-on-empty:** at boot `device.ProvideService` calls
   `SeedAgentRuntimeFromGateway` — when `config.agent_runtime` is empty/null **and**
-  ROBOT.md `gateway.default` names a valid runtime, that value is written into
+  `ResolveDefaultAgent` names a valid runtime (`f_r_default_agent`, else ROBOT.md
+  `gateway.default`), that value is written into
   config.json (idempotent; only the first boot of a fresh/legacy config writes).
   Once a concrete value is on disk the device **owns** its runtime: a dev who set
   it (via switch or by hand) is left untouched, and the resolve-fallback above
@@ -52,6 +57,18 @@ wire the switch, install, migration, skills, hooks, and reset.
   runtime instead of the optimistic one).
 
 ---
+
+### LLM configuration ownership
+
+`llm_config_mode` is one device-wide choice, independent of `agent_runtime`:
+
+- Missing/empty: legacy behavior, including Codex/Claude Code subscription detection.
+- `os`: explicitly apply the saved OS provider, model and credentials, even when native auth exists.
+- `runtime`: preserve native provider/model/auth configuration. Onboarding still maintains gateway, workspace, skills and channels; presync, periodic sync and config migration must not overwrite native LLM settings.
+
+Settings → Runtime selects this mode through `PUT /api/device/config`. Native mode does not select a new model or log in: existing configuration, including an earlier OS model, remains until the operator explicitly selects the provider/model with the runtime's own CLI/config. Use the daemon's user/home, restart the runtime after native changes, and open a new terminal to discard old proxy environment variables. Switching runtimes does not migrate subscription credentials; configure each runtime separately.
+
+Keep the OS key/base URL stored for voice/backend services. Restoring AI Brain defaults explicitly selects `os` and reapplies configuration even when those saved values are unchanged. A mode-apply failure is returned to the caller, but the mode is already saved; retry applying it after resolving the error. Successful apply does not verify subscription/account validity. This flow has not yet been tested on a device with real subscription accounts.
 
 ## 1. The contract — implement `domain.AgentGateway`
 
@@ -168,7 +185,7 @@ The fix pattern (use it for everything stateful):
 Hermes's presync (`runtimes/hermes/presync.sh`) now owns **both** the
 `config.yaml` model wiring (idempotent — coerces a reset-blanked `model: ''` back
 to a map, asserts `provider`/`custom_providers` structure, syncs `llm_*`/secrets)
-**and** the skill restore (re-runs `claw migrate` when `skills/openclaw-imports`
+**and** the skill restore (re-runs `claw migrate` when `~/.hermes/skills/openclaw-imports`
 is empty). Keep `verify` CLI-only (`command -v <bin>`) — a structure-check in
 `verify` would force a heavy full reinstall when presync alone heals it.
 
@@ -334,13 +351,19 @@ request remains unchanged. Skill bodies are loaded locally. There are no retries
 direct-provider fallbacks or conversation-history uploads. The total selection
 budget is at most 3 seconds, with a 30-second error cooldown and a non-blocking
 busy gate. Selection requires probability >= 0.70, margin >= 0.20 and independent
-fit >= 0.60. More than 32 eligible skills causes abstention, not roster truncation.
+fit >= 0.60. The full serialized request has a local 256 KiB budget instead of a
+32-skill cutoff. Oversized requests skip with `catalog_budget`, without truncation
+or an error cooldown.
 These are skill-discovery thresholds, not the stricter hardware-intent thresholds.
 
 A preload includes the complete bounded SKILL.md and its absolute directory.
-The Go adapters only preload simple static skills from the runtime's installed
-root; dynamic templates, custom frontmatter controls, conflicting project skill
-roots and unsupported native policy settings defer to native discovery. They
+The Go adapters preload simple static skills from documented global and project
+roots (see each runtime's docs). Project roots stop at the nearest repository/worktree
+boundary, or at the working directory when no boundary is known. Ambiguous parsed
+names, dynamic templates, unsupported invocation metadata and native policy settings
+defer to native discovery; plugin caches are not scanned independently. Codex skills
+with `agents/openai.yaml` remain native-owned. OpenClaw and PicoClaw instead use
+the runtime-published roster, including eligible skills outside the workspace. They
 recheck eligibility and content after inference. System/slash/attachment turns
 keep their existing route. All new non-Hermes integrations are **disabled by
 default** pending native validation; Hermes is unchanged. Each new runtime owns a Go build switch `const jevEnabled = false`: bridges use `gatewayd/jev.go`, PicoClaw uses `jev_hook.go`, and OpenClaw uses `jev_plugin.go`. When disabled, bridges construct no selector; native onboarding installs no assets and creates no Jev registration. If an older Jev registration exists, Go only disables that registration and preserves unrelated settings. Disabled integrations do not read skills, call the provider, or add Jev content to requests. Enabling requires changing the switch, rebuilding and restarting through runtime management; env/config is not a replacement for the build switch. `JEV_CONFIG_PATH` selects the bridge OS config file.

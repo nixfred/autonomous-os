@@ -1,9 +1,4 @@
-"""FacePerception — Perception state machine wrapping FaceRecognizer.
-
-Handles presence (enter/leave events), stranger tracking & wellbeing posts, the
-photos watcher, enrollment I/O, and the public HTTP-facing surface consumed by
-``hal/routes/sensing.py``.
-"""
+"""FacePerception — Perception state machine wrapping FaceRecognizer."""
 
 import json
 import logging
@@ -11,7 +6,9 @@ import re
 import shutil
 import threading
 import time
+from collections import deque
 from copy import copy
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, override
 
@@ -39,18 +36,16 @@ from .constants import (
 from .enter_message import (
     FrameFacts,
     build_enter_message,
-    copresence_ticks,
     frame_labels,
 )
 from .recognizer import FaceRecognizer
+from .stranger_gaze import GazeMeasurement, StrangerGazeTick, gaze_confirmed, measure_gaze
 
 logger = logging.getLogger(__name__)
 
-# Presence memory sidecar — who was last seen when. tmpfs + boot_id makes it
-# boot-scoped (same pattern as the scene sidecar): an in-boot HAL service
-# restart must NOT wipe last_seen — everyone would look "new" on the first
-# frame and presence.enter (the greeting) would re-fire mid-session. A full
-# device reboot starts fresh on purpose.
+# Presence memory sidecar — who was last seen when. tmpfs + boot_id makes it boot-scoped
+# (same pattern as the scene sidecar): an in-boot HAL service restart must NOT wipe
+# last_seen.
 _PRESENCE_STATE_PATH = Path("/tmp/hal-presence-state.json")
 
 
@@ -61,14 +56,56 @@ def _current_boot_id() -> str:
         return ""
 
 
-# Visit count at which hal prompts the user to enroll a familiar stranger.
-# Fires exactly once per stranger when count first reaches this value; the
-# face-enroll skill handles asking the user and POST /face/enroll on confirm.
 _FAMILIAR_VISIT_THRESHOLD = 2
 
-# Image extensions that count as enrollment uploads. ``load_from_disk`` reads
-# only files with these suffixes sitting DIRECTLY in a user folder; the photos
-# watcher uses the same set so the two agree on what "an enrollment change" is.
+# How often the familiar-stranger snapshot folder is swept while the camera runs.
+_SNAPSHOT_PRUNE_EVERY_S = 3600.0
+
+
+def prune_stranger_snapshots(now: float) -> int:
+    """Delete familiar-stranger snapshots older than the retention window; return the count."""
+    cutoff = now - config.STRANGER_SNAPSHOT_RETENTION_S
+    removed = 0
+    try:
+        files = list(_STRANGER_SNAPSHOTS_DIR.glob("*.jpg"))
+    except OSError:
+        return 0
+    for f in files:
+        try:
+            if f.stat().st_mtime < cutoff:
+                f.unlink()
+                removed += 1
+        except OSError as e:
+            logger.warning("[face] failed to prune stranger snapshot %s: %s", f, e)
+    if removed:
+        logger.info("[face] pruned %d stranger snapshot(s) older than %.0f s", removed, config.STRANGER_SNAPSHOT_RETENTION_S)
+    return removed
+
+_STRANGER_ID_RE = re.compile(r"^stranger_\d+$")
+_STRANGER_TS_FORMAT = "%Y-%m-%dT%H:%M:%S%z"
+
+
+def is_stranger_id(value: str) -> bool:
+    """True for a well-formed stranger id such as ``stranger_5``."""
+    return bool(_STRANGER_ID_RE.match(value))
+
+
+def _delete_stranger_snapshots(stranger_ids: set[str] | None) -> None:
+    """Delete familiar-stranger snapshots of these ids (all when None)."""
+    try:
+        files = list(_STRANGER_SNAPSHOTS_DIR.glob("*.jpg"))
+    except OSError:
+        return
+    for f in files:
+        sid = f.name.rsplit("_", 1)[0]
+        if stranger_ids is not None and sid not in stranger_ids:
+            continue
+        try:
+            f.unlink()
+        except OSError as e:
+            logger.warning("[face] failed to delete stranger snapshot %s: %s", f, e)
+
+
 _ENROLL_IMG_EXTS = {".jpg", ".jpeg", ".png", ".bmp"}
 
 
@@ -125,10 +162,9 @@ class FacePerception(Perception[cv2.typing.MatLike]):
         self._face_present: bool = False
         self._people_data_dict: dict[str, PersonData] = {}
         self._last_stranger_enter_ts: float = 0.0
+        # 0 sweeps on the first tick, which also covers snapshots left from before a restart.
+        self._last_snapshot_prune_ts: float = 0.0
         self._last_presence_save_ts: float = 0.0
-        # Consecutive ticks a friend and a non-friend box shared the frame —
-        # the guard on the "already present" segment of presence.enter.
-        self._copresence_ticks: int = 0
         self._load_presence_state()
         self._owners: set[str] = set()
         self._strangers: set[str] = set()
@@ -136,15 +172,12 @@ class FacePerception(Perception[cv2.typing.MatLike]):
         self._any_stranger_logged: bool = False
         self._stranger_visit_counts: dict[str, Any] = self._load_stranger_stats()
 
-        # Stranger snapshot buffer — flushed every FACE_STRANGER_FLUSH_S
-        # Each entry: (raw_frame, annotations[(bbox, kind, label), ...])
-        self._stranger_flush_interval: float = config.FACE_STRANGER_FLUSH_S
-        self._stranger_snapshots_buffers: list[cv2.typing.MatLike] = []
-        # Parallel to the snapshots: what each buffered frame showed, so the
-        # flushed event describes the picture it carries, not the flush tick.
-        self._stranger_facts_buffer: list[FrameFacts] = []
-        self._stranger_ids_buffer: set[str] = set()
-        self._last_stranger_flush_ts: float = 0.0
+        # Ungreeted strangers this visit -> familiar-stranger snapshot for their greeting (#531).
+        self._ungreeted_strangers: dict[str, str | None] = {}
+        # Recent ticks an ungreeted stranger was in frame: snapshot, who faced the lamp, when.
+        self._stranger_gaze_ticks: deque[StrangerGazeTick] = deque(
+            maxlen=config.FACE_STRANGER_GAZE_TICKS
+        )
 
         self._callbacks: set[Callable[[FaceDetectionData], None]] = set()
 
@@ -166,22 +199,6 @@ class FacePerception(Perception[cv2.typing.MatLike]):
         USERS_DIR.mkdir(parents=True, exist_ok=True)
 
         def _latest_mtime() -> float:
-            # Only watch what ``load_from_disk`` actually consumes: image files
-            # sitting DIRECTLY in a user folder (USERS_DIR/<user>/<file>). Match
-            # that exact set so a reload fires iff an enrollment upload changed.
-            #
-            # This deliberately ignores everything else under USERS_DIR:
-            #   * subfolders — ``.extended`` (self-managed, already in the bank),
-            #     ``mood/``, ``pose/``, and any other per-user data dir. They are
-            #     never loaded as enrollment images, so a change there must not
-            #     trip a full re-embed of every upload. The depth check below
-            #     (parent is a direct child of USERS_DIR) excludes all of them,
-            #     including subfolders added in the future — no blocklist to keep.
-            #   * directory entries — skipped via ``is_file``; e.g. creating a
-            #     user's ``.extended`` subfolder bumps the parent user folder's
-            #     mtime, which would otherwise look like an upload change.
-            #   * non-image files — ``metadata.json``, ``.stranger_stats.json``,
-            #     etc., excluded by the suffix check.
             try:
                 return max(
                     (
@@ -276,16 +293,7 @@ class FacePerception(Perception[cv2.typing.MatLike]):
         return str(path)
 
     def load_from_disk(self) -> int:
-        """Re-train the owner + extended banks from all images under USERS_DIR.
-
-        Gathers every user's uploads (and folder names) first, then hands them to
-        ``FaceRecognizer.reload`` which installs the freshly-built owner and
-        extended banks in a SINGLE atomic swap. This is deliberate: an earlier
-        version cleared the bank and re-appended per person, leaving a window in
-        which a concurrent ``detect`` saw a None/partial owner bank and scored
-        every enrolled friend ``_NO_MATCH`` (they'd flip to stranger/unsure for a
-        frame). One atomic swap closes that window.
-        """
+        """Re-train the owner + extended banks from all images under USERS_DIR."""
         if not USERS_DIR.is_dir():
             logger.info("No users dir at %s — skipping", USERS_DIR)
             # Empty inputs => reload clears both banks atomically.
@@ -376,8 +384,7 @@ class FacePerception(Perception[cv2.typing.MatLike]):
         return meta.get("telegram_id") or None
 
     def remove_photo(self, label: str, filename: str) -> bool:
-        """Remove a single photo from a person's directory and re-load from disk.
-        Returns True if the photo was found and deleted."""
+        """Remove a single photo from a person's directory and re-load from disk."""
         person_dir = self._resolve_person_dir(label)
         if person_dir is None:
             return False
@@ -430,6 +437,10 @@ class FacePerception(Perception[cv2.typing.MatLike]):
             return
 
         cur_ts = time.time()
+        if cur_ts - self._last_snapshot_prune_ts >= _SNAPSHOT_PRUNE_EVERY_S:
+            self._last_snapshot_prune_ts = cur_ts
+            prune_stranger_snapshots(cur_ts)
+            self.expire_strangers(cur_ts)
 
         faces = self._face_recognizer.detect(frame)
 
@@ -438,7 +449,6 @@ class FacePerception(Perception[cv2.typing.MatLike]):
                 logger.debug("[face] no faces detected")
                 self._face_present = False
                 self._faces_n = 0
-                self._copresence_ticks = 0
                 self._check_leaves(cur_ts)
                 return
             else:
@@ -456,8 +466,6 @@ class FacePerception(Perception[cv2.typing.MatLike]):
             logger.info(
                 f"Detected friends={list(owners_seen)} and strangers={list(strangers_seen)}"
             )
-
-            self._copresence_ticks = copresence_ticks(self._copresence_ticks, faces)
 
             new_owners: set[str] = set()
             new_strangers: set[str] = set()
@@ -504,17 +512,11 @@ class FacePerception(Perception[cv2.typing.MatLike]):
             if self._face_present and self._presense_service is not None:
                 self._presense_service.on_motion()
 
-            # Strangers: always buffer snapshots; flush decides when to send
             annotated_frame = self._annotate_frame(frame, faces)
             current_facts = self._frame_facts(faces, owners_seen, new_owners)
             annotated_frames_to_send: list[cv2.typing.MatLike] = []
             if len(new_owners) > 0:
                 annotated_frames_to_send.append(annotated_frame)
-            else:
-                if new_strangers:
-                    self._stranger_snapshots_buffers.append(annotated_frame)
-                    self._stranger_facts_buffer.append(current_facts)
-                    self._stranger_ids_buffer.update(new_strangers)
 
             familiar_paths: dict[str, str] = {}
             if new_strangers:
@@ -543,21 +545,24 @@ class FacePerception(Perception[cv2.typing.MatLike]):
                                 e,
                             )
 
-            flushed_stranger_snapshots, flushed_stranger_ids, flushed_facts = (
-                self._flush_stranger_buffer(cur_ts)
-            )
+            # A stranger new on the same tick as a friend rides the friend's
+            # enter, as before. Any other new stranger waits until they look
+            # at the lamp (#531).
+            stranger_ids_to_send: set[str] = set()
+            if new_owners:
+                stranger_ids_to_send = set(new_strangers)
+            else:
+                for sid in new_strangers:
+                    self._ungreeted_strangers[sid] = familiar_paths.get(sid)
+                greeted, gaze_frames, familiar_paths = self._stranger_gaze_greeting(
+                    frame, faces, annotated_frame, cur_ts
+                )
+                stranger_ids_to_send = greeted
+                annotated_frames_to_send = gaze_frames
 
-            annotated_frames_to_send = (
-                annotated_frames_to_send + flushed_stranger_snapshots
-            )
-            stranger_ids_to_send = new_strangers.union(flushed_stranger_ids)
-
-            # Stranger-only enter floor: embedding flicker mints a fresh
-            # stranger_N id every few seconds for the same unrecognizable
-            # person, and a fresh id is always "new" — each would be a full
-            # agent turn with only the 10s FACE_COOLDOWN between them. One
-            # stranger update per floor window is plenty; a friend appearing
-            # is never floored.
+            # Stranger-only enter floor: embedding flicker mints a fresh stranger_N id
+            # every few seconds for the same unrecognizable person, and a fresh id is
+            # always "new".
             if (
                 annotated_frames_to_send
                 and not new_owners
@@ -576,16 +581,11 @@ class FacePerception(Perception[cv2.typing.MatLike]):
             if annotated_frames_to_send:
                 if not new_owners and stranger_ids_to_send:
                     self._last_stranger_enter_ts = cur_ts
-                # Describe the frame the agent will see: a new friend sends the
-                # current frame at once; a stranger-only enter sends the
-                # buffered snapshots, whose newest frame may be several ticks
-                # old by now — its own facts go with it.
-                facts = current_facts if new_owners else flushed_facts[-1]
                 message = build_enter_message(
                     new_friends=new_owners,
                     new_strangers=stranger_ids_to_send,
-                    present_friends=facts.present_friends,
-                    frame_labels=facts.labels,
+                    present_friends=current_facts.present_friends,
+                    frame_labels=current_facts.labels,
                 )
                 for sid, img_path in familiar_paths.items():
                     message += (
@@ -624,7 +624,6 @@ class FacePerception(Perception[cv2.typing.MatLike]):
                 if last_seen is None or last_seen < person_data.last_seen:
                     last_seen = person_data.last_seen
                     last_person = person_id
-            # Currently visible people
             return {
                 "type": "face",
                 "face_present": self._face_present,
@@ -637,8 +636,6 @@ class FacePerception(Perception[cv2.typing.MatLike]):
                 "enrolled_count": self.enrolled_count(),
                 "stranger_count": len(self._face_recognizer.strangers),
             }
-
-    # -- Presence leave detection ------------------------------------------------
 
     def _load_presence_state(self) -> None:
         """Restore last_seen from the boot-scoped sidecar after a service restart."""
@@ -673,9 +670,7 @@ class FacePerception(Perception[cv2.typing.MatLike]):
         """Throttled dump of the last_seen map.
 
         Must run periodically, not just on enter/leave: the restore above only
-        suppresses a re-greeting when the saved timestamps are FRESH — an
-        enter-time-only save would already be past the forget window by the
-        next restart. tmpfs makes the 30s write essentially free.
+        suppresses a re-greeting when the saved timestamps are FRESH.
         """
         if not force and (cur_ts - self._last_presence_save_ts) < 30.0:
             return
@@ -703,7 +698,6 @@ class FacePerception(Perception[cv2.typing.MatLike]):
                         or (cur_ts - person_data.last_seen) > self._owners_forget_ts
                     ):
                         deleted_ids.add(person_id)
-                        # Per-friend leave row on their own timeline.
                         self._post_wellbeing(self.normalize_label(person_id), "leave")
                         self._send_leave_event(person_id, kind=person_data.kind)
                 elif person_data.kind == PersonKind.STRANGER:
@@ -715,6 +709,9 @@ class FacePerception(Perception[cv2.typing.MatLike]):
 
             for id in deleted_ids:
                 del self._people_data_dict[id]
+                _ = self._ungreeted_strangers.pop(id, None)
+            if not self._ungreeted_strangers:
+                self._stranger_gaze_ticks.clear()
 
             current_strangers = [
                 p
@@ -726,9 +723,6 @@ class FacePerception(Perception[cv2.typing.MatLike]):
                 self._post_wellbeing("unknown", "leave")
                 self._any_stranger_logged = False
 
-            # _check_leaves runs on every perception pass (both the faces and
-            # no-faces paths), so this is the one natural heartbeat for the
-            # presence sidecar.
             self._persist_presence_state(cur_ts)
 
     def _send_leave_event(self, person_id: str, kind: PersonKind) -> None:
@@ -743,9 +737,8 @@ class FacePerception(Perception[cv2.typing.MatLike]):
     def _post_wellbeing(self, user: str, action: str) -> None:
         """POST an enter/leave row to the OS server's wellbeing log.
 
-        Fire-and-forget with a short timeout — a stuck OS server must never
-        block face detection. Phase 2 dedup in wellbeing.go absorbs any
-        residual duplicates from races or restarts.
+        Fire-and-forget with a short timeout — a stuck OS server must never block face
+        detection.
         """
         if not user:
             return
@@ -765,8 +758,6 @@ class FacePerception(Perception[cv2.typing.MatLike]):
         except requests.RequestException as e:
             logger.debug("[face] wellbeing %s %s failed: %s", action, user, e)
 
-    # -- Stranger visit tracking -------------------------------------------------
-
     @staticmethod
     def _load_stranger_stats() -> dict[str, Any]:
         try:
@@ -785,12 +776,8 @@ class FacePerception(Perception[cv2.typing.MatLike]):
                 logger.warning("Failed to save stranger stats: %s", e)
 
     def _track_stranger_visits(self, stranger_ids: set[str]) -> set[str]:
-        """Increment visit count for each stranger seen in this frame.
-
-        Returns the subset of stranger_ids whose visit count just reached
-        ``_FAMILIAR_VISIT_THRESHOLD`` on this call (transition fires once).
-        """
-        now = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+        """Increment visit count for each stranger seen in this frame."""
+        now = time.strftime(_STRANGER_TS_FORMAT)
         just_familiar: set[str] = set()
         with self._state_lock:
             for sid in stranger_ids:
@@ -814,7 +801,55 @@ class FacePerception(Perception[cv2.typing.MatLike]):
     def stranger_stats(self) -> dict[str, Any]:
         """Return visit counts for all tracked stranger IDs."""
         with self._state_lock:
-            return self._stranger_visit_counts
+            return dict(self._stranger_visit_counts)
+
+    def forget_strangers(self, stranger_ids: set[str] | None = None) -> set[str]:
+        """Delete everything kept about these strangers (all when None).
+
+        Face data in the recognizer bank, visit stats, familiar-stranger snapshots and the
+        in-memory presence entry all go, so the person is new again if they come back.
+        Returns the ids that had visit stats.
+        """
+        with self._state_lock:
+            if stranger_ids is None:
+                forgotten = set(self._stranger_visit_counts)
+                self._stranger_visit_counts.clear()
+            else:
+                forgotten = {sid for sid in stranger_ids if self._stranger_visit_counts.pop(sid, None) is not None}
+            for sid in [p for p, d in self._people_data_dict.items() if d.kind == PersonKind.STRANGER]:
+                if stranger_ids is None or sid in stranger_ids:
+                    self._people_data_dict.pop(sid, None)
+                    self._ungreeted_strangers.pop(sid, None)
+            self._save_stranger_stats()
+        self._face_recognizer.forget_strangers(stranger_ids)
+        _delete_stranger_snapshots(stranger_ids)
+        logger.info("[face] forgot %s stranger(s)", "all" if stranger_ids is None else len(stranger_ids))
+        return forgotten
+
+    def expire_strangers(self, now: float) -> set[str]:
+        """Forget strangers not seen for FACE_STRANGER_RETENTION_S, and face data with no stats.
+
+        A bank row without a stats record is invisible in the web card and could never be
+        deleted there; a new stranger gets its record in the same tick it is minted, and
+        this runs before detection, so such a row is always left over from an old state.
+        """
+        cutoff = now - config.FACE_STRANGER_RETENTION_S
+        expired: set[str] = set()
+        with self._state_lock:
+            for sid, rec in self._stranger_visit_counts.items():
+                try:
+                    last = datetime.strptime(rec.get("last_seen", ""), _STRANGER_TS_FORMAT).timestamp()
+                except (ValueError, TypeError, AttributeError):
+                    logger.warning("[face] stranger %s has an unreadable last_seen, keeping it", sid)
+                    continue
+                if last < cutoff:
+                    expired.add(sid)
+            tracked = set(self._stranger_visit_counts)
+        expired |= self._face_recognizer.stranger_ids() - tracked
+        if expired:
+            logger.info("[face] forgetting %d stranger(s) not seen for %.0f days", len(expired), config.FACE_STRANGER_RETENTION_S / 86400)
+            self.forget_strangers(expired)
+        return expired
 
     def has_friend_present(self) -> bool:
         """Return True if any friend was seen within the forget interval."""
@@ -834,35 +869,14 @@ class FacePerception(Perception[cv2.typing.MatLike]):
             )
 
     def current_user(self) -> str:
-        """Return the name of the person currently "in front" of the device:
-        - Friend with the MOST RECENT session start (enter-after-last-leave)
-          among friends still within the forget window.
-          Lowercased to match the OS server per-user folder convention.
-        - "unknown" if no friend is visible but any stranger was seen within
-          the stranger forget window (all strangers collapse to one bucket).
-        - Empty string if nobody has been seen recently.
-        Sorting by session_start (not last_seen) makes the answer deterministic
-        when two friends are both continuously present: whoever entered the
-        scene latest wins. last_seen ties at ~now while both remain visible,
-        so it can't distinguish them. See docs/plan-presence-logging.md.
+        """Return the name of the person currently "in front" of the device: - Friend with
+        the MOST RECENT session start (enter-after-last-leave) among friends still
+        within the forget window.
         """
         return self.current_user_with_age()[0]
 
     def current_user_with_age(self) -> tuple[str, float]:
-        """``current_user()`` plus how long ago that person was actually seen.
-
-        The label alone hides its own staleness: a friend stays the answer for
-        `FACE_OWNER_FORGET_S` (1h) and a stranger for `FACE_STRANGER_FORGET_S`
-        (30m) after they were last in frame, so "who is in front of the device"
-        can be up to an hour old. Callers that surface identity for debugging
-        (`/identity/current-user`) need that age to tell "here right now" from
-        "seen 50 minutes ago".
-
-        age is seconds since:
-        - the winning FRIEND was last seen (not since their session started), or
-        - the MOST RECENTLY seen stranger, for the collapsed "unknown" bucket.
-        0.0 when nobody is known — there is nothing to be stale.
-        """
+        """``current_user()`` plus how long ago that person was actually seen."""
         now = time.time()
         last_friend: str | None = None
         last_friend_ts: float | None = None
@@ -900,8 +914,6 @@ class FacePerception(Perception[cv2.typing.MatLike]):
                 return "unknown", max(0.0, now - newest_stranger_seen)
 
             return "", 0.0
-
-    # -- Cooldown state / reset -------------------------------------------------
 
     def cooldown_state(self) -> dict[str, Any]:
         """Return current cooldown state for all tracked persons."""
@@ -949,32 +961,18 @@ class FacePerception(Perception[cv2.typing.MatLike]):
         """Clear all last-seen timestamps so next detection fires events immediately."""
         with self._state_lock:
             self._people_data_dict.clear()
-            # Persist the now-empty map immediately (bypassing the 30s
-            # throttle) — otherwise a HAL restart within the throttle window
-            # would restore the sidecar's stale last_seen and silently undo
-            # this reset.
             self._persist_presence_state(time.time(), force=True)
-            # And re-arm the throttle so the NEXT detection persists its fresh
-            # last_seen right away — the force call above just stamped the
-            # save ts, which would otherwise leave a <30s window where a
-            # restart loses the first post-reset sighting and re-enters again.
             self._last_presence_save_ts = 0.0
-            _ = self._flush_stranger_buffer(time.time())
-            # Clearing the people map is not enough: the shared observable holds
-            # a COPY of the last computed answer, refreshed only when a frame is
-            # processed. Consumers that read it directly (MotionPerception dedup
-            # keys, EmotionPerception's skip-when-empty) would keep attributing
-            # to the person we just forgot — indefinitely if frames stopped.
-            # Blank it here so the reset is visible immediately to everyone.
+            self._ungreeted_strangers.clear()
+            self._stranger_gaze_ticks.clear()
+            # Consumers read the observable's cached copy, so blank it now, not on the next frame.
             self._perception_state.current_user.data = ""
             logger.info("Face recognition cooldowns reset")
 
-    # -- Events -----------------------------------------------------------------
-
     _FACE_COLOR: dict[PersonKind, tuple[int, int, int]] = {
-        PersonKind.FRIEND: (0, 255, 0),  # green
-        PersonKind.STRANGER: (0, 0, 255),  # red
-        PersonKind.UNSURE: (0, 255, 255),  # yellow
+        PersonKind.FRIEND: (0, 255, 0),
+        PersonKind.STRANGER: (0, 0, 255),
+        PersonKind.UNSURE: (0, 255, 255),
     }
 
     def _annotate_frame(
@@ -1006,59 +1004,83 @@ class FacePerception(Perception[cv2.typing.MatLike]):
     ) -> FrameFacts:
         """Labels of every box in this frame plus the friends already present.
 
-        ``present_friends`` are friends boxed in THIS frame who did not just
-        arrive — the co-presence signal the sensing skill keys on. A
-        stranger-only enter waits until friend and non-friend boxes have
-        coexisted for FACE_COPRESENCE_MIN_TICKS ticks; a new friend is a
-        positive match and needs no such corroboration. Never derived from
-        current_user(): that is presence-window state and reads the same
-        whether momo is sitting here or left two minutes ago.
+        ``present_friends`` are friends matched in this frame who did not just arrive.
+        Never derived from current_user(): that reads the same after the user has left.
         """
-        present_friends = sorted(owners_seen - new_owners)
-        if (
-            not new_owners
-            and self._copresence_ticks < config.FACE_COPRESENCE_MIN_TICKS
+        return FrameFacts(
+            labels=frame_labels(faces),
+            present_friends=sorted(owners_seen - new_owners),
+        )
+
+    def _stranger_gaze_greeting(
+        self,
+        frame: cv2.typing.MatLike,
+        faces: list[Face],
+        annotated_frame: cv2.typing.MatLike,
+        cur_ts: float,
+    ) -> tuple[set[str], list[cv2.typing.MatLike], dict[str, str]]:
+        """Record this tick's gaze for ungreeted strangers; return who to greet.
+
+        Returns (stranger ids to greet, buffered snapshots newest last,
+        familiar-stranger snapshot paths). All empty until an ungreeted
+        stranger has faced the lamp on enough buffered ticks. Caller holds
+        _state_lock.
+        """
+        waiting = [
+            f
+            for f in faces
+            if f.kind == PersonKind.STRANGER and f.person_id in self._ungreeted_strangers
+        ]
+        if not waiting:
+            return set(), [], {}
+        frame_h, frame_w = frame.shape[:2]
+        # One measurement per stranger id; when two boxes share an id, the one
+        # facing the lamp wins so the vote stays "any box facing" (#537).
+        gazes: dict[str, GazeMeasurement] = {}
+        for f in waiting:
+            m = measure_gaze(f, frame_w, frame_h)
+            if f.person_id not in gazes or m.facing:
+                gazes[f.person_id] = m
+        facing = frozenset(sid for sid, m in gazes.items() if m.facing)
+        # A vote older than the window says nothing about looking now (#531).
+        while (
+            self._stranger_gaze_ticks
+            and cur_ts - self._stranger_gaze_ticks[0].ts
+            > config.FACE_STRANGER_GAZE_WINDOW_S
         ):
-            present_friends = []
-        return FrameFacts(labels=frame_labels(faces), present_friends=present_friends)
-
-    def _flush_stranger_buffer(
-        self, cur_ts: float
-    ) -> tuple[list[cv2.typing.MatLike], set[str], list[FrameFacts]]:
-        """Flush buffered stranger snapshots if the interval has elapsed.
-
-        Returns (snapshots, flushed_ids, facts) with facts[i] describing
-        snapshots[i]. All empty if not yet time to flush.
-        """
-        with self._state_lock:
-            if (cur_ts - self._last_stranger_flush_ts) < self._stranger_flush_interval:
-                return [], set(), []
-
-            snapshots = copy(self._stranger_snapshots_buffers)
-            facts = copy(self._stranger_facts_buffer)
-            ids = copy(self._stranger_ids_buffer)
-            self._stranger_snapshots_buffers.clear()
-            self._stranger_facts_buffer.clear()
-            self._stranger_ids_buffer.clear()
-            self._last_stranger_flush_ts = cur_ts
-            logger.info(
-                "[face] flushing %d stranger snapshot(s) for %s", len(snapshots), ids
-            )
-            return snapshots, ids, facts
+            _ = self._stranger_gaze_ticks.popleft()
+        self._stranger_gaze_ticks.append(
+            StrangerGazeTick(annotated_frame, facing, cur_ts)
+        )
+        ticks = [t.facing for t in self._stranger_gaze_ticks]
+        in_frame = sorted(gazes)
+        # The numbers behind each vote, so a greeting can be explained from the
+        # log alone (#537).
+        logger.info(
+            "[face] stranger gaze: %s",
+            "; ".join(
+                f"{sid} {gazes[sid].describe()} {sum(sid in t for t in ticks)}/{len(ticks)}"
+                for sid in in_frame
+            ),
+        )
+        greet = {sid for sid in in_frame if gaze_confirmed(ticks, sid)}
+        if not greet:
+            return set(), [], {}
+        frames = [t.frame for t in self._stranger_gaze_ticks]
+        self._stranger_gaze_ticks.clear()
+        familiar = {
+            sid: path
+            for sid in greet
+            if (path := self._ungreeted_strangers.pop(sid)) is not None
+        }
+        return greet, frames, familiar
 
     def _send_enter_event(
         self,
         frames: list[cv2.typing.MatLike],
         message: str,
     ) -> None:
-        """Send a presence.enter event with annotated snapshots.
-
-        Args:
-            frames: Annotated frames to attach — the current frame plus any
-                buffered stranger snapshots from the flush window.
-            message: Event text from ``enter_message.build_enter_message``,
-                optionally followed by the familiar-stranger hint.
-        """
+        """Send presence.enter with annotated frames (newest last) and the event text."""
         self._send_event(
             "presence.enter",
             message,

@@ -12,7 +12,7 @@ Source: colors are what the **lamp** actually shows — `robots/lamp/presets.jso
 | `excited` | 3, 1, 0 | `#030100` dim orange | overlay | candle | 0.5 | excited |
 | `shy` | 3, 0, 1 | `#030001` dim rose | overlay | breathing | 0.3 | shy |
 | `shock` | 2, 2, 2 | `#020202` soft white | overlay | notification_flash | 1.0 | shock |
-| `listening` | 0, 0, 3 | `#000003` dim blue | overlay | breathing_fine (opens at peak) | 1.2 | — (see note) |
+| `listening` | 0, 0, 3 | `#000003` dim blue | overlay | breathing_fine (opens at peak) | 0.3 (base 1.2) | — (see note) |
 | `laugh` | 2, 3, 0 | `#020300` dim lime | overlay | candle | 0.2 | laugh |
 | `confused` | 3, 2, 0 | `#030200` dim amber | overlay | candle | 0.2 | confused |
 | `sleepy` | 0, 0, 0 | `#000000` black (off) | base | solid | — | sleepy |
@@ -87,7 +87,7 @@ Technical notes:
 
   `speaking_wave_rainbow` also generates its own hue, so it takes the same `music_strong` `brightness` and rides its VU envelope under it. `music/routes` never emits the `music_strong` emotion itself — the agent does.
 - **This table lives in `robots/lamp/presets.json`**, the per-device overlay merged field by field at boot via `hal/board/presets_overlay.py` — `hal/presets.py` is *not* edited. Other robots (reachy, intern) therefore keep the base palette, and reverting the lamp to the base palette is just deleting the `emotion` section from that JSON file.
-- **Do not confuse `EMO_IDLE` with `AMBIENT_RESTING_LED`.** The latter is `[0, 0, 0]` (product call 30/07/2026: a resting strip is fully off); `EMO_IDLE` is an emotion the agent actively emits and still has a color.
+- **Do not confuse `EMO_IDLE` with `AMBIENT_RESTING_LED`.** The latter comes from `presets.json` → `ambient_led.resting` (Lamp: steady `[1, 1, 1]`); `EMO_IDLE` is an emotion the agent actively emits and still has a color.
 
 ### `listening` opens at the peak of its breath
 
@@ -129,7 +129,7 @@ So for a `servo: None` emotion (today only `listening`) the route calls `svc.hal
 Two guards go with it:
 
 - **Music is exempt**: while music plays the groove matters more, and a listening cue must not stop the dancing.
-- **Auto-resume idle after 10s** (`STILL_IDLE_RESUME_SECONDS` in `hal/routes/emotion.py`): if the turn produces no emotion at all (LLM error, silence after the first partial), the body returns to idle instead of freezing mid-pose. Any `POST /emotion` cancels this timer. The 8s safety net in `voice_service` only clears the LED and never touches the servo — so this timer is the only thing looking after the body.
+- **Auto-resume idle after 10s** (`STILL_IDLE_RESUME_SECONDS` in `hal/routes/emotion.py`): if the turn produces no emotion at all (LLM error, silence after the first partial), the body returns to idle instead of freezing mid-pose. Any `POST /emotion` and any `POST /servo/aim` cancel this timer. When it fires while any servo hold is active (`explicit`, `scene`, `tracking`, `look`), it does not move the body: it logs `idle resume deferred -- servo held by <owner>` and parks the resume, which runs when the `look` hold is released, but only if `look` was the last holder (a resume parked under `explicit`, `scene` or `tracking` is dropped at the next look release; `/servo/resume` or that owner's own path restarts idle) (see `led-control.md`, "Hold ownership"). It never releases a hold. The 8s safety net in `voice_service` only clears the LED and never touches the servo — so this timer is the only thing looking after the body.
 - **Clear thinking when the reply finishes speaking** (`_clear_thinking_after_reply` in `hal/app_state.py`, called from `_on_tts_speak_end`): the wait ends when the device stops talking, so that is when the `thinking` face goes away — no waiting on the agent to emit an emotion marker. Gated on `tts_service.realtime_feedback`, the flag only the runtime's own reply sets, so dead-air fillers and system notices spoken *during* the wait do not end the cue.
 - **Auto-reset thinking after 25s** (`HAL_EMOTION_THINKING_RESET_S`, `0` disables) — the net for turns that never speak at all. `thinking` is the one face nothing clears on its own — it is set at the start of a wait and replaced by whatever the reply expresses, so a turn that dies before expressing one (realtime exception, a delegate the agent answers without an emotion marker) leaves it burning with no user input to break it out. After that many seconds of *continuous* thinking the route drops `_thinking_cue_active`, expresses `idle` and restores the user's LED state. Any other emotion cancels; a fresh `thinking` re-arms. The window is measured, not guessed: on device, realtime replies clear the cue in 0.4-8.6s and a delegated turn runs 6-22s end to end.
 

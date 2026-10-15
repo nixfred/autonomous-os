@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"path/filepath"
 	"strings"
 	"sync/atomic"
@@ -21,9 +22,7 @@ import (
 	"go.autonomous.ai/os/system/server/config"
 )
 
-// publishTimeout bounds the fd_channel reply publish. Only matters at QoS 1+
-// (below), where conn.Publish blocks until the broker PUBACKs — a dead/slow
-// connection must not hang this forever.
+// publishTimeout bounds the fd_channel reply publish.
 const publishTimeout = 15 * time.Second
 
 // DeviceMQTTHandler handles incoming MQTT messages and dispatches to command handlers.
@@ -36,50 +35,43 @@ type DeviceMQTTHandler struct {
 	buddyService   *buddy.Service
 	harnessService *harness.Service
 	harnessVoice   *atomic.Pointer[harness.VoiceController]
-	// connectorWriter is the data-driven writer for the connector.set.<code> /
-	// connector.remove.<code> flow and the refresh loop. Routing (is it an MCP
-	// connector? which auth header?) is decided per-message from the payload's
-	// credentials map, with a compiled-in fallback for codes that shipped before
-	// the contract moved to the wire. Handles every connector EXCEPT those in
-	// specialConnectorWriters. Built once at startup; never mutated at runtime.
+	// connectorWriter is the data-driven writer for the connector.set.<code>
+	// / connector.remove.<code> flow and the refresh loop.
 	connectorWriter *connectorWriter
-	// specialConnectorWriters holds bespoke writers for connectors that can't be
-	// expressed as a simple http mcp_url entry — e.g. figma-api, a local stdio
-	// MCP server that drops a Node wrapper on disk. A code with no special writer
-	// and no mcp_url falls through to connectorWriter. Built once at startup.
+	// shopifyHTTP is the client for the one Shopify credential check the local
+	// Settings page makes; nil means the default (short timeout, no redirects).
+	shopifyHTTP *http.Client
+	// ebayHTTP is the client for the eBay sign-in exchange on the local
+	// Settings page; nil means the default (short timeout, no redirects).
+	ebayHTTP *http.Client
+	// publishConnectorResult, when set, replaces publishDataResult for the local
+	// connector pages so tests don't need a broker.
+	publishConnectorResult func(kind, status, errMsg string, data interface{}) error
+	// specialConnectorWriters holds bespoke writers for connectors that can't
+	// be expressed as a simple http mcp_url entry — e.g. figma-api, a local
+	// stdio MCP server that drops a Node wrapper on disk.
 	specialConnectorWriters map[string]ConnectorWriter
 	// oauthAlertStatus tracks the last-alerted refresh outcome per provider
-	// ("ok"/"fail") so the OAuth refresh loop pings the maintainer chat only on
-	// state changes, not every tick. Mutated only from the single refresh-loop
-	// goroutine; initialised in ProvideDeviceMQTTHandler.
+	// ("ok"/"fail") so the OAuth refresh loop pings the maintainer chat only
+	// on state changes, not every tick.
 	oauthAlertStatus map[string]string
-	// chatStream mirrors the monitor events of chat.send runs onto fd_channel.
-	// Nil only in tests that build the handler directly; handleChatSend nil-checks
-	// so a missing stream degrades to "turn runs, backend sees only the ack".
+	// chatStream mirrors the monitor events of chat.send runs onto
+	// fd_channel.
 	chatStream *ChatStream
 	// scheduleStore persists the "Scheduled" feature's task list to
-	// schedules.json — a SIBLING of config.json (config.Dir()), never inside it
-	// (see schedule.Store's doc comment). Shared between handleScheduleSync /
-	// handleScheduleRun and scheduleRunner below.
+	// schedules.json — a SIBLING of config.json (config.Dir()), never
+	// inside it (see schedule.Store's doc comment).
 	scheduleStore *schedule.Store
 	// scheduleRunner is the once-a-minute ticker that fires due schedules
-	// through agentGateway.SendSystemChatMessage. Built once at startup;
-	// started by StartScheduleRunnerLoop from config_watch.go alongside the
-	// other background loops (OAuth/connector refresh).
+	// through agentGateway.SendSystemChatMessage.
 	scheduleRunner *schedule.Runner
 
 	// scheduleIntents queues device-originated schedule changes until the
-	// backend confirms them. Deliberately a SEPARATE store from scheduleStore:
-	// the runner fires only from scheduleStore, so a task the backend has not
-	// yet confirmed is not merely flagged un-runnable, it is absent from the
-	// file the runner reads. See system/schedule/intent.go.
+	// backend confirms them.
 	scheduleIntents *schedule.IntentStore
 
 	// scheduleAlert, when non-nil, receives every schedule ops alert
-	// (alertScheduleEvent) synchronously INSTEAD of the real transport. Tests
-	// set it to capture exact titles; production leaves it nil, which sends
-	// through alertOps on its own goroutine (see alertScheduleEvent for why
-	// schedule alerts must never run inline). Never mutated after construction.
+	// (alertScheduleEvent) synchronously INSTEAD of the real transport.
 	scheduleAlert func(title, detail string)
 }
 
@@ -87,12 +79,7 @@ type DeviceMQTTHandler struct {
 func (h *DeviceMQTTHandler) SetHarnessService(s *harness.Service) { h.harnessService = s }
 
 // mcpConnectorSpec lists the remote-MCP connectors that the generic writer
-// recognises via its compiled-in fallback table. apiKey:true selects the
-// static-API-key header builder (Ahrefs); the rest use the default OAuth Bearer
-// access-token builder. The MCP URL is pulled from the openclaw catalog so there
-// is a single source of truth. The fallback only fills the gap until the backend
-// pushes mcp_url/mcp_auth_header in the connector.set payload — payload always
-// wins, and a brand-new connector needs no entry here at all.
+// recognises via its compiled-in fallback table.
 var mcpConnectorSpecs = []struct {
 	name   string
 	apiKey bool
@@ -106,17 +93,12 @@ var mcpConnectorSpecs = []struct {
 
 // specialConnectorCodes is the set of connector codes handled by a bespoke
 // writer (newSpecialConnectorWriters) instead of the generic data-driven one.
-// The generic writer's refresh loop skips these so it never re-Writes them in
-// the wrong (http) shape — see connectorWriter.reserved.
 var specialConnectorCodes = map[string]bool{
 	"figma-api": true,
 }
 
 // newSpecialConnectorWriters builds the bespoke writers for connectors that
-// can't be expressed as a simple http mcp_url entry. Today that is only
-// figma-api: a local stdio MCP server that drops a Node wrapper on disk and
-// passes the Figma OAuth token via the entry's env (the hosted Figma MCP is
-// allowlist-gated, so this REST wrapper is the only Figma wiring).
+// can't be expressed as a simple http mcp_url entry.
 func newSpecialConnectorWriters(cfg *config.Config, gw domain.AgentGateway) map[string]ConnectorWriter {
 	configsDir := filepath.Join(cfg.OpenclawConfigDir, "workspace", "configs")
 	wrapperPath := openclaw.FigmaMCPServerPath(cfg.OpenclawConfigDir)
@@ -128,13 +110,11 @@ func newSpecialConnectorWriters(cfg *config.Config, gw domain.AgentGateway) map[
 				return figmaStdioEntry(wrapperPath, c)
 			},
 			ensureAssets: func() error {
-				// Wrapper script is required — fail the connector.set if it can't drop.
 				if _, err := openclaw.EnsureFigmaMCPServer(ocDir); err != nil {
 					return err
 				}
-				// Skill (SKILL.md from GCS) is best-effort: the figma_* tools still
-				// work via the MCP tool list without it. Idempotent — only downloads
-				// when missing, so token refreshes don't re-fetch.
+				// Idempotent — only downloads when missing, so token
+				// refreshes don't re-fetch.
 				if err := openclaw.EnsureMCPSkill(ocDir, "figma-api"); err != nil {
 					slog.Warn("figma-api: skill install failed (continuing)", "component", "mqtt", "error", err)
 				}
@@ -144,11 +124,8 @@ func newSpecialConnectorWriters(cfg *config.Config, gw domain.AgentGateway) map[
 	}
 }
 
-// figmaStdioEntry builds the mcp.servers.figma-api stdio entry for the figma-api
-// connector. Token + auth header come from the connector's mcp_auth_header
-// descriptor: OAuth -> access_token via Authorization/Bearer; PAT -> api_key via
-// the connector's custom header (e.g. X-Figma-Token). FIGMA_ACCESS_TOKEN is kept
-// as a back-compat alias for wrappers shipped before FIGMA_TOKEN existed.
+// figmaStdioEntry builds the mcp.servers.figma-api stdio entry for the
+// figma-api connector.
 func figmaStdioEntry(wrapperPath string, c ConnectorCreds) map[string]any {
 	hdrName, _, token := connectorAuthHeader(c.Credentials[credentialMCPAuthHeader], c)
 	return map[string]any{
@@ -174,10 +151,8 @@ func (h *DeviceMQTTHandler) connectorWriterFor(code string) ConnectorWriter {
 	return h.connectorWriter
 }
 
-// refreshableConnectorWriters returns every writer the refresh loop must scan:
-// the generic writer plus each special writer. The generic writer already skips
-// codes owned by a special writer (its `reserved` set), so connectors are never
-// double-refreshed.
+// refreshableConnectorWriters returns every writer the refresh loop must
+// scan: the generic writer plus each special writer.
 func (h *DeviceMQTTHandler) refreshableConnectorWriters() []ConnectorWriter {
 	out := make([]ConnectorWriter, 0, 1+len(h.specialConnectorWriters))
 	if h.connectorWriter != nil {
@@ -214,23 +189,9 @@ func ProvideDeviceMQTTHandler(cfg *config.Config, mqttFactory *mqtt.Factory, ds 
 		scheduleStore:           scheduleStore,
 		scheduleIntents:         scheduleIntents,
 	}
-	// h.publishScheduleRunReport is bound to THIS local h, not to whatever copy
-	// the caller eventually stores (wire_gen.go copies the return value into
-	// Server.deviceMQTTHandler) — that is safe here because publishDataResult
-	// only ever reads h.config/h.mqttFactory, and both are pointers shared
-	// identically by every copy of this struct. The run's ops alert
-	// (alertScheduleEvent) adds reads of h.scheduleAlert (nil in production,
-	// never mutated) and, through alertOps, h.config again — the same holds.
-	// Do not add any other mutable-by-value state to this closure without
-	// re-checking that holds.
+	// Bound to this local h (wire_gen copies the struct): safe only because
+	// the callbacks read pointer/never-mutated fields shared by every copy.
 	h.scheduleRunner = schedule.NewRunner(scheduleStore, gw, cfg.DeviceID, h.publishScheduleRunReport)
-	// The connector guard for template tasks (schedule.Schedule.Requires):
-	// the runner asks connectorInstalled whether each required code has
-	// credentials on this device, and skips the run — reported as "skipped" —
-	// when one does not. Bound to the local h for the same reason, and just as
-	// safely: connectorInstalled reads only h.config (pointer),
-	// h.connectorWriter (pointer) and h.specialConnectorWriters (map), all set
-	// in the literal above and never mutated afterwards.
 	h.scheduleRunner.SetConnectorChecker(schedule.ConnectorCheckerFunc(h.connectorInstalled))
 	return h
 }
@@ -247,13 +208,7 @@ func (h *DeviceMQTTHandler) publish(data interface{}) error {
 	if err != nil {
 		return err
 	}
-	// QoS 1 (was 0): a QoS-0 publish is fire-and-forget with zero delivery
-	// guarantee, and larger replies (e.g. a full SKILL.md via skills.files) were
-	// observed being silently lost on real device network conditions — the
-	// broker itself carries far larger payloads fine, so this is loss on the
-	// device's own uplink, not a broker limit. At QoS 1 the paho client blocks
-	// this call until the broker PUBACKs (or ctx above times out), so a lost ack
-	// is retried by the client's session rather than silently dropped.
+	// QoS 1: QoS 0 silently lost large replies on real device uplinks.
 	if err := mqttClient.Publish(ctx, h.config.FDChannel, byte(1), payload); err != nil {
 		slog.Error("PublishToFD failed", "component", "mqtt", "channel", h.config.FDChannel, "error", err)
 		return err
@@ -262,15 +217,8 @@ func (h *DeviceMQTTHandler) publish(data interface{}) error {
 	return nil
 }
 
-// handleData routes a generic cmd:"data" envelope by its delivery Type:
-//
-//   - default (Type == "")  → Data is inline; dispatch immediately.
-//   - Type == "privacy"     → Data lives on the backend; ack "received" then
-//     async-fetch it over TLS before re-entering dispatchData with Data
-//     populated (see privacy_fetch.go).
-//
-// Per-kind handlers don't care which path the data took — they read env.Data
-// after the routing layer has populated it.
+// handleData routes a generic cmd:"data" envelope: inline Data dispatches
+// now; Type "privacy" acks, then fetches Data over TLS (privacy_fetch.go).
 func (h *DeviceMQTTHandler) handleData(cmd domain.MQTTMessage) error {
 	var env domain.MQTTDataCommand
 	if err := json.Unmarshal(cmd.Raw(), &env); err != nil {
@@ -284,12 +232,9 @@ func (h *DeviceMQTTHandler) handleData(cmd domain.MQTTMessage) error {
 	return h.dispatchData(env)
 }
 
-// dispatchData is the per-kind switch, shared by the inline and privacy paths.
-// New sub-handlers go in this switch — adding one does NOT require touching the
-// privacy fetch flow, which only cares about env.Kind/env.Type.
+// dispatchData is the per-kind switch, shared by the inline and privacy
+// paths.
 func (h *DeviceMQTTHandler) dispatchData(env domain.MQTTDataCommand) error {
-	// Connector kinds carry the connector code as suffix (e.g.
-	// "connector.set.notion"), so prefix-match before the exact-kind switch.
 	if strings.HasPrefix(env.Kind, domain.DataKindConnectorSetPrefix) {
 		return h.handleConnectorSet(env)
 	}
@@ -313,8 +258,18 @@ func (h *DeviceMQTTHandler) dispatchData(env domain.MQTTDataCommand) error {
 		return h.handleTTSSet(env)
 	case domain.KindRealtimeSet:
 		return h.handleRealtimeSet(env)
+	case domain.KindVoiceInputMode:
+		return h.handleVoiceInputMode(env)
 	case domain.KindWakeWordGate:
 		return h.handleWakeWordGate(env)
+	case domain.KindWakeSettingsGet:
+		return h.handleWakeSettingsGet(env)
+	case domain.KindWakeSettingsSet:
+		return h.handleWakeSettingsSet(env)
+	case domain.KindWakeLightPreview:
+		return h.handleWakeLightPreview(env)
+	case domain.KindCloudPerceptionSet:
+		return h.handleCloudPerceptionSet(env)
 	case domain.KindTimezoneSet:
 		return h.handleTimezoneSet(env)
 	case domain.KindHermesSetup:
@@ -367,6 +322,9 @@ func (h *DeviceMQTTHandler) dispatchData(env domain.MQTTDataCommand) error {
 		return h.handleSkillsUninstall(env)
 	case domain.KindChannelRefreshConfig:
 		return h.handleChannelRefreshConfig(env)
+	case domain.KindAddChannel:
+		// A data kind so credentials can arrive via the privacy fetch path.
+		return h.handleAddChannelData(env)
 	case domain.KindChatSend:
 		return h.handleChatSend(env)
 	case domain.KindChatFileGet:
@@ -377,6 +335,38 @@ func (h *DeviceMQTTHandler) dispatchData(env domain.MQTTDataCommand) error {
 		return h.handleScheduleMutateAck(env)
 	case domain.KindScheduleRun:
 		return h.handleScheduleRun(env)
+	case domain.KindFaceEnroll:
+		return h.handleFaceEnroll(env)
+	case domain.KindFaceOwners:
+		return h.handleFaceOwners(env)
+	case domain.KindFaceRemove:
+		return h.handleFaceRemove(env)
+	case domain.KindVoiceEnroll:
+		return h.handleVoiceEnroll(env)
+	case domain.KindVoiceOwners:
+		return h.handleVoiceOwners(env)
+	case domain.KindVoiceRemove:
+		return h.handleVoiceRemove(env)
+	case domain.KindVoiceFileGet:
+		return h.handleVoiceFileGet(env)
+	case domain.KindVoiceFileRemove:
+		return h.handleVoiceFileRemove(env)
+	case domain.KindLEDRestingGet:
+		return h.handleLEDRestingGet(env)
+	case domain.KindLEDRestingSet:
+		return h.handleLEDRestingSet(env)
+	case domain.KindLEDRestingPreview:
+		return h.handleLEDRestingPreview(env)
+	case domain.KindVolumeGet:
+		return h.handleVolumeGet(env)
+	case domain.KindVolumeSet:
+		return h.handleVolumeSet(env)
+	case domain.KindMicGet:
+		return h.handleMicGet(env)
+	case domain.KindMicSet:
+		return h.handleMicSet(env)
+	case domain.KindRealtimeGet:
+		return h.handleRealtimeGet(env)
 	default:
 		slog.Warn("unknown data kind", "component", "mqtt", "kind", env.Kind)
 		return h.publishDataResult(env.Kind, "failure", "unknown kind: "+env.Kind, nil)
@@ -385,7 +375,9 @@ func (h *DeviceMQTTHandler) dispatchData(env domain.MQTTDataCommand) error {
 
 // HandleMessage processes an incoming MQTT message (called from MQTT subscription callback or GWS HTTP).
 func (h *DeviceMQTTHandler) HandleMessage(topic string, payload []byte) error {
-	slog.Debug("HandleMessage", "component", "mqtt", "topic", topic, "payload", string(payload))
+	// Length only — raw payload can carry credentials (add_channel inline
+	// config, oauth tokens) so we do not want it landing in journalctl.
+	slog.Debug("HandleMessage", "component", "mqtt", "topic", topic, "payload_len", len(payload))
 
 	var cmd domain.MQTTMessage
 	if err := json.Unmarshal(payload, &cmd); err != nil {

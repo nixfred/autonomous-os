@@ -45,8 +45,10 @@ func TestIntentContextRouting(t *testing.T) {
 			{"expired hint pending task", "make it brighter", true, false, false, false, 200},
 			{"explicit lamp", "tăng sáng đèn Lamp", true, true, true, true, 200},
 			{"connection alone", "turn off the light", false, false, true, false, 200},
-			{"new digital abstain", "Create a landscape render", false, false, false, true, 200},
-			{"new digital error", "Create a landscape render", false, false, false, true, 503},
+			// No device vocabulary: the keyword pre-filter skips Jev entirely.
+			{"new digital no device keyword", "Create a landscape render", false, false, false, false, 200},
+			{"new digital abstain", "Create a landscape render in warm light", false, false, false, true, 200},
+			{"new digital error", "Create a landscape render in warm light", false, false, false, true, 503},
 		} {
 			t.Run(kind+"/"+tc.name, func(t *testing.T) {
 				previous := http.DefaultTransport
@@ -115,5 +117,25 @@ func TestIntentContextRouting(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+func TestEnglishIntentContextBoundaries(t *testing.T) {
+	for _, pending := range []bool{false, true} {
+		h := &SensingHandler{harnessTaskPending: func() bool { return pending }}
+		for _, phrase := range []string{"brighter", "dimmer", "louder", "quieter", "make it brighter", "make it quieter", "try again", "continue"} {
+			if !h.deferContextualIntent(phrase) {
+				t.Errorf("pending=%v: context fragment escaped: %q", pending, phrase)
+			}
+		}
+		for _, phrase := range []string{"Make this lamp brighter", "Your speaker is too quiet", "Stop the music on your speaker", "Track the cup with your camera"} {
+			if h.deferContextualIntent(phrase) {
+				t.Errorf("pending=%v: explicit device request deferred: %q", pending, phrase)
+			}
+		}
+	}
+	h := &SensingHandler{}
+	if h.deferContextualIntent("The room is a bit dark") {
+		t.Fatal("dark-room complaint must reach the classifier")
 	}
 }

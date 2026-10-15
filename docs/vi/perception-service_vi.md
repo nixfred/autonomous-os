@@ -5,6 +5,10 @@ hình deep-learning mà HAL trên thiết bị không chạy nổi cục bộ (n
 cảm xúc khuôn mặt và giọng nói, tư thế + công thái học, phát hiện vật thể, embedding
 người nói) và expose qua WebSocket và HTTP, phía sau một load balancer mã hóa tùy chọn.
 
+Trên thiết bị, các luồng nhận thức camera gọi backend này (motion, cảm xúc khuôn
+mặt, pose, fire hazard) là opt-in và mặc định tắt; xem
+[Hành vi Cảm nhận](../../robots/lamp/docs/vi/sensing-behavior_vi.md#nhận-thức-camera-qua-cloud-mặc-định-tắt).
+
 Trang này là **tổng quan nền tảng** — backend là gì và nằm ở đâu. **Tài liệu đầy đủ
 nằm cạnh code** trong [`integrations/perception-service/docs/`](../../integrations/perception-service/docs/); schema, danh sách
 model, endpoint và biến môi trường để ở đó, không để ở đây.
@@ -35,8 +39,9 @@ HAL / client
 - **`dlserver`** (`:8001`) — nạp các mô hình ML, phục vụ các endpoint perception.
 - **`lbserver`** (`:7999`) — proxy round-robin trước một hoặc nhiều `dlserver`; kết
   thúc (terminate) mã hóa RSA+AES để `dlserver` luôn nhận plaintext.
-- **`nginx`** (`:8899`) — cửa ngõ công khai; ánh xạ prefix `/lelamp/` (phía thiết
-  bị) sang prefix nội bộ `/hal/` và nâng cấp WebSocket.
+- **`nginx`** (`:8899`) — cửa ngõ công khai; cho `/hal/...` (prefix mà mặc định
+  hiện tại của HAL dùng, ví dụ `/hal/api/dl/ser/recognize`) đi thẳng qua, ánh xạ
+  prefix cũ `/lelamp/` sang `/hal/`, và nâng cấp WebSocket.
 
 Khi dev một node, có thể gọi thẳng `dlserver:8001` với mã hóa tắt.
 
@@ -54,6 +59,22 @@ Input được giới hạn kích thước (ảnh, audio) để chống tấn c�
 Đầu vào SER được giới hạn 2–8 giây với batch 1 phía server, nằm trong dải kích
 thước của engine TensorRT đã cache, nên không độ dài clip nào có thể kích hoạt
 việc build lại engine trong lúc xử lý request.
+Tương tự, đầu vào speaker embedding bị cắt còn 3000 frame (30 giây) trước khi
+suy luận, thấp hơn giới hạn 5546 frame của engine đã cache, nên clip dài được
+embed từ 30 giây đầu thay vì phải build lại engine (#555).
+Phát hiện vật thể OWLv2 chạy bằng hai graph ONNX: graph text biến prompt thành query
+embedding, graph ảnh dùng các embedding đó để phát hiện. Các preset prompt có tên (hiện chỉ
+có `fire_hazard_v1`, 46 prompt nguy cơ cháy mà HAL dùng) được encode một lần khi dlserver
+khởi động và giữ trong bộ nhớ, không lưu xuống đĩa, nên mỗi lần restart sẽ encode lại, và
+request dùng preset chỉ chạy graph ảnh. Request detect qua HTTP nhận field `preset` tùy
+chọn (tối đa 64 ký tự): preset đã biết được ưu tiên hơn `classes`, preset không biết bị trả
+400. Đổi prompt nghĩa là đặt tên preset mới và đưa ra cùng một lần deploy server, và phải
+deploy server trước bản HAL gửi tên mới (server cũ bỏ qua `preset` và trả 200 với class mặc
+định của nó). Cả hai graph dùng profile TensorRT tường minh (1–500 query, tối ưu cho 46) và
+được warm ở 46 và 1 query, nên engine được build lúc khởi động, trên slot đang rảnh khi
+deploy hai slot (khoảng 97 s trên GPU hiện tại), không bao giờ giữa chừng một request.
+Schema request:
+[`integrations/perception-service/docs/api.md`](../../integrations/perception-service/docs/api.md#object-detection--websocket--http).
 Lựa chọn model và output:
 [`integrations/perception-service/docs/perceptions.md`](../../integrations/perception-service/docs/perceptions.md).
 
@@ -68,11 +89,11 @@ lọc/VAD/chuẩn hoá audio **tại thiết bị** và gọi `/audio-recognizer
 định `preprocess=false`; chỉ truyền `true` nếu upload audio thô để server tự làm
 sạch). HAL cũng đặt `use_sliding_window`: bước enroll gửi `false` để nhồi nguyên
 câu vào model một lần (một vector sạch), còn bước recognize gửi `true` để trượt
-cửa sổ chồng lấn và bỏ phiếu theo từng chunk. Response embed (và `/health`) còn
-trả `embed_model_version` — vân tay của
+cửa sổ chồng lấn và bỏ phiếu theo từng chunk. Response embed
+(`embed_model_version`) và `/health` (`audio_embedder_version`) còn trả vân tay của
 trọng số model đang nạp, để HAL biết khi model server đổi và **tự tính lại
 embedding** cho các hồ sơ giọng đã lưu thay vì so khớp với vector đã lỗi thời
-(xem [`robots/lamp/docs/speaker-enrollment.md`](../../robots/lamp/docs/speaker-enrollment.md)). Endpoint và payload chính xác nằm trong
+(xem [`robots/lamp/docs/vi/speaker-enrollment_vi.md`](../../robots/lamp/docs/vi/speaker-enrollment_vi.md)). Endpoint và payload chính xác nằm trong
 [`integrations/perception-service/docs/api.md`](../../integrations/perception-service/docs/api.md); mọi tham số cấu hình nằm trong
 [`integrations/perception-service/docs/configuration.md`](../../integrations/perception-service/docs/configuration.md).
 
@@ -82,6 +103,12 @@ embedding** cho các hồ sơ giọng đã lưu thay vì so khớp với vector 
 một `Makefile`; hai tiến trình chạy bằng `python -m dlserver` và `python -m lbserver`.
 Cài đặt, single-node vs scale master/slave nhiều GPU, RunPod, Docker và TLS:
 [`integrations/perception-service/docs/deployment.md`](../../integrations/perception-service/docs/deployment.md).
+
+Code dlserver mới được triển khai bằng `make deploy-dlserver`: lệnh này khởi động
+code mới trên một cổng thứ hai, cùng GPU, và chỉ chuyển lbserver sang đó (state
+file + `SIGHUP`) khi mọi model đã tải xong, nên thiết bị không thấy lỗi nào. Thay
+đổi dependency vẫn dùng cách restart tại chỗ đã lên kế hoạch như trước. Chi tiết:
+[Zero-downtime deploy](../../integrations/perception-service/docs/deployment.md#zero-downtime-deploy-two-slots).
 
 ---
 

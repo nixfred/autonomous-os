@@ -1,4 +1,6 @@
 """Confirmed STT openers enter full-duplex LIVE without duplicate dispatch."""
+import threading
+
 
 from types import MethodType
 from unittest.mock import Mock
@@ -159,6 +161,11 @@ def test_final_wake_confirmation_controls_promotion_and_fallback(
     monkeypatch.setattr(config, "REALTIME_ENABLED", True)
     monkeypatch.setattr(module.voice_cfg, "LIVE_MODE", True)
     service = Mock()
+    service._automatic_reply_lock = threading.Lock()
+    service._automatic_reply_stop = None
+    service._automatic_reply_cancelled_at = None
+    service._stt_drain_worker = None
+    service._stt_drain_future = None
     service._running = False
     service._tts = None
     service._wakeword_focus = WakeWordFocus(20)
@@ -167,6 +174,8 @@ def test_final_wake_confirmation_controls_promotion_and_fallback(
     service._music_is_playing.return_value = False
     service._decorator.starts_with_wake_word.side_effect = lambda t: t.lower().startswith("hello lamp")
     service._decorator.matches_wake_word_loosely.return_value = False
+    service._decorator.matches_wake_prefix_slot.return_value = False
+    service.bare_wake_phrase.return_value = False
     service._decorator.classify_wake_word.return_value = (final, "voice_command")
     service._decorator.identify_and_decorate.return_value = (final, None, None)
     service._try_live_opener = MethodType(VoiceService._try_live_opener, service)
@@ -275,7 +284,7 @@ def test_real_live_session_keeps_mic_streaming_during_opener_reply(monkeypatch, 
     assert captured.is_set() and opener["consumed"]
     audio = [c[1] for c in calls if isinstance(c, tuple) and c[0] == "audio"]
     assert audio[:2] == frames
-    assert len(audio) > 2  # Real-time mic frames followed the captured opener.
+    assert len(audio) > 2
     assert calls.index("flush") < calls.index(("audio", frames[0]))
 
 

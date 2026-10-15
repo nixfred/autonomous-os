@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -16,20 +17,8 @@ import (
 	"go.autonomous.ai/os/system/server/serializers"
 )
 
-// Dead air filler — short TTS cues spoken by HAL while OpenClaw is busy,
-// scheduled and cancelled by FillerManager from agent lifecycle/tool events.
-//
-// Two pools chosen by turn position:
-//   - OpeningFillers: first filler of a turn — acknowledges the user
-//     just before the agent starts working.
-//   - ContinuationFillers: re-arms after tool.end — implies progress
-//     ("still working") rather than re-acknowledging.
-//
-// Pool empty = that position is silent. Both empty = feature disabled.
-
 // poolsForLang returns the (opening, continuation) pools for a BCP-47 STT
-// language code. Empty / unknown / "en*" → English. Falls through to English
-// when the requested pool is empty so a misconfigured pool stays graceful.
+// language code.
 func poolsForLang(lang string) (opening, continuation []string) {
 	return i18n.FillerOpening(lang), i18n.FillerContinuation(lang)
 }
@@ -42,43 +31,28 @@ func realtimePoolForLang(lang string) []string {
 }
 
 // toolPoolForLang returns the tool-specific filler pool for (lang, toolName).
-// Returns nil when there's no pool for that combination — caller falls back
-// to the regular Continuation pool. Unknown lang → English pool.
 func toolPoolForLang(lang, toolName string) []string {
 	return i18n.FillerForTool(lang, toolName)
 }
 
 // Filler tuning. All durations are wall-clock.
 const (
-	// FillerDelay is how long to wait after the agent starts (or finishes
-	// a non-reactive tool) before speaking a filler. If the assistant
-	// reply or a hardware reaction arrives first the timer is cancelled
-	// and no filler plays.
-	FillerDelay = 1500 * time.Millisecond
+	// FillerDelay is how long to wait after the agent starts (or finishes a
+	// non-reactive tool) before speaking a filler.
+	FillerDelay = 3500 * time.Millisecond
 
-	// FillerCooldown is the minimum gap between two filler reactions in
-	// the same turn — covers both filler-spoken and hardware-reaction
-	// events. Keeps the device from chattering "one sec... still working"
-	// on top of "/emotion thinking" within a fraction of a second.
-	// Tuned 2026-05-12 from 4s → 2.5s so short ~3s tool gaps still get a
-	// filler instead of going silent — cached audio plays in ~1s so a
-	// 2.5s cooldown leaves ~1.5s of dead air between fillers, enough to
-	// not feel chattery while still covering more gaps.
+	// FillerCooldown is the minimum gap between two filler reactions in the
+	// same turn — covers both filler-spoken and hardware-reaction events.
 	FillerCooldown = 2500 * time.Millisecond
 
-	// MaxFillersPerTurn caps actual spoken fillers in a single turn.
-	// Hardware reactions don't count against this — only TTS plays.
-	// Bumped 2026-05-12 from 3 → 6 to cover multi-tool turns (4+ tool
-	// boundaries observed on web_search + web_fetch chains) where every
-	// gap should get a filler for best perceived progress UX. With pool
-	// sizes ≥ 12 (post-2026-05-12), 5 Continuations + 1 synthetic Opening
-	// stays varied enough to avoid feeling robotic.
-	MaxFillersPerTurn = 6
+	// MaxFillersPerTurn includes the reserved opening slot (also for delegates),
+	// leaving at most one automatic continuation in each turn.
+	MaxFillersPerTurn = 2
 )
 
 // fillerCancelToolMarkers are URL fragments for tool calls that themselves
-// act as audible/visible reactions — when one fires, no filler is needed
-// at that moment because the user already perceived the device reacting.
+// act as audible/visible reactions — when one fires, no filler is needed at
+// that moment because the user already perceived the device reacting.
 var fillerCancelToolMarkers = []string{"/emotion", "/audio/play", "/scene", "/servo"}
 
 // isHWReactionTool reports whether toolArgs invokes a hardware reaction.
@@ -104,36 +78,23 @@ type fillerRun struct {
 	suspended      bool      // assistant text is streaming; only a new tool.start may resume
 	generation     uint64    // invalidates timer callbacks and speech completions after suspension
 	lastSpoken     string    // text of the most recent filler — used to dedup back-to-back picks
-	rearmPending   bool      // tool.end arrived while playing=true; fire() re-arms after speak (otherwise the event would be silently dropped by armLocked's playing guard)
-	armOnTool      bool      // delegated realtime turn: the realtime model already acknowledged the user, so the first filler waits for the first tool.start instead of FillerDelay after lifecycle.start (a NO_REPLY turn then stays silent instead of promising an answer)
-	lastToolName   string    // name of the most recently started tool — drives tool-aware filler pool ("Đang tra mạng" for web_search, "Đang đọc tài liệu" for read, etc.). Empty when no tool has started yet (e.g. first filler before any tool call)
+	rearmPending   bool      // tool.end arrived while playing; fire() re-arms after speaking
+	armOnTool      bool      // delegated realtime turn: first filler waits for the first tool.start
+	lastToolName   string    // most recently started tool; selects the tool-aware filler pool
 }
 
 // fillersDisabled reports whether both English pools are empty — the kill
-// switch. Per-language pools are not considered: emptying English alone
-// disables the feature for every language.
+// switch.
 func fillersDisabled() bool {
 	return len(i18n.FillerOpening(i18n.LangEN)) == 0 && len(i18n.FillerContinuation(i18n.LangEN)) == 0
 }
 
-// pickFiller returns a phrase appropriate for the current turn position
-// in the active language (read from i18n.Lang()), avoiding lastSpoken when
-// an alternative exists.
-//
-// Lookup chain (first non-empty wins):
-//  1. Tool-specific pool keyed by lastToolName ("web_search" → "Đang tra mạng")
-//  2. Opening pool when fired==0, else Continuation pool
-//  3. The opposite (Continuation/Opening) pool as fallback
-//
-// fired==0 prefers Opening so the very first filler stays an
-// acknowledgement; once a tool has fired the tool pool drives accuracy.
-func pickFiller(fired int, lastSpoken, lastToolName string) string {
+// pickFiller returns a phrase appropriate for the current turn position in
+// the active language (read from i18n.Lang()), avoiding lastSpoken when an
+// alternative exists.
+func pickFiller(fired int, lastSpoken string) string {
 	lang := i18n.Lang()
-	if pool := toolPoolForLang(lang, lastToolName); len(pool) > 0 {
-		if pick := pickFrom(pool, lastSpoken); pick != "" {
-			return pick
-		}
-	}
+	// Automatic waiting feedback must not claim a tool-specific action.
 	opening, continuation := poolsForLang(lang)
 	primary, fallback := opening, continuation
 	if fired > 0 {
@@ -146,17 +107,10 @@ func pickFiller(fired int, lastSpoken, lastToolName string) string {
 }
 
 // classifyFillerPool reports which pool the given filler text came from,
-// purely for debug logging on the fire path. Looks up the text in the
-// tool pool, opening, and continuation lists (in that order) and returns
-// the first hit. Returned values: "tool:<name>", "opening", "continuation",
-// or "unknown" when the filler doesn't appear in any pool (shouldn't happen
-// unless pools were edited at runtime between pick and classify).
+// purely for debug logging on the fire path.
 func classifyFillerPool(filler, toolName string, fired int, lang string) string {
 	if filler == "" {
 		return "none"
-	}
-	if pool := toolPoolForLang(lang, toolName); poolContains(pool, filler) {
-		return "tool:" + toolName
 	}
 	opening, continuation := poolsForLang(lang)
 	if poolContains(opening, filler) {
@@ -179,9 +133,7 @@ func poolContains(pool []string, s string) bool {
 	return false
 }
 
-// pickFrom returns a random entry from pool. When the pool has more than
-// one entry it avoids returning lastSpoken so the same line doesn't fire
-// twice in a row within a turn.
+// pickFrom returns a random entry from pool.
 func pickFrom(pool []string, lastSpoken string) string {
 	switch len(pool) {
 	case 0:
@@ -191,11 +143,8 @@ func pickFrom(pool []string, lastSpoken string) string {
 	}
 	pick := pool[rand.Intn(len(pool))]
 	if pick == lastSpoken {
-		// Re-roll once. With pool size >= 2, two picks bound collision
-		// probability tightly enough — no need to loop.
 		pick = pool[rand.Intn(len(pool))]
 		if pick == lastSpoken {
-			// Deterministic fallback: walk to the next index.
 			for i, p := range pool {
 				if p == lastSpoken {
 					pick = pool[(i+1)%len(pool)]
@@ -207,20 +156,9 @@ func pickFrom(pool []string, lastSpoken string) string {
 	return pick
 }
 
-// PrewarmFillers asks hal to render+save WAV for every filler phrase
-// in the active STT language (read from i18n.Lang()) so the first runtime
-// fire is a cache hit (no ElevenLabs roundtrip). Polls hal /health
-// until it answers (os-server.service starts before hal.service is
-// ready -- without this guard every prerender races and all phrases
-// fail with connection refused). Then prerenders serially. Logs failures
-// but never panics; cache misses fall back to live speak at fire time.
-//
-// "vi", "zh-CN", "zh-TW" pick the matching translated pool; anything
-// else falls back to English. intent.CacheableReplies is always English
-// (intent rules only match English keywords) so it's prewarmed regardless
-// of language. Switching language at runtime causes a one-time miss on
-// the first filler — acceptable since hal restarts on EditConfig
-// anyway.
+// PrewarmFillers asks hal to render+save WAV for every filler phrase in the
+// active STT language (read from i18n.Lang()) so the first runtime fire is a
+// cache hit (no ElevenLabs roundtrip).
 func PrewarmFillers() {
 	lang := i18n.Lang()
 	const (
@@ -246,23 +184,10 @@ func PrewarmFillers() {
 	all := append([]string{}, opening...)
 	all = append(all, continuation...)
 	all = append(all, realtimePoolForLang(lang)...)
-	// Also prerender tool-specific filler phrases. Without this, the first
-	// fire of a tool-aware filler (e.g. "Đang tra mạng" when web_search
-	// runs) hits ElevenLabs live (~1-2s render) and the resulting late
-	// audio races against the assistant TTS that follows — user perceives
-	// it as the filler getting cut off / TTS being suppressed.
-	//
-	// Enumerated from the pool maps rather than from a list maintained by hand
-	// here. The hand-maintained version had already fallen behind twice: every
-	// look_* pool was missing from it, and so would the demo_* pools have been.
-	// A pool left out does not fail — it just renders late, on the one fire
-	// where the timing matters most.
 	for _, pool := range i18n.AllPoolKeys() {
 		all = append(all, i18n.FillerForTool(lang, pool)...)
 	}
 	all = append(all, intent.CacheableReplies...)
-	// Dedup so overlapping phrases (e.g. between a tool pool and the
-	// generic Continuation pool) only prerender once per language.
 	seen := make(map[string]struct{}, len(all))
 	unique := make([]string, 0, len(all))
 	for _, p := range all {
@@ -296,17 +221,13 @@ func PrewarmFillers() {
 }
 
 // PlayOpeningFillerNow fires a single Opening-pool filler immediately,
-// fire-and-forget, without going through FillerManager. Called by the
-// sensing handler right after a voice/voice_command turn is forwarded.
-//
-// Pool is picked from i18n.Lang() (see poolsForLang). Uses the hal WAV
-// cache (SpeakCachedInterruptible) so the filler nhả tiếng ~50ms after this
-// call instead of 1.5s — fillers were previously fired ~5-10s ahead of the
-// real reply just to mask ElevenLabs latency; with cached audio that
-// workaround is unnecessary, but the call site stays the same for now.
-//
-// No-op when the resolved Opening pool is empty.
+// fire-and-forget, without going through FillerManager.
 func PlayOpeningFillerNow(owner string) {
+	// Temporarily pause opening acknowledgments; retain playback for re-enabling.
+	const openingFillerPaused = true
+	if openingFillerPaused {
+		return
+	}
 	lang := i18n.Lang()
 	opening, _ := poolsForLang(lang)
 	if len(opening) == 0 {
@@ -322,27 +243,15 @@ func PlayOpeningFillerNow(owner string) {
 	}
 }
 
-// PlayFiller speaks one realtime filler on demand. It exists for the realtime
-// voice path, which owns a dead-air pocket os-server cannot see: HAL commits
-// the captured audio to the realtime model and only forwards the turn here
-// AFTER that model is done, so the seconds spent waiting for Gemini have no
-// turn to hang a filler on. HAL times that wait itself and calls this when it
-// runs long (see hal/drivers/voice/_internal/realtime_turn.py).
-//
-// Kept as an endpoint rather than a phrase list in HAL so the pools, the
-// language resolution, and the WAV cache stay in one place — a second copy in
-// Python would drift the moment either side edits a phrase.
-//
-// Fire-and-forget: returns 200 as soon as the filler is queued. The caller is
-// racing the model's first sentence, so waiting on TTS would be pointless.
+// PlayFiller speaks one realtime filler on demand.
 func (h *SensingHandler) PlayFiller(c *gin.Context) {
 	// Optional body selects a specific pool. Bodyless calls use the dedicated
 	// realtime-wait pool, so the main-agent opening pool remains unchanged.
 	var req struct {
 		Pool string `json:"pool"`
 		// Owner is an opaque tag HAL sends back to itself so a played filler
-		// can be attributed to the utterance it was armed for (voice metrics).
-		// Empty keeps the previous behaviour for callers that have none.
+		// can be attributed to the utterance it was armed for (voice
+		// metrics).
 		Owner string `json:"owner"`
 	}
 	_ = c.ShouldBindJSON(&req)
@@ -355,8 +264,7 @@ func (h *SensingHandler) PlayFiller(c *gin.Context) {
 }
 
 // PlayRealtimeFillerNow speaks one quiet, non-lexical cue while the realtime
-// model has not produced its first audio frame. Unlike PlayOpeningFillerNow,
-// it does not acknowledge or narrate work the model has not completed.
+// model has not produced its first audio frame.
 func PlayRealtimeFillerNow(owner string) {
 	lang := i18n.Lang()
 	filler := pickFrom(realtimePoolForLang(lang), "")
@@ -369,13 +277,7 @@ func PlayRealtimeFillerNow(owner string) {
 	}
 }
 
-// PlayPoolFillerNow speaks one phrase from a named tool pool. Used by the
-// look-aim, whose states ("searching", "found") need their own phrasing rather
-// than the generic "one sec" — a lamp physically turning away from the user is
-// confusing unless it says why.
-//
-// Silent when the pool is unknown or empty: a missing phrase must never block
-// the aim or the capture that follows it.
+// PlayPoolFillerNow speaks one phrase from a named tool pool.
 func PlayPoolFillerNow(pool, owner string) {
 	lang := i18n.Lang()
 	phrases := toolPoolForLang(lang, pool)
@@ -392,36 +294,30 @@ func PlayPoolFillerNow(pool, owner string) {
 	}
 }
 
+// speakCue plays a SayInVoiceRun cue; a var so tests can capture it.
+var speakCue = hal.SpeakCachedInterruptibleForTurn
+
 // FillerManager schedules and cancels dead-air fillers driven by OpenClaw
-// agent events. Wiring (per turn lifecycle):
-//
-//  1. Sensing handler calls MarkVoiceRun(runID, interactionID) before forwarding a
-//     voice/voice_command turn — only marked runs are eligible.
-//  2. SSE handler calls OnTurnStart(runID) on lifecycle.start — arms the
-//     first FillerDelay timer.
-//  3. SSE handler calls OnToolStart(runID, toolArgs) on tool.start —
-//     hardware tools (/emotion, /audio/play, /scene, /servo) soft-cancel
-//     the pending filler since the agent already reacted; non-hardware
-//     tools (Bash, Read, etc.) leave the timer alone.
-//  4. SSE handler calls OnToolEnd(runID) on tool.end — re-arms a filler
-//     timer if the turn is still active and the cap/cooldown allow it.
-//     This covers long multi-tool turns where each tool boundary is a
-//     potential dead-air pocket.
-//  5. Assistant deltas suspend fillers until the next tool.start.
-//     Lifecycle end/error or explicit cancellation permanently clears the
-//     run, preventing subsequent tool events from reviving fillers.
-//
-// All exported methods are safe for concurrent use and idempotent.
+// agent events. Safe for concurrent use; all exported methods are idempotent.
 type FillerManager struct {
-	mu        sync.Mutex
-	runs      map[string]*fillerRun
-	voiceRuns map[string]bool
+	supersededBefore atomic.Int64
+	mu               sync.Mutex
+	runs             map[string]*fillerRun
+	voiceRuns        map[string]bool
 	// delegated marks voice runs the realtime model handed off after speaking
 	// its own filler — see fillerRun.armOnTool.
 	delegated map[string]bool
 	// interactions maps a run to HAL's voice-metrics interaction id, so a filler
 	// fired later in the turn is attributed the same way the opening one is.
 	interactions map[string]string
+	// Suppression survives Cancel because a delegated task can resume fillers
+	// after the device agent finishes. Keep only a bounded set of recent runs.
+	suppressed      map[string]bool
+	suppressedOrder []string
+	// cueRuns are suppressed voice turns that started: no automatic filler, but
+	// SayInVoiceRun may still announce an action the agent chose. The value is
+	// true while the reply streams.
+	cueRuns map[string]bool
 }
 
 // NewFillerManager constructs an empty FillerManager. Language is read at
@@ -432,6 +328,8 @@ func NewFillerManager() *FillerManager {
 		voiceRuns:    make(map[string]bool),
 		delegated:    make(map[string]bool),
 		interactions: make(map[string]string),
+		suppressed:   make(map[string]bool),
+		cueRuns:      make(map[string]bool),
 	}
 }
 
@@ -440,13 +338,38 @@ func NewFillerManager() *FillerManager {
 // (OnTurnStart/OnToolStart/OnToolEnd/Cancel).
 var DefaultFillerManager = NewFillerManager()
 
-// MarkVoiceRun marks runID as eligible for fillers. Other turn types
-// (Telegram, web chat, passive sensing, cron, guard) must NOT be marked.
-func (fm *FillerManager) MarkVoiceRun(runID, interactionID string) {
-	if runID == "" {
+const maxSuppressedFillerRuns = 4096
+
+// SuppressRun disables automatic fillers for a turn, including re-registration
+// after queued replay or a delegated task resumes. Call before dispatch.
+func (fm *FillerManager) SuppressRun(runID string) {
+	if runID == "" || fm.Superseded(runID) {
 		return
 	}
 	fm.mu.Lock()
+	defer fm.mu.Unlock()
+	if fm.suppressed[runID] {
+		return
+	}
+	if len(fm.suppressedOrder) >= maxSuppressedFillerRuns {
+		delete(fm.suppressed, fm.suppressedOrder[0])
+		fm.suppressedOrder = fm.suppressedOrder[1:]
+	}
+	fm.suppressed[runID] = true
+	fm.suppressedOrder = append(fm.suppressedOrder, runID)
+}
+
+// MarkVoiceRun marks runID as eligible for fillers. Other turn types
+// (Telegram, web chat, passive sensing, cron, guard) must NOT be marked.
+func (fm *FillerManager) MarkVoiceRun(runID, interactionID string) {
+	if runID == "" || fm.Superseded(runID) {
+		return
+	}
+	fm.mu.Lock()
+	if fm.suppressed[runID] {
+		fm.mu.Unlock()
+		return
+	}
 	fm.voiceRuns[runID] = true
 	if interactionID != "" {
 		fm.interactions[runID] = interactionID
@@ -455,25 +378,21 @@ func (fm *FillerManager) MarkVoiceRun(runID, interactionID string) {
 }
 
 // MarkDelegatedVoiceRun is MarkVoiceRun for a turn the realtime model handed
-// off to the main agent (`[voice-instruction]`). The realtime model has
-// already spoken a filler for this utterance, so os-server must not promise
-// an answer a second time: no opening filler, and the first Continuation
-// only arms when a tool starts. A turn the main agent ends with NO_REPLY
-// (the common outcome for an unclear utterance) then produces no os-server
-// filler at all; a turn that runs tools keeps every tool-boundary filler.
+// off to the main agent (`[voice-instruction]`).
 func (fm *FillerManager) MarkDelegatedVoiceRun(runID, interactionID string) {
 	fm.MarkVoiceRun(runID, interactionID)
-	if runID == "" {
+	if runID == "" || fm.Superseded(runID) {
 		return
 	}
 	fm.mu.Lock()
-	fm.delegated[runID] = true
+	if !fm.suppressed[runID] {
+		fm.delegated[runID] = true
+	}
 	fm.mu.Unlock()
 }
 
-// fillerOwner is the tag HAL attributes played filler audio to: the voice-metrics
-// interaction when HAL sent one, else the run id. Measurement only — an empty
-// result simply leaves the audio unattributed.
+// fillerOwner is the tag HAL attributes played filler audio to: the
+// voice-metrics interaction when HAL sent one, else the run id.
 func fillerOwner(interactionID, runID string) string {
 	if interactionID != "" {
 		return interactionID
@@ -481,22 +400,25 @@ func fillerOwner(interactionID, runID string) string {
 	return runID
 }
 
-// OnTurnStart records the run as active and arms a Continuation timer so
-// dead air gets filled even when the agent thinks without invoking any
-// tool (no tool.end -> no OnToolEnd re-arm without this). fired=1 marks
-// Opening as already played by the sensing handler so pickFiller prefers
-// the Continuation pool here.
-//
-// The arm-on-turn-start path was previously disabled because ElevenLabs
-// TTFB > 2s could exceed hal speak() lock-timeout=2s; with the WAV
-// cache (2026-05-05), cached fillers play in ~50ms so the race is gone.
+// OnTurnStart records the run as active and arms a Continuation timer so dead
+// air gets filled even when the agent thinks without invoking any tool (no
+// tool.end -> no OnToolEnd re-arm without this).
 func (fm *FillerManager) OnTurnStart(runID string) {
-	if runID == "" || fillersDisabled() {
+	if runID == "" {
 		return
 	}
 	fm.mu.Lock()
 	defer fm.mu.Unlock()
-	if !fm.voiceRuns[runID] {
+	if fm.Superseded(runID) {
+		return
+	}
+	if fm.suppressed[runID] {
+		if _, ok := fm.cueRuns[runID]; !ok {
+			fm.cueRuns[runID] = false
+		}
+		return
+	}
+	if fillersDisabled() || !fm.voiceRuns[runID] {
 		return
 	}
 	delete(fm.voiceRuns, runID)
@@ -515,18 +437,18 @@ func (fm *FillerManager) OnTurnStart(runID string) {
 	fm.armLocked(runID, run, FillerDelay)
 }
 
-// OnToolStart records the most recently started tool name so the next
-// filler picks a tool-aware phrase (see ToolFillers*), and soft-cancels
-// the pending filler when the tool is a hardware reaction (the user
-// already perceives the device reacting — no filler needed at that moment).
-// Non-hardware tools leave the filler timer ticking so it can still fire
-// during a long Bash/Read/web_search.
+// OnToolStart records the tool name for diagnostics and soft-cancels
+// the pending filler when the tool is itself a hardware reaction.
 func (fm *FillerManager) OnToolStart(runID, toolArgs, toolName string) {
-	if runID == "" {
+	if runID == "" || fm.Superseded(runID) {
 		return
 	}
 	fm.mu.Lock()
 	defer fm.mu.Unlock()
+	if _, ok := fm.cueRuns[runID]; ok {
+		fm.cueRuns[runID] = false
+		return
+	}
 	run, ok := fm.runs[runID]
 	if !ok || run.ended {
 		slog.Debug("filler OnToolStart skipped — no active run", "component", "sensing", "run_id", runID, "tool", toolName)
@@ -552,13 +474,8 @@ func (fm *FillerManager) OnToolStart(runID, toolArgs, toolName string) {
 	fm.softCancelLocked(run)
 }
 
-// OnToolEnd attempts to re-arm a filler timer after a tool finishes —
-// the turn may still have minutes of thinking ahead. No-op when the run
-// has ended or the per-turn cap is reached. When a filler is currently
-// speaking, the arm is deferred via run.rearmPending so fire() can
-// schedule the next timer once speech completes — without this defer
-// the tool.end is silently dropped (armLocked refuses while playing)
-// and the next dead-air gap goes unfilled.
+// OnToolEnd attempts to re-arm a filler timer after a tool finishes — the
+// turn may still have minutes of thinking ahead.
 func (fm *FillerManager) OnToolEnd(runID string) {
 	if runID == "" || fillersDisabled() {
 		return
@@ -584,9 +501,8 @@ func (fm *FillerManager) OnToolEnd(runID string) {
 func fillerRearmDelay(run *fillerRun) time.Duration {
 	delay := FillerDelay
 	if !run.lastActivityAt.IsZero() {
-		// Respect cooldown from the last filler/HW reaction. Add the
-		// regular delay on top so we don't immediately re-fire the moment
-		// cooldown elapses — give the next thought a chance.
+		// Add the regular delay on top so we don't immediately re-fire the
+		// moment cooldown elapses — give the next thought a chance.
 		if elapsed := time.Since(run.lastActivityAt); elapsed < FillerCooldown {
 			delay = (FillerCooldown - elapsed) + FillerDelay
 		}
@@ -594,12 +510,14 @@ func fillerRearmDelay(run *fillerRun) time.Duration {
 	return delay
 }
 
-// OnAssistantText interrupts fillers without ending a voice turn. Agents may
-// announce their next step before using tools; only a later tool.start can
-// resume fillers, while late tool.end events remain suppressed.
+// OnAssistantText interrupts fillers without ending a voice turn.
 func (fm *FillerManager) OnAssistantText(runID string) {
 	fm.mu.Lock()
 	defer fm.mu.Unlock()
+	if _, ok := fm.cueRuns[runID]; ok {
+		fm.cueRuns[runID] = true
+		return
+	}
 	run, ok := fm.runs[runID]
 	if !ok || run.ended || run.suspended {
 		return
@@ -609,9 +527,13 @@ func (fm *FillerManager) OnAssistantText(runID string) {
 }
 
 // Cancel hard-cancels the run: stop pending timer, interrupt any filler
-// mid-speech, mark the run ended so future tool events are no-ops, and
-// drop the entry from the runs map. Idempotent.
+// mid-speech, mark the run ended so future tool events are no-ops, and drop
+// the entry from the runs map.
 func (fm *FillerManager) Cancel(runID string) {
+	fm.cancel(runID, true)
+}
+
+func (fm *FillerManager) cancel(runID string, stopPlayback bool) {
 	if runID == "" {
 		return
 	}
@@ -619,6 +541,7 @@ func (fm *FillerManager) Cancel(runID string) {
 	delete(fm.voiceRuns, runID)
 	delete(fm.delegated, runID)
 	delete(fm.interactions, runID)
+	delete(fm.cueRuns, runID)
 	run, ok := fm.runs[runID]
 	if !ok {
 		fm.mu.Unlock()
@@ -634,7 +557,7 @@ func (fm *FillerManager) Cancel(runID string) {
 	delete(fm.runs, runID)
 	fm.mu.Unlock()
 
-	if wasPlaying {
+	if wasPlaying && stopPlayback {
 		go func() {
 			if err := hal.StopTTS(); err != nil {
 				slog.Warn("filler stop TTS failed", "component", "sensing", "run_id", runID, "error", err)
@@ -644,28 +567,93 @@ func (fm *FillerManager) Cancel(runID string) {
 }
 
 // CancelAllActive hard-cancels every run currently holding filler state, and
-// reports how many there were. Called by the physical cancel gesture.
-//
-// The click mutes turns but deliberately does not abort them, so a cancelled
-// turn keeps running and keeps reaching tool boundaries — and OnToolEnd would
-// keep re-arming "one moment" for a reply that is now guaranteed never to be
-// spoken. Device-observed: the user clicks, asks something else, and the lamp
-// promises to answer the question it was just told to drop.
-//
-// Cancelling by iteration rather than by watermark on each fire is exact here:
-// the mark is stamped at this instant, so every run already registered is on
-// the old side of it, and a turn started after the click registers fresh.
+// reports how many filler runs there were. It also drops the cue-only suppressed
+// turns, which hold no filler and so are not counted. Called by the physical
+// cancel gesture.
 func (fm *FillerManager) CancelAllActive() int {
+	return fm.cancelMatching(func(string) bool { return true }, true)
+}
+
+// cancelMatching invokes the predicate outside fm.mu.
+func (fm *FillerManager) cancelMatching(matches func(string) bool, stopPlayback bool) int {
 	fm.mu.Lock()
 	runIDs := make([]string, 0, len(fm.runs))
 	for runID := range fm.runs {
 		runIDs = append(runIDs, runID)
 	}
-	fm.mu.Unlock()
-	for _, runID := range runIDs {
-		fm.Cancel(runID)
+	cueIDs := make([]string, 0, len(fm.cueRuns))
+	for runID := range fm.cueRuns {
+		cueIDs = append(cueIDs, runID)
 	}
-	return len(runIDs)
+	fm.mu.Unlock()
+	count := 0
+	for _, runID := range runIDs {
+		if matches(runID) {
+			fm.cancel(runID, stopPlayback)
+			count++
+		}
+	}
+	// Cue-only suppressed turns hold no filler: dropped, but not counted.
+	for _, runID := range cueIDs {
+		if matches(runID) {
+			fm.cancel(runID, stopPlayback)
+		}
+	}
+	return count
+}
+
+// cueTargetLocked picks the voice turn a cue speaks on: a filler run first, else
+// a suppressed (cue-only) turn, whose run is nil. Caller holds fm.mu.
+func (fm *FillerManager) cueTargetLocked() (string, *fillerRun) {
+	for id, r := range fm.runs {
+		if !r.ended && !r.suspended {
+			return id, r
+		}
+	}
+	for id, streaming := range fm.cueRuns {
+		if !streaming {
+			return id, nil
+		}
+	}
+	return "", nil
+}
+
+// SayInVoiceRun speaks one phrase from pool for the voice turn in progress and
+// pushes that turn's dead-air filler back by its cooldown, so a generic "Hmm..."
+// does not land on top of the cue. It is silent and returns false when no voice
+// turn is running (Telegram, web chat, cron) or the reply is already streaming.
+// The cue does not count toward MaxFillersPerTurn. A suppressed voice follow-up
+// (SuppressRun) still gets cues, which announce an action, never automatic fillers.
+func (fm *FillerManager) SayInVoiceRun(pool string) bool {
+	phrases := toolPoolForLang(i18n.Lang(), pool)
+	if len(phrases) == 0 {
+		return false
+	}
+	fm.mu.Lock()
+	runID, run := fm.cueTargetLocked()
+	if runID == "" {
+		fm.mu.Unlock()
+		return false
+	}
+	// A cue-only turn has no dead-air filler to push back.
+	if run != nil {
+		if run.timer != nil {
+			run.timer.Stop()
+			run.timer = nil
+			run.generation++
+		}
+		run.lastActivityAt = time.Now()
+		fm.armLocked(runID, run, fillerRearmDelay(run))
+	}
+	owner := fillerOwner(fm.interactions[runID], runID)
+	fm.mu.Unlock()
+
+	filler := pickFrom(phrases, "")
+	slog.Info("voice cue firing", "component", "sensing", "run_id", runID, "pool", pool, "filler", filler, "owner", owner)
+	if err := speakCue(filler, owner); err != nil {
+		slog.Warn("voice cue failed", "component", "sensing", "pool", pool, "error", err)
+	}
+	return true
 }
 
 // HasActiveRun reports whether runID still holds filler state. Exported for
@@ -680,7 +668,7 @@ func (fm *FillerManager) HasActiveRun(runID string) bool {
 // armLocked schedules a filler timer for run after delay. Caller holds fm.mu.
 // No-op when the run has ended, the cap is reached, or a timer/filler is already active.
 func (fm *FillerManager) armLocked(runID string, run *fillerRun, delay time.Duration) {
-	if run.ended || run.suspended {
+	if run.ended || run.suspended || fm.Superseded(runID) {
 		slog.Debug("filler arm blocked — ended", "component", "sensing", "run_id", runID)
 		return
 	}
@@ -700,9 +688,8 @@ func (fm *FillerManager) armLocked(runID string, run *fillerRun, delay time.Dura
 	run.timer = time.AfterFunc(delay, func() { fm.fire(runID, run, generation) })
 }
 
-// softCancelLocked clears a pending timer and interrupts in-flight TTS,
-// but keeps the run alive so OnToolEnd can re-arm later. Counts as an
-// activity so the cooldown applies to the next re-arm.
+// softCancelLocked clears a pending timer and interrupts in-flight TTS, but
+// keeps the run alive so OnToolEnd can re-arm later.
 func (fm *FillerManager) softCancelLocked(run *fillerRun) {
 	run.generation++
 	run.rearmPending = false
@@ -722,20 +709,24 @@ func (fm *FillerManager) softCancelLocked(run *fillerRun) {
 	}
 }
 
-// fire is the timer callback. Re-checks state under the lock, picks a
-// pool-appropriate filler, speaks it outside the lock, then re-takes the
-// lock to update counters.
+// fire is the timer callback. It re-checks state under the lock and speaks
+// outside it.
 func (fm *FillerManager) fire(runID string, expectedRun *fillerRun, generation uint64) {
 	fm.mu.Lock()
 	run, ok := fm.runs[runID]
-	if !ok || run != expectedRun || run.generation != generation || run.ended || run.suspended || run.timer == nil {
-		// Cancel raced ahead between AfterFunc firing and this callback.
+	if fm.Superseded(runID) || !ok || run != expectedRun || run.generation != generation || run.ended || run.suspended || run.timer == nil {
 		fm.mu.Unlock()
 		return
 	}
-	filler := pickFiller(run.fired, run.lastSpoken, run.lastToolName)
+	// Temporarily pause continuation audio; retain the timer lifecycle and playback code.
+	const continuationFillerPaused = true
+	if continuationFillerPaused {
+		run.timer = nil
+		fm.mu.Unlock()
+		return
+	}
+	filler := pickFiller(run.fired, run.lastSpoken)
 	if filler == "" {
-		// Both pools empty after live edit. Bail without playing.
 		run.timer = nil
 		fm.mu.Unlock()
 		slog.Warn("filler fire bail — both pools empty", "component", "sensing", "run_id", runID, "tool", run.lastToolName)
@@ -745,22 +736,14 @@ func (fm *FillerManager) fire(runID string, expectedRun *fillerRun, generation u
 	run.playing = true
 	toolName := run.lastToolName
 	fired := run.fired
-	// Count playback when it starts so suspension cannot reset the turn cap.
 	run.fired++
 	fm.mu.Unlock()
 
-	// Show whether the picked filler came from a tool-specific pool (matches
-	// what the agent is doing right now) or fell back to the generic
-	// Continuation pool (tool name unmapped). Speeds up "I didn't hear a
-	// filler for web_search" debugging — grep run_id, see pool=tool vs
-	// pool=continuation vs pool=opening at fire time.
 	fm.mu.Lock()
 	owner := fillerOwner(fm.interactions[runID], runID)
 	fm.mu.Unlock()
 	pool := classifyFillerPool(filler, toolName, fired, i18n.Lang())
 	slog.Info("dead air filler firing", "component", "sensing", "run_id", runID, "filler", filler, "tool", toolName, "fired", fired, "pool", pool)
-	// Pass the run id so HAL can attribute the played filler to the turn it
-	// was armed for (voice metrics attribution; no behaviour change).
 	if err := hal.SpeakCachedInterruptibleForTurn(filler, owner); err != nil {
 		slog.Warn("dead air filler failed", "component", "sensing", "run_id", runID, "error", err)
 	}

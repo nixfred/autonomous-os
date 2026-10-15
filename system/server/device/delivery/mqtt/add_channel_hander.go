@@ -16,10 +16,8 @@ import (
 // Each char is two vertical QR pixels: '█'=both '▀'=top '▄'=bottom ' '=neither.
 const pairingQRFormat = "unicode_blocks_2x1"
 
-// addChannelTimeout caps the whole add_channel call (incl. streaming pairing).
-// Budget: ~90s plugin install + 90s QR-scan window + 5min Baileys post-pair
-// sync + slack. Set above the sum of those caps so a slow but successful
-// flow can't be cut short.
+// addChannelTimeout caps the whole add_channel call (incl. streaming
+// pairing).
 const addChannelTimeout = 10 * time.Minute
 
 func (h *DeviceMQTTHandler) publishAddChannelResult(channel, status, errMsg string, evt *domain.PairingEvent) error {
@@ -40,13 +38,62 @@ func (h *DeviceMQTTHandler) publishAddChannelResult(channel, status, errMsg stri
 	return h.publish(resp)
 }
 
+// handleAddChannel handles the legacy top-level cmd:"add_channel" message
+// (config carried inline on MQTT).
 func (h *DeviceMQTTHandler) handleAddChannel(cmd domain.MQTTMessage) error {
 	var req domain.MQTTAddChannelCommand
 	if err := json.Unmarshal(cmd.Raw(), &req); err != nil {
 		slog.Error("add_channel: invalid payload", "component", "mqtt", "error", err)
 		return h.publishAddChannelResult(req.Channel, "failure", "invalid JSON payload", nil)
 	}
+	return h.processAddChannel(req)
+}
 
+// handleAddChannelData handles the cmd:"data" kind:"add_channel" form (inline
+// or privacy-fetched env.Data).
+func (h *DeviceMQTTHandler) handleAddChannelData(env domain.MQTTDataCommand) error {
+	// Metadata only — env.Data carries channel credentials (bot tokens,
+	// BlueBubbles password) so raw bytes must never hit journalctl.
+	slog.Info("add_channel data envelope received",
+		"component", "mqtt",
+		"kind", env.Kind,
+		"type", env.Type,
+		"channel_hint", env.Channel,
+		"data_len", len(env.Data),
+	)
+	var req domain.MQTTAddChannelCommand
+	if len(env.Data) > 0 {
+		if err := json.Unmarshal(env.Data, &req); err != nil {
+			slog.Error("add_channel (data): invalid payload", "component", "mqtt", "error", err)
+			return h.publishAddChannelResult(req.Channel, "failure", "invalid JSON payload", nil)
+		}
+		if len(req.Config) == 0 {
+			var alt struct {
+				Data map[string]interface{} `json:"data"`
+			}
+			if err := json.Unmarshal(env.Data, &alt); err == nil && len(alt.Data) > 0 {
+				req.Config = alt.Data
+			}
+		}
+	}
+	// Keys only, never values. Enough to spot a rename ("server_url" vs
+	// "bluebubbles_server_url") without leaking the credential itself.
+	cfgKeys := make([]string, 0, len(req.Config))
+	for k := range req.Config {
+		cfgKeys = append(cfgKeys, k)
+	}
+	slog.Info("add_channel data parsed",
+		"component", "mqtt",
+		"channel", req.Channel,
+		"config_keys", cfgKeys,
+	)
+	return h.processAddChannel(req)
+}
+
+// processAddChannel is the shared add-channel logic for both the legacy
+// cmd:"add_channel" form and the cmd:"data" kind:"add_channel" form (inline
+// or privacy-fetched).
+func (h *DeviceMQTTHandler) processAddChannel(req domain.MQTTAddChannelCommand) error {
 	channelReq := req.ToRequest()
 	if err := validator.New().Struct(channelReq); err != nil {
 		return h.publishAddChannelResult(req.Channel, "failure", err.Error(), nil)
@@ -60,8 +107,6 @@ func (h *DeviceMQTTHandler) handleAddChannel(cmd domain.MQTTMessage) error {
 
 	events, err := h.deviceService.AddChannel(ctx, channelReq)
 	if err != nil {
-		// Map the shared sentinel to a stable code so the backend can branch
-		// without parsing free-form text (mirrors channel.refresh_config).
 		errMsg := err.Error()
 		if errors.Is(err, device.ErrChannelNotSupported) {
 			errMsg = "channel_not_supported"
@@ -77,12 +122,10 @@ func (h *DeviceMQTTHandler) handleAddChannel(cmd domain.MQTTMessage) error {
 		return h.publishAddChannelResult(req.Channel, "success", "", nil)
 	}
 
-	// WhatsApp streams pairing events. Publish one fd_channel message per event.
 	for evt := range events {
 		status := string(evt.Status)
 		if pubErr := h.publishAddChannelResult(req.Channel, status, evt.Error, &evt); pubErr != nil {
 			slog.Error("add_channel: publish event failed", "component", "mqtt", "status", status, "error", pubErr)
-			// Keep draining so the goroutine in PairWhatsapp can exit cleanly.
 		}
 		h.alertPairingTerminal("add_channel "+req.Channel, evt)
 	}

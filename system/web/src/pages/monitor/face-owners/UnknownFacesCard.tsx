@@ -1,28 +1,48 @@
 import type { CSSProperties } from "react";
 import { ScanFace, UserX } from "lucide-react";
-import { CardLabel } from "../components";
 import { EmptyState } from "./EmptyState";
 import { fmtIsoAgo } from "./format";
 import { FAMILIAR_VISIT_THRESHOLD } from "./types";
 import type { FaceStrangerStat } from "./types";
 
-// Unknown Faces — visit stats per stranger_id. Read-only card; all data is
-// passed in from already-fetched state.
+// Unknown Faces: visit stats per stranger_id.
 export function UnknownFacesCard({
-  faceStrangers, faceStrangersError, monCard, cardHeader,
+  faceStrangers, faceStrangersError, forgetting, onForget, monCard, cardHeader,
 }: {
   faceStrangers: FaceStrangerStat[] | null;
   faceStrangersError: boolean;
+  /** Stranger id (or "all") being deleted right now. */
+  forgetting: string | null;
+  /** Ask to delete one stranger, or "all". */
+  onForget: (target: string) => void;
   monCard: CSSProperties;
   cardHeader: CSSProperties;
 }) {
+  const deleteButton: CSSProperties = {
+    fontSize: 12, color: "var(--lm-red)", fontWeight: 600, flexShrink: 0, padding: "0 4px",
+  };
   return (
     <div className="lm-mon-card" style={monCard}>
       <div style={cardHeader}>
-        <CardLabel icon={<ScanFace size={13} />} text="Unknown Faces" />
-        <span style={{ fontSize: 10, color: "var(--lm-text-muted)" }}>
+        <h2 className="lm-users-card-title"><ScanFace size={17} aria-hidden />Unknown faces</h2>
+        <span style={{ display: "flex", alignItems: "center", gap: 10, fontSize: 12, color: "var(--lm-text-muted)" }}>
           {faceStrangers ? `${faceStrangers.length} stranger${faceStrangers.length !== 1 ? "s" : ""}` : ""}
+          {faceStrangers && faceStrangers.length > 0 && (
+            <button
+              className="lm-users-delete"
+              disabled={forgetting !== null}
+              onClick={() => onForget("all")}
+              title="Delete every unknown face"
+              style={{ ...deleteButton, cursor: forgetting ? "wait" : "pointer", opacity: forgetting ? 0.5 : 0.8 }}
+            >
+              {forgetting === "all" ? "Clearing…" : "Clear all"}
+            </button>
+          )}
         </span>
+      </div>
+      <div style={{ fontSize: 12, color: "var(--lm-text-muted)", marginBottom: 8 }}>
+        Face data of people the lamp does not know, kept on the device to count visits.
+        Deleted automatically after 30 days without a visit.
       </div>
 
       {faceStrangersError && (
@@ -34,9 +54,7 @@ export function UnknownFacesCard({
       )}
 
       {!faceStrangersError && faceStrangers && faceStrangers.length > 0 && (
-        // Local scroll — list can grow unbounded as new strangers are tracked,
-        // and the surrounding 3-col row should stay aligned with sibling cards.
-        <div style={{ display: "flex", flexDirection: "column", gap: 8, maxHeight: 320, overflowY: "auto" }} className="lm-hide-scroll lm-scroll-fade">
+        <div style={{ display: "flex", flexDirection: "column", gap: 8, maxHeight: 320, overflowY: "auto" }} className="lm-users-list">
           {faceStrangers.map((s) => {
             const familiar = s.count >= FAMILIAR_VISIT_THRESHOLD;
             const accent = familiar ? "var(--lm-amber)" : "var(--lm-red)";
@@ -54,12 +72,12 @@ export function UnknownFacesCard({
                       fontSize: 12,
                       fontWeight: 700,
                       color: accent,
-                      fontFamily: "monospace",
+                      fontFamily: "monospace", overflowWrap: "anywhere",
                     }}>
                       {s.stranger_id}
                     </span>
                     <span style={{
-                      fontSize: 10,
+                      fontSize: 12,
                       padding: "1px 6px",
                       borderRadius: 4,
                       background: accentBg,
@@ -73,7 +91,7 @@ export function UnknownFacesCard({
                         className="lm-pulse"
                         title={`Visit count ≥ ${FAMILIAR_VISIT_THRESHOLD} (familiar threshold). The device fires the enroll prompt only on the 1→${FAMILIAR_VISIT_THRESHOLD} transition — strangers whose count was already past the threshold before the trigger code was deployed will NOT have been prompted.`}
                         style={{
-                          fontSize: 10,
+                          fontSize: 12,
                           padding: "1px 6px",
                           borderRadius: 4,
                           background: "var(--lm-amber-dim)",
@@ -86,11 +104,21 @@ export function UnknownFacesCard({
                       </span>
                     )}
                   </div>
-                  <span style={{ fontSize: 10, color: "var(--lm-text-muted)" }}>
+                  <span style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12, color: "var(--lm-text-muted)" }}>
                     last {s.last_seen ? fmtIsoAgo(s.last_seen) : "?"}
+                    <button
+                      className="lm-users-delete"
+                      disabled={forgetting !== null}
+                      aria-label={`Delete ${s.stranger_id}`}
+                      title={`Delete ${s.stranger_id}`}
+                      onClick={() => onForget(s.stranger_id)}
+                      style={{ ...deleteButton, cursor: forgetting ? "wait" : "pointer", opacity: forgetting === s.stranger_id ? 0.5 : 0.7 }}
+                    >
+                      {forgetting === s.stranger_id ? "…" : "✕"}
+                    </button>
                   </span>
                 </div>
-                <div style={{ fontSize: 10, color: "var(--lm-text-muted)" }}>
+                <div style={{ fontSize: 12, color: "var(--lm-text-muted)" }}>
                   first seen {s.first_seen ? fmtIsoAgo(s.first_seen) : "?"}
                 </div>
               </div>

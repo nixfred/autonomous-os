@@ -71,11 +71,7 @@ def _owner(monkeypatch, default_latency=0.0435):
 
 
 def test_playback_survives_a_short_writer_scheduling_stall(monkeypatch, caplog):
-    """A 70ms scheduling/AEC stall emptied the observed 43.5ms device buffer.
-
-    This models buffer consumption, not OS scheduling or acoustic quality.
-    No PCM is dropped, repeated or modified to conceal the simulated gap.
-    """
+    """A 70ms scheduling/AEC stall emptied the observed 43.5ms device buffer."""
     audio = np.arange(44100, dtype=np.float32).reshape(-1, 1)
     results = []
     for requested in (0.0, 0.120):
@@ -123,7 +119,6 @@ def test_underflow_flags_accumulate_and_logs_are_rate_limited(monkeypatch, caplo
     sinks[0].write = lambda data: next(flags)
     monkeypatch.setattr(module.aec, "reference_write", lambda data, rate: None)
     frame = np.zeros((1764, 1), dtype=np.float32)
-    # Onset after idle isn't a mid-utterance underrun.
     assert stream.write(frame) is True
     assert "during playback" not in caplog.text
     assert stream.write(np.concatenate([frame, frame, frame])) is True
@@ -162,6 +157,18 @@ def test_cold_reference_setup_happens_before_the_first_speaker_sample(monkeypatc
     assert preparations == [44100]
     assert sinks[0].xruns == 0
     assert owner._write_started_ts is None
+
+
+def test_output_open_prepares_reference_without_playback(monkeypatch):
+    owner, _, sinks = _owner(monkeypatch)
+    rates = []
+    monkeypatch.setattr(module.aec, "prepare_playback", rates.append)
+    first = owner._ensure_stream(44100)
+    assert rates == [44100]
+    assert not sinks[0].writes
+    assert owner._audio_written_fired is False
+    assert owner._ensure_stream(44100) is first
+    assert rates == [44100]
 
 
 def test_stop_during_cold_setup_never_starts_cancelled_speech(monkeypatch):

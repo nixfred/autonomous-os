@@ -5,23 +5,6 @@ import { C } from "@/components/setup/shared";
 import { getConnector, setConnectorPAT, removeConnector } from "@/lib/api";
 import type { ConnectorInfo } from "@/lib/api";
 
-// FacebookSection — the on-device settings surface for the Facebook Fan Page
-// posting skill. Layout mirrors the ecm-website admin PAT connector modal
-// (see connectorAuthRegistry's PatConnectModal): a compact "Connect Facebook
-// Fan Page" card with the mandatory-prerequisites callout, a numbered
-// how-to-get-the-token walkthrough, the two inputs (Page ID + Page Access
-// Token), a bottom safety note, and a right-aligned Cancel/Connect pair.
-//
-// Storage: NOT config.json. This writes through the same connectorWriter the
-// MQTT connector.set.<code> dispatcher uses, via POST
-// /api/device/connectors/pat → <OpenclawConfigDir>/workspace/configs/
-// facebook_access_tokens.json. That is the exact file the skill reads and
-// the same file the ecm-website admin's connector flow would write when it
-// ships — no drift between local paste and remote push.
-//
-// This section renders its own Cancel/Connect footer (SectionCard-scoped, not
-// modal-shaped) so SettingsPanel excludes "facebook" from the shared Save
-// button chrome. Cancel resets the local form; Connect submits.
 const CONNECTOR_CODE = "facebook";
 
 export function FacebookSection({ active }: { active: boolean }) {
@@ -32,9 +15,6 @@ export function FacebookSection({ active }: { active: boolean }) {
   const [pageId, setPageId] = useState("");
   const [pageAccessToken, setPageAccessToken] = useState("");
   const [showToken, setShowToken] = useState(false);
-  // Guide starts collapsed to keep the form short. Persist the choice per-
-  // browser so an operator who wants it open doesn't have to re-expand on
-  // every visit; fall back to false on any storage error (private windows).
   const [guideOpen, setGuideOpen] = useState<boolean>(() => {
     try { return localStorage.getItem("fb-guide-open") === "1"; } catch { return false; }
   });
@@ -54,9 +34,7 @@ export function FacebookSection({ active }: { active: boolean }) {
         setConnectedAt(r.obtained_at ?? 0);
       })
       .catch(() => {
-        // A device that has never had this connector set answers with
-        // connected:false; a hard error only fires on 500. Silent on 500 is
-        // fine — the UI shows the empty form and the operator can try again.
+        // A never-set connector returns connected:false; stay silent on 500.
       })
       .finally(() => setLoading(false));
   };
@@ -69,11 +47,7 @@ export function FacebookSection({ active }: { active: boolean }) {
     setShowToken(false);
   };
 
-  // Explicit click handler, not a form submit. FacebookSection is rendered
-  // inside SettingsPanel's shared <form id="edit-form"> and HTML forbids
-  // nested forms — a browser flattens them, so an inner form's submit event
-  // never fires and our POST never leaves the page. Using onClick sidesteps
-  // that entirely; the Enter-key affordance is handled by onKeyDown below.
+  // Click handler, not a form submit: this renders inside SettingsPanel's form, and nested forms never submit.
   const onSubmit = async (e: React.MouseEvent | React.KeyboardEvent) => {
     e.preventDefault();
     setError(null);
@@ -124,9 +98,6 @@ export function FacebookSection({ active }: { active: boolean }) {
     }
   };
 
-  // Bypass SectionCard: this section renders a modal-style card whose own
-  // header replaces SectionCard's title chip, so we mount/unmount inline and
-  // keep the display:none idiom the other sections use.
   return (
     <div
       id="section-facebook"
@@ -138,14 +109,10 @@ export function FacebookSection({ active }: { active: boolean }) {
       }}
     >
       {loading ? (
-        <div style={{ fontSize: 12, color: C.textMuted }}>Loading…</div>
+        <div style={{ fontSize: 12, color: C.textDim }}>Loading…</div>
       ) : (
         <div
           onKeyDown={(e) => {
-            // Preserve the Enter-to-submit affordance without a real <form>.
-            // Only fires when the token/page-id inputs are focused; ignores
-            // Enter inside anything else (e.g. no textarea here today, but
-            // keeps behaviour narrow if one is added later).
             const target = e.target as HTMLElement;
             if (e.key === "Enter" && target.tagName === "INPUT") {
               if (!submitting && pageId && pageAccessToken) onSubmit(e);
@@ -171,13 +138,7 @@ export function FacebookSection({ active }: { active: boolean }) {
             spellCheck={false}
             style={{ ...inputStyle, marginBottom: 6, fontFamily: "monospace" }}
           />
-          {/* One-line hint under the Page ID input — a link that expands the
-              walkthrough below so the how-to lives in exactly ONE place. The
-              hint used to inline the full "Page Transparency" instructions
-              which duplicated step 6 of the guide and made the form scroll.
-              openGuide → expand + scroll into view so people who click the
-              link actually see the section they were pointed at. */}
-          <div style={{ fontSize: 11, color: C.textMuted, marginBottom: 14, lineHeight: 1.5 }}>
+          <div style={{ fontSize: 12, color: C.textDim, marginBottom: 14, lineHeight: 1.5 }}>
             Don't know your Page ID?{" "}
             <button
               type="button"
@@ -201,13 +162,13 @@ export function FacebookSection({ active }: { active: boolean }) {
 
           <div style={{ display: "flex", alignItems: "flex-end", justifyContent: "space-between", marginBottom: 5 }}>
             <FieldLabel htmlFor="fb_page_token">Page Access Token</FieldLabel>
-            <div style={{ fontSize: 11, color: C.textMuted, display: "flex", alignItems: "center", gap: 8 }}>
+            <div style={{ fontSize: 12, color: C.textDim, display: "flex", alignItems: "center", gap: 8 }}>
               <TokenCounter length={pageAccessToken.length} />
               <button
                 type="button"
                 onClick={() => setShowToken((v) => !v)}
                 aria-label={showToken ? "Hide" : "Show"}
-                style={{ background: "none", border: "none", padding: 0, color: C.textMuted, cursor: "pointer", display: "flex", alignItems: "center" }}
+                style={{ background: "none", border: "none", padding: 0, color: C.textDim, cursor: "pointer", display: "flex", alignItems: "center" }}
               >
                 {showToken ? <EyeOff size={14} /> : <Eye size={14} />}
               </button>
@@ -226,30 +187,23 @@ export function FacebookSection({ active }: { active: boolean }) {
 
           <div style={{
             display: "flex", alignItems: "center", gap: 6,
-            fontSize: 11, color: C.amber, marginBottom: 16,
+            fontSize: 12, color: C.amber, marginBottom: 16,
           }}>
             <Lock size={11} /> Stored on your robot only. Never uploaded to our servers.
           </div>
 
-          {/* Collapsible walkthrough — placed BELOW the form fields (after the
-              Privacy line) so an operator who already has the token in hand
-              sees the form first without scrolling past a wall of steps. Header
-              row is always visible so people who need the walkthrough know
-              where to click. Expanded state persisted in localStorage — see
-              guideOpen. The `id` is a scroll target for the Page-ID hint link
-              above so a click on "See how to find it" jumps here. */}
           <div id="fb-guide-anchor" style={{
             background: C.bg, border: `1px solid ${C.border}`, borderRadius: 10,
             padding: "10px 14px", marginBottom: 12,
           }}>
-            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8 }}>
+            <div style={{ display: "flex", flexWrap: "wrap", alignItems: "center", justifyContent: "space-between", gap: 8 }}>
               <button
                 type="button"
                 onClick={() => setGuideOpen((v) => !v)}
                 style={{
                   background: "none", border: "none", padding: 0, cursor: "pointer",
-                  display: "inline-flex", alignItems: "center", gap: 6,
-                  color: C.textDim, fontSize: 10.5, fontWeight: 700, letterSpacing: "0.05em",
+                  display: "inline-flex", flexWrap: "wrap", alignItems: "center", gap: 6,
+                  color: C.textDim, fontSize: 12, fontWeight: 700, letterSpacing: "0.05em",
                 }}
                 aria-expanded={guideOpen}
               >
@@ -260,13 +214,13 @@ export function FacebookSection({ active }: { active: boolean }) {
                 href="https://developers.facebook.com/tools/explorer/"
                 target="_blank"
                 rel="noreferrer"
-                style={{ color: C.amber, fontSize: 11.5, display: "inline-flex", alignItems: "center", gap: 4, textDecoration: "none" }}
+                style={{ color: C.amber, fontSize: 12.5, display: "inline-flex", alignItems: "center", gap: 4, textDecoration: "none" }}
               >
                 Open Graph Explorer <ExternalLink size={11} />
               </a>
             </div>
             {guideOpen && (
-              <div style={{ marginTop: 12, fontSize: 11.5, color: C.textDim, lineHeight: 1.6 }}>
+              <div style={{ marginTop: 12, fontSize: 12.5, color: C.textDim, lineHeight: 1.6 }}>
                 <Step n={1}>
                   Open the <b>Graph API Explorer</b> and sign in with the Facebook
                   account that manages the Page.
@@ -280,13 +234,13 @@ export function FacebookSection({ active }: { active: boolean }) {
                   <b>Generate Access Token</b>:
                   <div style={{
                     background: C.surface, border: `1px solid ${C.border}`, borderRadius: 6,
-                    padding: "6px 8px", marginTop: 5, fontFamily: "monospace", fontSize: 10.5,
+                    padding: "6px 8px", marginTop: 5, fontFamily: "monospace", fontSize: 12,
                     color: C.text, lineHeight: 1.55, wordBreak: "break-word",
                   }}>
                     pages_show_list, pages_manage_posts, pages_read_engagement,<br />
                     pages_read_user_content, pages_manage_engagement, read_insights
                   </div>
-                  <div style={{ marginTop: 4, color: C.textMuted, fontSize: 10.5 }}>
+                  <div style={{ marginTop: 4, color: C.textDim, fontSize: 12 }}>
                     First 3 = post to Page. Last 3 = read + reply to comments +
                     analytics. Fewer is fine if the skill's auto-comment / insights
                     features are disabled.
@@ -294,7 +248,7 @@ export function FacebookSection({ active }: { active: boolean }) {
                 </Step>
                 <Step n={4}>
                   <b style={{ color: C.amber }}>Extend the token to ~60 days</b>{" "}
-                  <span style={{ color: C.textMuted }}>(strongly recommended for
+                  <span style={{ color: C.textDim }}>(strongly recommended for
                   schedules / cron — the raw token from step 3 expires in ~1 hour)</span>.
                   Open the{" "}
                   <a
@@ -309,7 +263,7 @@ export function FacebookSection({ active }: { active: boolean }) {
                   and click <b>Extend Access Token</b> (Facebook reauth prompt may
                   appear). Copy the <b>new</b> token that shows below "Your new
                   extended access token".
-                  <div style={{ marginTop: 4, color: C.textMuted, fontSize: 10.5 }}>
+                  <div style={{ marginTop: 4, color: C.textDim, fontSize: 12 }}>
                     Paste this extended token <b>back</b> into the "Access Token"
                     box in Graph API Explorer, replacing the short-lived one, before
                     continuing to step 5. The Page Access Token derived from this
@@ -324,13 +278,13 @@ export function FacebookSection({ active }: { active: boolean }) {
                   wrong most often.</b> In the <b>User or Page</b> dropdown
                   (right panel, under Meta App — labelled "Người dùng hoặc Trang"
                   in Vietnamese), change <b>User Token</b> → pick your Page's
-                  name (e.g. "Trâm Anh"). The <b>Access Token</b> box on top{" "}
+                  name (e.g. "Elvis"). The <b>Access Token</b> box on top{" "}
                   <b style={{ color: C.amber }}>auto-switches</b> to the Page
                   Access Token — copy <b>that</b> one. The token shown while the
                   dropdown still says "User Token" is a <b>User Access Token</b>
                   {" "}and Meta refuses it on Page posts (error #200) — same
                   scopes, wrong owner.
-                  <div style={{ marginTop: 4, color: C.textMuted, fontSize: 10.5 }}>
+                  <div style={{ marginTop: 4, color: C.textDim, fontSize: 12 }}>
                     <b style={{ color: C.text }}>Verify before pasting:</b>{" "}
                     drop the token into the{" "}
                     <a
@@ -345,7 +299,7 @@ export function FacebookSection({ active }: { active: boolean }) {
                     <b style={{ color: C.amber }}>PAGE</b> (not USER). If it says
                     USER, redo this step.
                   </div>
-                  <div style={{ marginTop: 4, color: C.textMuted, fontSize: 10.5 }}>
+                  <div style={{ marginTop: 4, color: C.textDim, fontSize: 12 }}>
                     Only Pages you've authorized this app for appear in the
                     dropdown. Missing a Page? Go to{" "}
                     <a
@@ -384,13 +338,13 @@ export function FacebookSection({ active }: { active: boolean }) {
           {error && (
             <div style={{
               background: "var(--lm-red-dim)", border: "1px solid var(--lm-red-glow)",
-              borderRadius: 8, padding: "8px 12px", fontSize: 11.5, color: C.red, marginBottom: 14,
+              borderRadius: 8, padding: "8px 12px", fontSize: 12.5, color: C.red, marginBottom: 14,
             }}>
               {error}
             </div>
           )}
 
-          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 10 }}>
+          <div style={{ display: "flex", flexWrap: "wrap", justifyContent: "space-between", alignItems: "center", gap: 10 }}>
             {connected ? (
               <button
                 type="button"
@@ -409,7 +363,7 @@ export function FacebookSection({ active }: { active: boolean }) {
               </button>
             ) : <span />}
 
-            <div style={{ display: "flex", gap: 10 }}>
+            <div style={{ display: "flex", flexWrap: "wrap", gap: 10 }}>
               <button
                 type="button"
                 onClick={reset}
@@ -448,11 +402,7 @@ export function FacebookSection({ active }: { active: boolean }) {
   );
 }
 
-// ── Sub-components ──────────────────────────────────────────────────────────
-
-// ModalHeader — logo + title + description row. Named "Modal" because it
-// visually anchors the card like the modal header of the ecm-website's PAT
-// connector, even though this renders in-page (not a real dialog).
+// Logo + title + description row.
 function ModalHeader({
   connected,
   connectedAt,
@@ -480,11 +430,11 @@ function ModalHeader({
           Add a Page Access Token so the robot can post to your Facebook Page.
         </div>
         {connected && (
-          <div style={{ marginTop: 8, fontSize: 11, color: C.green, display: "inline-flex", alignItems: "center", gap: 6 }}>
+          <div style={{ marginTop: 8, fontSize: 12, color: C.green, display: "inline-flex", flexWrap: "wrap", alignItems: "center", gap: 6 }}>
             ✓ connected
-            {connectedPageId && <span style={{ color: C.textMuted }}>· Page {connectedPageId}</span>}
+            {connectedPageId && <span style={{ color: C.textDim }}>· Page {connectedPageId}</span>}
             {connectedAt > 0 && (
-              <span style={{ color: C.textMuted }}>
+              <span style={{ color: C.textDim }}>
                 · {new Date(connectedAt * 1000).toLocaleDateString()}
               </span>
             )}
@@ -514,13 +464,13 @@ function InfoCard({
   return (
     <div style={{
       background: bg, border: `1px solid ${border}`, borderRadius: 10,
-      padding: "12px 14px", marginBottom: 14, fontSize: 11.5, color: C.textDim, lineHeight: 1.6,
+      padding: "12px 14px", marginBottom: 14, fontSize: 12.5, color: C.textDim, lineHeight: 1.6,
     }}>
       {(title || titleRight || icon) && (
-        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8, marginBottom: title ? 8 : 0 }}>
+        <div style={{ display: "flex", flexWrap: "wrap", alignItems: "center", justifyContent: "space-between", gap: 8, marginBottom: title ? 8 : 0 }}>
           <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
             {icon}
-            {title && <div style={{ fontSize: 10.5, fontWeight: 700, letterSpacing: "0.05em", color: titleColor }}>{title}</div>}
+            {title && <div style={{ fontSize: 12, fontWeight: 700, letterSpacing: "0.05em", color: titleColor }}>{title}</div>}
           </div>
           {titleRight}
         </div>
@@ -538,17 +488,14 @@ function Step({ n, last, children }: { n: number; last?: boolean; children: Reac
         width: 18, height: 18, borderRadius: 9,
         background: C.amberDim, color: C.amber,
         display: "flex", alignItems: "center", justifyContent: "center",
-        fontSize: 10.5, fontWeight: 700,
+        fontSize: 12, fontWeight: 700,
       }}>{n}</div>
-      <div style={{ fontSize: 11.5, color: C.textDim, lineHeight: 1.6, minWidth: 0 }}>{children}</div>
+      <div style={{ fontSize: 12.5, color: C.textDim, lineHeight: 1.6, minWidth: 0 }}>{children}</div>
     </div>
   );
 }
 
-// TokenCounter reproduces the "✓ 16/16" affordance from the Gmail modal —
-// a green check when the token looks long enough to be a real Page Access
-// Token, plus the character count. Threshold is intentionally loose
-// (>=40 chars) because Meta's tokens are variable-length.
+// Check mark + character count once the token looks long enough (>= 40 chars).
 function TokenCounter({ length }: { length: number }) {
   if (length === 0) return null;
   const ok = length >= 40;
@@ -562,7 +509,7 @@ function TokenCounter({ length }: { length: number }) {
 
 function FieldLabel({ htmlFor, children }: { htmlFor: string; children: React.ReactNode }) {
   return (
-    <label htmlFor={htmlFor} style={{ display: "block", fontSize: 11.5, fontWeight: 600, color: C.text, marginBottom: 5 }}>
+    <label htmlFor={htmlFor} style={{ display: "block", fontSize: 12.5, fontWeight: 600, color: C.text, marginBottom: 5 }}>
       {children}
     </label>
   );

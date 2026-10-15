@@ -6,9 +6,7 @@ import (
 	"go.autonomous.ai/os/system/intent/jev"
 )
 
-// matchCanonical executes only a complete, unqualified command locally. Legacy
-// substring matching remains available to Match, but contextual user requests
-// must reach semantic classification before any hardware side effect.
+// matchCanonical executes only a complete, unqualified command locally.
 func matchCanonical(text string) *Result {
 	text = canonicalVoiceText(text)
 	text = strings.Join(strings.Fields(strings.TrimRight(normalize(text), ".!?")), " ")
@@ -19,7 +17,6 @@ func matchCanonical(text string) *Result {
 	}
 	text = strings.TrimPrefix(text, "please ")
 	text = strings.TrimSuffix(text, " please")
-	// Resolve only complete aliases, never replace words inside qualified requests.
 	switch text {
 	case "turn off the lights", "lights off":
 		text = "turn off the light"
@@ -35,12 +32,12 @@ func matchCanonical(text string) *Result {
 func canonicalCommand(text string) bool {
 	switch text {
 	case "turn on the light", "light on", "turn off the light", "light off",
-		"dim the light", "dimmer", "dim light", "volume up", "louder", "volume down", "quieter",
+		"dim the light", "dimmer", "dim light", "brighten the light", "brighten light", "volume up", "louder", "volume down", "quieter",
 		"mute speaker", "mute the speaker", "unmute speaker", "unmute the speaker",
 		"stop music", "stop the music", "music off", "stop playing", "stop talking", "ok stop",
 		"stop tracking", "stop following", "stop watching", "stop track",
 		"what time", "what time is it", "whats the time", "what's the time",
-		"goodnight", "good night", "brighter", "energize", "max brightness":
+		"goodnight", "good night", "brighter", "energize":
 		return true
 	}
 	for _, scene := range sceneNames {
@@ -83,7 +80,7 @@ func canonicalCommand(text string) bool {
 	return false
 }
 
-// Keep deterministic and semantic execution on the same transport parser.
+// canonicalVoiceText normalizes transport text for deterministic and semantic matching.
 func canonicalVoiceText(text string) string {
 	return jev.NormalizeText(text)
 }

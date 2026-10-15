@@ -4,13 +4,11 @@ import { X, Timer } from "lucide-react";
 import type { DisplayEvent } from "../types";
 import type { FlowStage, ActiveFlowStage } from "./types";
 import { FLOW_NODES } from "./types";
+import { withApiToken } from "@/lib/api";
 import { useTheme } from "@/lib/useTheme";
 import { cameraSnapshotURLs, extractNodeInfo, aggregateEvents } from "./helpers";
 
 // Hidden-textarea clipboard fallback for non-secure origins (http://Pi.local).
-// navigator.clipboard.writeText only works in secure contexts; without this,
-// the pipeline copy button silently no-ops when the monitor is opened over
-// plain HTTP from the device.
 function fallbackCopy(text: string): void {
   const ta = document.createElement("textarea");
   ta.value = text;
@@ -53,7 +51,8 @@ export function FlowDiagram({
   const [lightboxUrl, setLightboxUrl] = useState<string | null>(null);
   const [isPhoneLayout, setIsPhoneLayout] = useState(false);
   const [mobileDetailsOpen, setMobileDetailsOpen] = useState(false);
-  const [, , themeClass] = useTheme();
+  const [theme, , themeClass] = useTheme();
+  const isLight = theme === "light";
 
   const [zoom, setZoom] = useState(1);
   const [pan, setPan] = useState({ x: 0, y: 0 });
@@ -68,9 +67,6 @@ export function FlowDiagram({
 
   useEffect(() => { panRef.current = pan; }, [pan]);
 
-  // Keep verbose event payloads out of the fixed-coordinate SVG on phones.
-  // They instead render in a native HTML sheet below, where long curl/tool
-  // arguments can wrap and scroll at the device's actual width.
   useEffect(() => {
     const media = window.matchMedia("(max-width: 768px)");
     const update = () => setIsPhoneLayout(media.matches);
@@ -79,8 +75,7 @@ export function FlowDiagram({
     return () => media.removeEventListener("change", update);
   }, []);
 
-  // Use native wheel listener with { passive: false } so preventDefault actually works
-  // and stops scroll from bubbling to parent (Turns list).
+  // Native wheel listener with { passive: false } so preventDefault works.
   useEffect(() => {
     const el = svgRef.current;
     if (!el) return;
@@ -94,9 +89,6 @@ export function FlowDiagram({
     return () => el.removeEventListener("wheel", handler);
   }, []);
 
-  // Pointer events cover mouse and touch: one pointer pans, two pointers
-  // pinch-zoom. Native browser gestures are disabled on the SVG itself by
-  // touchAction below, letting both gestures coexist inside the chart.
   const handlePointerDown = useCallback((e: React.PointerEvent<SVGSVGElement>) => {
     if (e.pointerType === "mouse" && e.button !== 0) return;
     e.preventDefault();
@@ -146,9 +138,6 @@ export function FlowDiagram({
     setDragging(pointers.current.size > 0);
   }, []);
 
-  // Setters from useState are stable, so listing them keeps the callback
-  // identity unchanged across renders (same as the previous empty dep array)
-  // while matching the deps the React Compiler infers.
   const resetView = useCallback(() => {
     const initialPan = { x: 0, y: 0 };
     panRef.current = initialPan;
@@ -161,16 +150,9 @@ export function FlowDiagram({
   const vbX = (VW - vbW) / 2 - pan.x;
   const vbY = (VH - vbH) / 2 - pan.y;
 
-  // Event Pipeline rect — centered between agent_call (950,240) and
-  // agent_response (950,795). Shared between the rect rendering, the
-  // tool_exec edge anchoring (so HW edges latch to the rect boundary
-  // instead of a phantom point inside it), and the foreignObject row
-  // list. Update one place, all three follow.
+  // Event Pipeline rect, shared by rendering, edge anchoring and the row list.
   const PIPE = { x: 798, y: 330, w: 304, h: 376 };
-  // Returns the point on the pipeline rect boundary along the line from
-  // the rect center toward (extX, extY). Used to anchor edges that go
-  // to/from tool_exec — the conceptual "tool" anchor is the whole rect,
-  // not a circle, so each edge meets the rect at its closest edge.
+  // Returns the point on the pipeline rect boundary along the line from the rect center toward (extX, extY).
   const pipeAnchor = (extX: number, extY: number) => {
     const cx = PIPE.x + PIPE.w / 2;
     const cy = PIPE.y + PIPE.h / 2;
@@ -184,48 +166,27 @@ export function FlowDiagram({
   };
 
   const positions: Record<FlowStage, { x: number; y: number }> = {
-    // OS server — top row
     intent_check:      { x: 80, y: 50 },
     local_match:       { x: 200, y: 50 },
     os_gate:         { x: 467, y: 795 },
-    // Device — input row (MIC/CAM/BTN)
     mic_input:         { x: -40, y: 240 },
     cam_input:         { x: 80, y: 240 },
-    // Button / touch input — physical interaction (GPIO button, TTP223
-    // touchpad). Sits below mic so it doesn't crowd the input row and
-    // its edge to intent_check has a clear path up-right past mic.
     button_input:      { x: -40, y: 350 },
-    // Device — output column (stacked vertically, same x, gap=135)
     hw_camera:         { x: 200, y: 345 },
     hw_emotion:        { x: 200, y: 480 },
     hw_led:            { x: 200, y: 615 },
     hw_servo:          { x: 200, y: 750 },
     hw_audio:          { x: 200, y: 885 },
     tts_speak:         { x: 200, y: 1020 },
-    // OS-server-side log writes — stack BELOW the BCAST node (tg_alert at y=930)
-    // so HOOK / BCAST stay grouped at the top of the OS-server column and the
-    // three async-POST logs hang off the bottom in their own block.
-    // x=467 same column. Edges from os_gate use elbow routing
-    // (right → down → left) to avoid running through tg_alert.
     hw_mood:             { x: 467, y: 1065 },
     hw_wellbeing:        { x: 467, y: 1200 },
     hw_music_suggestion: { x: 467, y: 1335 },
     hw_posture:          { x: 467, y: 1470 },
-    // OpenClaw — agent core (cron lives in OpenClaw, fires agent_call).
-    // The 2 inner nodes (agent_thinking, tool_exec) are rendered as a
-    // single Event Pipeline rect between agent_call and agent_response —
-    // see <EventPipeline> below. Their FlowStage entries are kept
-    // (visited tracking, edges, info maps still reference them) but
-    // their node circles are not drawn. tool_exec is the visible edge
-    // anchor for HW outgoing edges; put it on the LEFT edge of the
-    // pipeline rect (closest to the hw_* column at x=200) so those 5
-    // edges stay visually short. agent_thinking is an inert anchor.
     schedule_trigger:  { x: 750, y: 240 },
     agent_call:        { x: 950, y: 240 },
     agent_thinking:    { x: 1180, y: 480 },
     tool_exec:         { x: 820, y: 600 },
     agent_response:    { x: 950, y: 795 },
-    // External channels — outside OpenClaw
     channel_input:     { x: 1300, y: 240 },
     webchat_input:     { x: 1300, y: 440 },
     tg_out:            { x: 1300, y: 795 },
@@ -245,10 +206,6 @@ export function FlowDiagram({
     ["channel_input",     "agent_call"],
     ["webchat_input",     "agent_call"],
     ["schedule_trigger",  "agent_call"],
-    // agent_call → pipeline → agent_response. The pipeline is a single
-    // visual rect (rendered below) containing aggregated event rows.
-    // tool_exec sits at the right edge of that rect so HW edges look like
-    // they originate from the pipeline.
     ["agent_call",        "tool_exec"],
     ["tool_exec",         "agent_response"],
     ["tool_exec",         "hw_led"],
@@ -296,14 +253,14 @@ export function FlowDiagram({
     const toVisited = visitedStages.has(to) || to === activeStage;
     if (fromVisited && toVisited) return nodeColor(to);
     if (fromVisited || toVisited) return "var(--lm-border-hi)";
-    return "var(--lm-border)";
+    return isLight ? "var(--lm-text-muted)" : "var(--lm-border)";
   }
   function edgeOpacity(from: FlowStage, to: FlowStage) {
     const fromVisited = visitedStages.has(from) || from === activeStage;
     const toVisited = visitedStages.has(to) || to === activeStage;
     if (fromVisited && toVisited) return 0.98;
     if (fromVisited || toVisited) return 0.8;
-    return 0.45;
+    return isLight ? 0.7 : 0.45;
   }
 
   const glowId = compact ? "flow-glow-c" : "flow-glow";
@@ -317,14 +274,12 @@ export function FlowDiagram({
     return lines.length > 0 ? [{ label: node.label, lines }] : [];
   });
 
-  // Extract snapshot URLs from agent_call lines (🖼 added by helpers.ts from sensing_input or chat_send).
   const sensingSnapshotUrls: string[] = (nodeInfo.agent_call ?? [])
     .filter((l) => l.startsWith("🖼"))
     .map((l) => l.match(/snapshot:\s*\/tmp\/(?:lamp|hal)-(?:sensing|emotion|motion)-snapshots\/((?:sensing|emotion|motion)_[^\s]+\.jpg)/)?.[1])
     .filter((f): f is string => !!f)
-    .map((f) => `/api/sensing/snapshot/${f}`);
+    .map((f) => withApiToken(`/api/sensing/snapshot/${f}`));
 
-  // Check if image was actually sent to agent (has_image in chat_send event)
   const imageSentToAgent: boolean = (nodeInfo.agent_call ?? []).some((l) => l.includes("📷 image attached"));
   const agentSnapshotUrls = cameraSnapshotURLs(turnEvents);
 
@@ -337,9 +292,8 @@ export function FlowDiagram({
         style={{
           display: "block", width: "100%", flex: 1, minHeight: 0,
           cursor: dragging ? "grabbing" : "grab", userSelect: "none",
-          // Prevent browser page gestures while the pointer is over the
-          // diagram; the component handles one-finger pan and two-finger zoom.
           touchAction: "none",
+          background: "var(--lm-surface)", borderRadius: 8,
         }}
         onPointerDown={handlePointerDown}
         onPointerMove={handlePointerMove}
@@ -359,7 +313,6 @@ export function FlowDiagram({
           </marker>
         </defs>
 
-        {/* Cluster group backgrounds */}
         <g>
           <rect x={-100} y={0} width={1500} height={110} rx={14}
             fill="var(--lm-teal)" fillOpacity={0.12} stroke="var(--lm-teal)" strokeWidth={2} opacity={0.6}
@@ -401,7 +354,6 @@ export function FlowDiagram({
           </text>
         </g>
 
-        {/* Edges */}
         {edges.map(([from, to]) => {
           const f = positions[from];
           const t = positions[to];
@@ -410,13 +362,11 @@ export function FlowDiagram({
           const op = edgeOpacity(from, to);
           const marker = `url(#arrow-${compact ? "c" : "f"})`;
 
-          // Elbow edges: LOCAL → output nodes (bypass intermediate nodes)
-          // Route: go right from LOCAL, then down, then left into target node
           if (from === "local_match" && (to === "hw_led" || to === "hw_servo" || to === "tts_speak" || to === "hw_emotion" || to === "hw_audio")) {
-            const elbowX = t.x - 80; // offset left of target
+            const elbowX = t.x - 80;
             const startY = f.y + nodeR;
             const endY = t.y;
-            const endX = t.x - nodeR - 4; // enter from left side
+            const endX = t.x - nodeR - 4;
             return (
               <path key={`${from}-${to}`}
                 d={`M ${f.x - nodeR * 0.7} ${f.y + nodeR * 0.7} L ${elbowX} ${startY + 20} L ${elbowX} ${endY} L ${endX} ${endY}`}
@@ -426,15 +376,11 @@ export function FlowDiagram({
             );
           }
 
-          // Elbow edges: os_gate → log nodes (hw_mood / hw_wellbeing /
-          // hw_music_suggestion) sitting BELOW tg_alert in the same column.
-          // Route right out of os_gate, down past tg_alert, then left back
-          // into the target so the line never overlaps tg_alert.
           if (from === "os_gate" && (to === "hw_mood" || to === "hw_wellbeing" || to === "hw_music_suggestion" || to === "hw_posture")) {
-            const elbowX = f.x + 90; // offset right of source/target column
+            const elbowX = f.x + 90;
             const startX = f.x + nodeR + 4;
             const startY = f.y;
-            const endX = t.x + nodeR + 4; // enter from right side
+            const endX = t.x + nodeR + 4;
             const endY = t.y;
             return (
               <path key={`${from}-${to}`}
@@ -446,7 +392,6 @@ export function FlowDiagram({
             );
           }
 
-          // Elbow L edge: tg_alert → tg_out (go right then up)
           if (from === "tg_alert" && to === "tg_out") {
             const startX = f.x + nodeR + 4;
             const startY = f.y;
@@ -464,14 +409,8 @@ export function FlowDiagram({
           }
 
           const isGateEdge = from === "os_gate" || to === "os_gate";
-          // HW marker path: agent_response fires inline markers — shown as dashed to distinguish from LLM tool path
           const isHWMarkerEdge = from === "agent_response" && (to === "hw_emotion" || to === "hw_led" || to === "hw_servo" || to === "hw_audio" || to === "hw_wellbeing" || to === "hw_mood" || to === "hw_music_suggestion" || to === "hw_posture");
 
-          // tool_exec is rendered as a rect (the Event Pipeline), not a
-          // circle. Anchor any edge that touches it on the rect boundary
-          // closest to the OTHER endpoint, so arrows latch precisely to
-          // the rect edge instead of pointing at a floating interior
-          // pixel.
           let x1: number, y1: number, x2: number, y2: number;
           if (from === "tool_exec" && to !== "tool_exec") {
             const a = pipeAnchor(t.x, t.y);
@@ -507,15 +446,8 @@ export function FlowDiagram({
           );
         })}
 
-        {/* Event Pipeline — replaces the old llm_first_token / agent_thinking /
-            tool_exec nodes. Lists OpenClaw stream events in chronological order
-            with consecutive same-type deltas merged into one row. */}
         {(() => {
           const px = PIPE.x, py = PIPE.y, pw = PIPE.w, ph = PIPE.h;
-          // Pipeline is always visible — it's the canonical visual anchor for
-          // the agent core. When the turn is local-match / idle / dropped, the
-          // rows list shows the "(no agent stream events ...)" placeholder so
-          // the canvas shape stays consistent across turn types.
           const pipelineColor = "var(--lm-blue)";
           const fmtDur = (ms: number) => ms >= 60_000 ? `${(ms / 60_000).toFixed(1)}m`
             : ms >= 1000 ? `${(ms / 1000).toFixed(1)}s` : `${ms}ms`;
@@ -525,9 +457,6 @@ export function FlowDiagram({
             const pad = (n: number, w = 2) => String(n).padStart(w, "0");
             return `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}.${pad(d.getMilliseconds(), 3)}`;
           };
-          // Header summary: openclaw init / llm work / tool exec / writing tail.
-          // Pulled from turnEvents (chat_send, lifecycle_*) + pipelineRows
-          // (tool durations).
           let chatSendTs = 0, lcStartTs = 0, lcEndTs = 0;
           for (const ev of turnEvents) {
             const tt = new Date(ev.time).getTime();
@@ -542,9 +471,6 @@ export function FlowDiagram({
           const initMs = (chatSendTs && lcStartTs && lcStartTs > chatSendTs) ? lcStartTs - chatSendTs : 0;
           const turnLlmMs = (lcStartTs && lcEndTs && lcEndTs > lcStartTs) ? (lcEndTs - lcStartTs) - toolTotalMs : 0;
           const totalMs = (chatSendTs && lcEndTs) ? lcEndTs - chatSendTs : 0;
-          // Sum components are joined with "·" and the total is glued on
-          // with " = " so the line reads as a literal sum:
-          //   init 2.8s · llm 15.1s · tool 0.5s = total 18.4s
           const sumParts: string[] = [];
           if (initMs > 0) sumParts.push(`init ${fmtDur(initMs)}`);
           if (turnLlmMs > 0) sumParts.push(`llm ${fmtDur(turnLlmMs)}`);
@@ -568,16 +494,12 @@ export function FlowDiagram({
           const copyBtnX = px + pw - 28;
           const copyBtnY = py + 10;
           // Plain-text dump of the pipeline content for the clipboard.
-          // Same shape as what the user reads on screen, easy to paste into
-          // a bug report or log.
           const buildPipelineText = (): string => {
             const lines: string[] = [];
             lines.push(`⟨agent event pipeline⟩`);
             if (headerSummary) lines.push(`⏱ ${headerSummary}`);
             for (let i = 0; i < pipelineRows.length; i++) {
               const r = pipelineRows[i];
-              // Real wall-clock stamp of the first event in this row, so the
-              // copied text can be correlated against device logs.
               let line = `${fmtClockMs(r.startMs)}  ${r.label}`;
               if (r.kind === "thinking" || r.kind === "assistant") {
                 line += `  ${fmtDur(r.durationMs)} · ${r.chunks} chunks · ${fmtChars(r.chars)}`;
@@ -602,9 +524,6 @@ export function FlowDiagram({
               setPipelineCopied(true);
               window.setTimeout(() => setPipelineCopied(false), 1200);
             };
-            // navigator.clipboard is undefined on non-secure origins (http://Pi).
-            // Fall back to a hidden textarea + execCommand so the button still
-            // works when the monitor is served over plain HTTP from the device.
             if (navigator.clipboard && window.isSecureContext) {
               navigator.clipboard.writeText(text).then(done).catch(() => {
                 fallbackCopy(text);
@@ -644,8 +563,6 @@ export function FlowDiagram({
                 fontFamily="monospace" opacity={0.85} style={{ letterSpacing: "0.06em" }}>
                 ⟨agent event pipeline⟩
               </text>
-              {/* Copy button: just left of the guide ?. Copies the pipeline
-                  content as plain text to the clipboard. */}
               {!isPhoneLayout && <g
                 onMouseDown={(e: React.MouseEvent) => { e.stopPropagation(); }}
                 onClick={(e: React.MouseEvent) => { e.stopPropagation(); handleCopyPipeline(); }}
@@ -662,8 +579,6 @@ export function FlowDiagram({
                   {pipelineCopied ? "✓" : "⎘"}
                 </text>
               </g>}
-              {/* Guide button: top-right corner. Click toggles a popup
-                  listing the OpenClaw stream types this pipeline can show. */}
               {!isPhoneLayout && <g
                 onMouseDown={(e: React.MouseEvent) => { e.stopPropagation(); }}
                 onClick={(e: React.MouseEvent) => { e.stopPropagation(); setPipelineGuideOpen(v => !v); }}
@@ -697,10 +612,6 @@ export function FlowDiagram({
                     WebkitUserSelect: "text",
                   }}
                 >
-                  {/* Header summary: openclaw init / llm / tool / total.
-                      All timing text is purple (var(--lm-purple)) so any
-                      number-with-a-time-unit anywhere in the pipeline reads
-                      as the same conceptual category. */}
                   {headerSummary && (
                     <div style={{
                       display: "flex", gap: 8, marginBottom: 4, padding: "2px 4px",
@@ -725,10 +636,6 @@ export function FlowDiagram({
                     const isOneShot = r.kind === "lifecycle_start" || r.kind === "lifecycle_end"
                       || r.kind === "agent_first_token" || r.kind === "thinking_first_token"
                       || r.kind === "compaction" || r.kind === "error";
-                    // Gap to NEXT row — rendered below this row when > 200ms
-                    // so the user sees idle time (e.g., "+ 6.3s" between
-                    // lifecycle_start and the first tool call = LLM thinking
-                    // before any tool was invoked).
                     const next = pipelineRows[i + 1];
                     const gapMs = next ? next.startMs - r.endMs : 0;
                     return (
@@ -785,10 +692,7 @@ export function FlowDiagram({
                   })}
                 </div>
               </foreignObject>}
-              {/* Mobile browsers can drop SVG foreignObject HTML entirely.
-                  Keep the stream summary in pure SVG text so the LLM/tool
-                  pipeline remains visible there; the native details sheet
-                  exposes full arguments and curl payloads. */}
+              {/* Mobile browsers can drop foreignObject HTML; keep a pure SVG text summary. */}
               {isPhoneLayout && (
                 <g clipPath={`url(#${pipelineClipId})`} pointerEvents="none">
                   {pipelineRows.length === 0 ? (
@@ -813,9 +717,7 @@ export function FlowDiagram({
                   </text>
                 </g>
               )}
-              {/* Guide popup rendered LAST inside the pipeline group so it
-                  paints on top of the event-row foreignObject (otherwise the
-                  row list overlays the popup and swallows clicks on ✕). */}
+              {/* Rendered last so it paints above the row foreignObject. */}
               {!isPhoneLayout && pipelineGuideOpen && (
                 <foreignObject
                   x={px + pw - 320} y={py + 22} width={320} height={ph - 30}
@@ -874,12 +776,8 @@ export function FlowDiagram({
           );
         })()}
 
-        {/* Nodes */}
         {FLOW_NODES.map((node) => {
-          // Hidden agent-core anchors — their FlowStage entries remain so
-          // edges and visited tracking still work, but their node circles
-          // are absorbed into the Event Pipeline rect (rendered separately
-          // below). Skip rendering here.
+          // Absorbed into the Event Pipeline rect; still used for edges and visited tracking.
           if (node.id === "agent_thinking" || node.id === "tool_exec") {
             return null;
           }
@@ -891,18 +789,15 @@ export function FlowDiagram({
           const lines = nodeInfo[node.id] ?? [];
           const hasInfo = lines.length > 0 && (isActive || isVisited);
           const descLines = node.desc.split(" · ").length;
-          // agent_call info box renders ABOVE the node so its (often long)
-          // message + token block doesn't sit on top of the Event Pipeline rect.
           const boxAbove = node.id === "agent_call";
           const boxY = boxAbove ? pos.y - nodeR - 4 : pos.y + nodeR + 14 + descLines * 10;
           return (
             <g key={node.id} opacity={opacity}>
-              {/* Node shape based on node.shape */}
               {(() => {
                 const shape = node.shape ?? "circle";
                 const r = shape === "square" ? gateR : nodeR;
                 const fOpacity = isActive ? 0.25 : isVisited ? 0.18 : 0.12;
-                const sOpacity = isActive ? 1 : isVisited ? 0.7 : 0.35;
+                const sOpacity = isActive ? 1 : isVisited ? 0.85 : isLight ? 0.7 : 0.35;
                 const sWidth = isActive ? 2.5 : 1.5;
                 const glow = isActive ? { filter: `url(#${glowId})` } : undefined;
                 const glowR = r + 6;
@@ -949,32 +844,22 @@ export function FlowDiagram({
                   : node.icon} {node.short}
               </text>
               <text x={pos.x} y={pos.y + 6} textAnchor="middle"
-                fill={color} fontSize={7} opacity={0.9}>
+                fill="var(--lm-text)" fontSize={8} opacity={1}>
                 {node.label}
               </text>
               {node.desc.split(" · ").map((part, i) => (
                 <text key={`d${i}`} x={pos.x} y={pos.y + nodeR + 14 + i * 10} textAnchor="middle"
-                  fill={color} fontSize={5.5} opacity={0.6}>
+                  fill="var(--lm-text-dim)" fontSize={8} opacity={1}>
                   {part}
                 </text>
               ))}
 
               {hasInfo && !isPhoneLayout && (() => {
                 const textLines = lines.filter((l) => !l.startsWith("🖼"));
-                // agent_call carries the full chat_send message (often the
-                // pre-injected context for emotion.detected /
-                // speech_emotion.detected / motion.activity Phase 2 — several
-                // KB of JSON). Widen its box and anchor the
-                // left edge at the original centered position so it grows
-                // rightward into the empty space toward channel_input.
                 const isWide = node.id === "agent_call";
                 const boxW = isWide ? 480 : 190;
-                const halfDefault = 95; // = original 190 / 2 — keep left edge stable
+                const halfDefault = 95;
                 const xCentered = isWide ? pos.x - halfDefault : pos.x - boxW / 2;
-                // agent_call box anchors at the right side of the node and
-                // flows rightward (toward channel_input) so the long message
-                // / token block reads left-aligned without sweeping over the
-                // pipeline rect on the left.
                 const boxRight = node.id === "agent_call";
                 const boxX = boxRight
                   ? pos.x + nodeR + 6
@@ -997,8 +882,8 @@ export function FlowDiagram({
                         fontFamily: "monospace",
                         fontSize: 5.5,
                         lineHeight: 1.7,
-                        color: color,
-                        opacity: 0.95,
+                        color: "var(--lm-text)",
+                        opacity: 1,
                         ...(boxAbove ? { transform: "translateY(-100%)" } : {}),
                         userSelect: "text",
                         WebkitUserSelect: "text",
@@ -1010,7 +895,7 @@ export function FlowDiagram({
                     >
                       {textLines.map((line, i) => (
                         <div key={i} style={{
-                          color: line.startsWith("⏱") ? "var(--lm-amber)" : color,
+                          color: line.startsWith("⏱") ? "var(--lm-amber)" : "var(--lm-text)",
                           fontWeight: line.startsWith("⏱") ? 700 : 400,
                         }}>
                           {line}
@@ -1024,7 +909,6 @@ export function FlowDiagram({
           );
         })}
 
-        {/* Snapshot images — below CAM node (always shown) */}
         {sensingSnapshotUrls.length > 0 && sensingSnapshotUrls.map((url, i) => {
           const imgW = 100;
           const imgH = 75;
@@ -1061,7 +945,6 @@ export function FlowDiagram({
           );
         })}
 
-        {/* Snapshot on INTENT→AGENT line — only when image was actually sent to agent */}
         {imageSentToAgent && sensingSnapshotUrls.length > 0 && sensingSnapshotUrls.slice(0, 1).map((url, i) => {
           const imgW = 80;
           const imgH = 60;
@@ -1096,8 +979,6 @@ export function FlowDiagram({
           );
         })}
 
-        {/* Exact saved frame returned by an agent GET /camera/snapshot call.
-            It is never a fresh preview capture. */}
         {agentSnapshotUrls.map((url, i) => {
           const imgW = 100;
           const imgH = 75;
@@ -1132,8 +1013,6 @@ export function FlowDiagram({
         >LLM / Tool / Curl details</button>
       )}
 
-      {/* The chart keeps its native boxes on mobile. This sheet is an optional
-          readable view for long tool/curl payloads at the real viewport width. */}
       {isPhoneLayout && mobileDetailsOpen && createPortal(
         <div
           className={`lm-root ${themeClass}`}
@@ -1206,11 +1085,7 @@ export function FlowDiagram({
         document.body,
       )}
 
-      {/* Snapshot lightbox — portalled to <body> so position:fixed anchors to
-          the viewport. The diagram lives inside transformed/animated ancestors
-          (zoom/pan + the turn card), any of which would otherwise become the
-          fixed containing block and let the lightbox overflow on top of the
-          page rather than cover it. `lm-root ${themeClass}` re-scopes tokens. */}
+      {/* Portalled so position:fixed anchors to the viewport (ancestors are transformed). */}
       {lightboxUrl && createPortal(
         <div
           className={`lm-root ${themeClass}`}
@@ -1245,7 +1120,6 @@ export function FlowDiagram({
         document.body,
       )}
 
-      {/* Shape legend */}
       <div style={{
         display: "flex", gap: 16, justifyContent: "center", alignItems: "center",
         fontSize: 10, color: "var(--lm-text-muted)", padding: "8px 0 4px",
@@ -1281,7 +1155,6 @@ export function FlowDiagram({
         ))}
       </div>
 
-      {/* Zoom controls overlay */}
       <div style={{
         position: "absolute", bottom: 6, right: 6,
         display: "flex", gap: 4, alignItems: "center",

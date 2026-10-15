@@ -5,10 +5,8 @@ import { toast } from "sonner";
 import { C, SectionCard, LABEL_STYLE, INPUT_STYLE } from "@/components/setup/shared";
 import { listPlugins, installPlugin, startPlugin, stopPlugin, uninstallPlugin } from "@/lib/api";
 import type { Plugin } from "@/lib/api";
-// PARKED (#213): plugin discovery moves off Hugging Face Spaces to our own
-// catalog. Restore alongside the api.ts pair, the Go handler, and its route.
-// import { searchHFPlugins } from "@/lib/api";
-// import type { HFSpace } from "@/lib/api";
+import "./settings-lists.css";
+// Plugin discovery browse is parked (#213).
 
 export function PluginsSection({ active }: { active: boolean }) {
   const [plugins, setPlugins] = useState<Plugin[]>([]);
@@ -17,48 +15,12 @@ export function PluginsSection({ active }: { active: boolean }) {
   const [installing, setInstalling] = useState(false);
   const [acting, setActing] = useState<string | null>(null);
 
-  // HF browse state — PARKED (#213)
-  // const [hfSpaces, setHfSpaces] = useState<HFSpace[]>([]);
-  // const [hfLoading, setHfLoading] = useState(true);
-  // const [hfInstalling, setHfInstalling] = useState<string | null>(null);
-
   function refresh() {
     listPlugins()
       .then(setPlugins)
       .catch(() => {})
       .finally(() => setLoading(false));
   }
-
-  // PARKED (#213) — the browse half. Installing from a URL below is unaffected.
-  // function refreshHF() {
-  //   setHfLoading(true);
-  //   searchHFPlugins()
-  //     .then(setHfSpaces)
-  //     .catch(() => {})
-  //     .finally(() => setHfLoading(false));
-  // }
-  //
-  // function hfUrlForSpace(id: string) {
-  //   return `https://huggingface.co/spaces/${id}`;
-  // }
-  //
-  // function isInstalled(spaceId: string) {
-  //   const spaceUrl = hfUrlForSpace(spaceId);
-  //   return plugins.some((p) => p.url === spaceUrl);
-  // }
-  //
-  // async function handleHFInstall(spaceId: string) {
-  //   setHfInstalling(spaceId);
-  //   try {
-  //     await installPlugin(hfUrlForSpace(spaceId));
-  //     toast.success("Plugin install started.");
-  //     setTimeout(refresh, 5000);
-  //   } catch (err) {
-  //     toast.error(err instanceof Error ? err.message : "Failed to install.");
-  //   } finally {
-  //     setHfInstalling(null);
-  //   }
-  // }
 
   useEffect(() => { refresh(); }, []);
 
@@ -137,32 +99,32 @@ export function PluginsSection({ active }: { active: boolean }) {
       </div>
 
       {loading ? (
-        <div style={{ fontSize: 12, color: C.textMuted }}>Loading...</div>
+        <div style={{ fontSize: 12, color: C.textDim }}>Loading...</div>
       ) : (
         <>
-          {/* Installed plugins */}
           {plugins.length > 0 && (
             <div style={{ marginBottom: 16 }}>
-              <div style={{ fontSize: 11, fontWeight: 600, color: C.textMuted, textTransform: "uppercase", letterSpacing: 0.5, marginBottom: 8 }}>
+              <div style={{ fontSize: 12, fontWeight: 600, color: C.textDim, textTransform: "uppercase", letterSpacing: 0.5, marginBottom: 8 }}>
                 Installed
               </div>
               {plugins.map((p) => (
                 <div
                   key={p.name}
+                  className="lm-settings-list-row"
                   style={{
                     display: "flex", alignItems: "center", justifyContent: "space-between",
                     gap: 8, padding: "10px 12px", marginBottom: 6,
                     background: C.surface, border: `1px solid ${C.border}`, borderRadius: 8,
                   }}
                 >
-                  <div style={{ overflow: "hidden", minWidth: 0, flex: 1 }}>
-                    <div style={{ fontSize: 13, fontWeight: 600, color: C.text, display: "flex", alignItems: "center", gap: 6 }}>
-                      {p.name}
+                  <div style={{ minWidth: 0, flex: 1 }}>
+                    <div style={{ fontSize: 13, fontWeight: 600, color: C.text, display: "flex", flexWrap: "wrap", alignItems: "center", gap: 6 }}>
+                      <span className="lm-settings-list-name">{p.name}</span>
                       {p.version && (
-                        <span style={{ fontSize: 10, color: C.textMuted, fontWeight: 400 }}>v{p.version}</span>
+                        <span style={{ fontSize: 12, color: C.textDim, fontWeight: 400 }}>v{p.version}</span>
                       )}
                       <span style={{
-                        fontSize: 10, fontWeight: 500,
+                        fontSize: 12, fontWeight: 500,
                         color: STATUS_COLOR[p.status] || C.textMuted,
                       }}>
                         {p.status}
@@ -170,17 +132,18 @@ export function PluginsSection({ active }: { active: boolean }) {
                     </div>
                     {p.description && (
                       <div style={{
-                        fontSize: 11, color: C.textDim, marginTop: 2,
-                        overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap",
+                        fontSize: 12, color: C.textDim, marginTop: 2,
+                        overflowWrap: "anywhere",
                       }}>
                         {p.description}
                       </div>
                     )}
                   </div>
-                  <div style={{ display: "flex", gap: 6, flexShrink: 0 }}>
+                  <div className="lm-settings-list-actions">
                     {p.status === "running" ? (
                       <button
                         type="button"
+                        aria-label={`Stop plugin ${p.name}`}
                         onClick={() => handleStop(p.name)}
                         disabled={acting === p.name}
                         style={{ ...BTN, opacity: acting === p.name ? 0.5 : 1 }}
@@ -190,6 +153,7 @@ export function PluginsSection({ active }: { active: boolean }) {
                     ) : (
                       <button
                         type="button"
+                        aria-label={`Start plugin ${p.name}`}
                         onClick={() => handleStart(p.name)}
                         disabled={acting === p.name}
                         style={{ ...BTN, opacity: acting === p.name ? 0.5 : 1 }}
@@ -199,6 +163,7 @@ export function PluginsSection({ active }: { active: boolean }) {
                     )}
                     <button
                       type="button"
+                      aria-label={`Uninstall plugin ${p.name}`}
                       onClick={() => handleUninstall(p.name)}
                       disabled={acting === p.name}
                       style={{ ...BTN, color: C.red, opacity: acting === p.name ? 0.5 : 1 }}
@@ -211,82 +176,6 @@ export function PluginsSection({ active }: { active: boolean }) {
             </div>
           )}
 
-          {/* PARKED (#213) — Browse listed plugins from Hugging Face Spaces.
-              Restore with the api.ts pair + Go handler + route, pointing at
-              our own catalog instead. Install-from-URL below is unaffected.
-          <div style={{ marginBottom: 16 }}>
-            <div style={{ fontSize: 11, fontWeight: 600, color: C.textMuted, textTransform: "uppercase", letterSpacing: 0.5, marginBottom: 8 }}>
-              Browse
-            </div>
-            {hfLoading ? (
-              <div style={{ fontSize: 12, color: C.textMuted }}>Loading plugins...</div>
-            ) : hfSpaces.length === 0 ? (
-              <div style={{ fontSize: 12, color: C.textMuted }}>No community plugins found.</div>
-            ) : (
-              hfSpaces.map((s) => {
-                const installed = isInstalled(s.id);
-                const busy = hfInstalling === s.id;
-                const title = s.cardData?.title || s.id.split("/").pop() || s.id;
-                const emoji = s.cardData?.emoji || "";
-                const desc = s.cardData?.description || "";
-                return (
-                  <div
-                    key={s.id}
-                    style={{
-                      display: "flex", alignItems: "center", justifyContent: "space-between",
-                      gap: 8, padding: "10px 12px", marginBottom: 6,
-                      background: C.surface, border: `1px solid ${C.border}`, borderRadius: 8,
-                    }}
-                  >
-                    <div style={{ overflow: "hidden", minWidth: 0, flex: 1 }}>
-                      <div style={{ fontSize: 13, fontWeight: 600, color: C.text, display: "flex", alignItems: "center", gap: 6 }}>
-                        {emoji && <span>{emoji}</span>}
-                        {title}
-                        {s.likes > 0 && (
-                          <span style={{ fontSize: 10, color: C.textMuted, fontWeight: 400, display: "inline-flex", alignItems: "center", gap: 2 }}>
-                            <Heart size={9} /> {s.likes}
-                          </span>
-                        )}
-                      </div>
-                      {desc && (
-                        <div style={{
-                          fontSize: 11, color: C.textDim, marginTop: 2,
-                          overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap",
-                        }}>
-                          {desc}
-                        </div>
-                      )}
-                    </div>
-                    <div style={{ flexShrink: 0 }}>
-                      {installed ? (
-                        <span style={{ fontSize: 11, color: C.green, fontWeight: 500 }}>Installed</span>
-                      ) : (
-                        <button
-                          type="button"
-                          onClick={() => handleHFInstall(s.id)}
-                          disabled={busy}
-                          style={{
-                            ...BTN,
-                            background: C.amber, color: "#000", borderColor: C.amber,
-                            opacity: busy ? 0.5 : 1,
-                            cursor: busy ? "not-allowed" : "pointer",
-                            display: "inline-flex", alignItems: "center", gap: 4,
-                          }}
-                        >
-                          <Download size={12} />
-                          {busy ? "Installing..." : "Install"}
-                        </button>
-                      )}
-                    </div>
-                  </div>
-                );
-              })
-            )}
-          </div>
-
-          */}
-
-          {/* Manual install form */}
           <div style={{ marginBottom: 6 }}>
             <label htmlFor="plugin-url" style={LABEL_STYLE}>Install from URL</label>
             <input

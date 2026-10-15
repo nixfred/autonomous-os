@@ -2,6 +2,8 @@ package bootstrap
 
 import (
 	"context"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"testing"
@@ -25,8 +27,6 @@ func TestUpdaterURLFrom(t *testing.T) {
 			want: "https://storage.googleapis.com/s3-autonomous-upgrade-3/os/software-update",
 		},
 		{
-			// A query string on the metadata feed must not be carried onto a
-			// different object.
 			name: "query is dropped",
 			in:   "https://cdn.autonomous.ai/os/ota/metadata.json?v=3",
 			want: "https://cdn.autonomous.ai/os/software-update",
@@ -37,8 +37,6 @@ func TestUpdaterURLFrom(t *testing.T) {
 			wantErr: true,
 		},
 		{
-			// Nothing to derive from: refuse rather than guess at the host root,
-			// where an unrelated file could be served.
 			name:    "no namespace to derive from",
 			in:      "https://cdn.autonomous.ai/metadata.json",
 			wantErr: true,
@@ -69,8 +67,7 @@ func TestUpdaterURLFrom(t *testing.T) {
 	}
 }
 
-// installUpdater writes to the fixed updaterPath, so the syntax gate is tested
-// through the same helper with a temp destination swapped in.
+// withTempUpdaterPath swaps updaterPath for a temp destination.
 func withTempUpdaterPath(t *testing.T, contents string) string {
 	t.Helper()
 	dir := t.TempDir()
@@ -78,9 +75,10 @@ func withTempUpdaterPath(t *testing.T, contents string) string {
 	if err := os.WriteFile(dest, []byte(contents), 0o755); err != nil {
 		t.Fatalf("seed updater: %v", err)
 	}
-	orig := updaterPath
+	orig, originalLock := updaterPath, updaterLockPath
 	updaterPath = dest
-	t.Cleanup(func() { updaterPath = orig })
+	updaterLockPath = filepath.Join(t.TempDir(), "software-update.lock")
+	t.Cleanup(func() { updaterPath, updaterLockPath = orig, originalLock })
 	return dest
 }
 
@@ -88,9 +86,7 @@ func TestInstallUpdaterRejectsBrokenSyntax(t *testing.T) {
 	good := "#!/usr/bin/env bash\necho ok\n"
 	dest := withTempUpdaterPath(t, good)
 
-	// A truncated download: `if` with no `fi`. This is the case that must never
-	// reach disk — a device whose updater does not parse cannot be repaired
-	// remotely.
+	// A truncated download (`if` without `fi`) must never reach disk.
 	truncated := []byte("#!/usr/bin/env bash\nif [ -f /tmp/x ]; then\n  echo half\n")
 	if err := installUpdater(context.Background(), truncated); err == nil {
 		t.Fatal("expected bash -n to reject a truncated script")
@@ -104,7 +100,6 @@ func TestInstallUpdaterRejectsBrokenSyntax(t *testing.T) {
 		t.Errorf("existing updater was replaced by a broken download:\n%s", after)
 	}
 
-	// No staging file may survive a rejected install.
 	entries, err := os.ReadDir(filepath.Dir(dest))
 	if err != nil {
 		t.Fatalf("read dir: %v", err)
@@ -134,8 +129,6 @@ func TestInstallUpdaterReplacesAndKeepsItExecutable(t *testing.T) {
 		t.Errorf("got %q, want %q", got, want)
 	}
 
-	// The rename must publish a file that is already runnable; a 0600 temp
-	// promoted into place would break every later exec.
 	info, err := os.Stat(dest)
 	if err != nil {
 		t.Fatalf("stat updater: %v", err)
@@ -153,5 +146,62 @@ func TestUpdateInFlightBlocksRefresh(t *testing.T) {
 	defer inFlight.Delete("hal")
 	if !updateInFlight() {
 		t.Error("a running force update must report as in flight")
+	}
+}
+
+func TestRefreshUpdaterSharesCLIInstallationLock(t *testing.T) {
+	b, _ := serviceBootstrap(t)
+	original := "#!/bin/sh\necho old\n"
+	dest := withTempUpdaterPath(t, original)
+	published := "#!/bin/sh\necho new\n"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(published))
+	}))
+	defer server.Close()
+	b.cfg.MetadataURL = server.URL + "/os/ota/metadata.json"
+	b.client = server.Client()
+	unlock, err := lockUpdaterRefresh()
+	if err != nil {
+		t.Fatal(err)
+	}
+	b.refreshUpdater(context.Background())
+	data, readErr := os.ReadFile(dest)
+	unlock()
+	if readErr != nil || string(data) != original {
+		t.Fatalf("updater changed while CLI held lock: %q %v", data, readErr)
+	}
+	b.refreshUpdater(context.Background())
+	data, err = os.ReadFile(dest)
+	if err != nil || string(data) != published {
+		t.Fatalf("updater did not refresh after CLI released lock: %q %v", data, err)
+	}
+}
+
+func TestRefreshUpdaterRechecksActivationAfterDownload(t *testing.T) {
+	b, _ := serviceBootstrap(t)
+	original := "#!/bin/sh\n# Service OTA protocol: 1\necho current\n"
+	dest := withTempUpdaterPath(t, original)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Simulate activation committing while the network request is pending.
+		// Acquiring the lock here also proves fetch does not hold it.
+		unlock, err := lockUpdaterRefresh()
+		if err != nil {
+			t.Errorf("network fetch held installation lock: %v", err)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		if err := os.WriteFile(filepath.Join(b.serviceDirectory(), "ownership.json"), []byte(`{}`), 0o600); err != nil {
+			t.Error(err)
+		}
+		unlock()
+		_, _ = w.Write([]byte("#!/bin/sh\necho incompatible\n"))
+	}))
+	defer server.Close()
+	b.cfg.MetadataURL = server.URL + "/os/ota/metadata.json"
+	b.client = server.Client()
+	b.refreshUpdater(context.Background())
+	data, err := os.ReadFile(dest)
+	if err != nil || string(data) != original {
+		t.Fatalf("activation compatibility state was stale: %q %v", data, err)
 	}
 }

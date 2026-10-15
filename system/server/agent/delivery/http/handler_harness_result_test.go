@@ -127,7 +127,7 @@ func TestHarnessQuestionKeepsResultPendingAndDeduplicatesReplay(t *testing.T) {
 			t.Fatal("question missing")
 		}
 		event := <-events
-		if event.Type != "assistant_delta" || event.Summary != "Choose a color" {
+		if event.Type != "assistant_delta" || event.Summary != "Choose a color\n" {
 			t.Fatalf("wrong event %+v", event)
 		}
 	}
@@ -168,8 +168,7 @@ func TestHarnessGroupedUsageLimitNeverRewritesResult(t *testing.T) {
 	}
 }
 
-// Reproduces the device report: A begins, speech is cancelled, then B is
-// submitted. A/B complete together. The new request must still own its reply.
+// A request submitted after a speech cancel must own its reply even when A and B complete together.
 func TestHarnessGroupedSpeechNewInputAfterCancelOwnsSharedReply(t *testing.T) {
 	old := "device-chat-1-1790308528212"
 	latest := "device-chat-2-1790308585451"
@@ -177,8 +176,7 @@ func TestHarnessGroupedSpeechNewInputAfterCancelOwnsSharedReply(t *testing.T) {
 		for _, source := range []string{"click", "realtime"} {
 			t.Run(source+"/"+order[0], func(t *testing.T) {
 				h := &AgentHandler{}
-				// Registration order is deliberately reversed: replay/callback
-				// arrival must not decide which device request is newest.
+				// Registration order is reversed on purpose: arrival order must not decide the newest request.
 				h.MarkHarnessResponseRun(latest, false, false)
 				h.MarkHarnessResponseRun(old, false, false)
 				if source == "click" {

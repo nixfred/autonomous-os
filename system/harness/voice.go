@@ -19,7 +19,9 @@ type VoiceTransport interface {
 	Request(context.Context, Frame) (Frame, error)
 }
 type VoiceCallbacks struct {
-	OnDispatch func(agentID, runID string)
+	// SupportsMode checks the configured physical input; absent callbacks fail closed.
+	SupportsMode func(context.Context) (bool, error)
+	OnDispatch   func(agentID, runID string)
 	// OnDispatchRequest registers delivery correlation before input can reach
 	// the remote engine. When provided it takes precedence over OnDispatch.
 	OnDispatchRequest func(agentID, runID string, frame Frame)
@@ -32,6 +34,7 @@ type VoicePending struct {
 	RunID          string `json:"runId"`
 }
 type VoiceModeState struct {
+	Supported      bool          `json:"supported"`
 	Enabled        bool          `json:"enabled"`
 	Generation     uint64        `json:"generation"`
 	MachineID      string        `json:"machineId"`
@@ -51,7 +54,15 @@ type VoiceQuestion struct {
 type voiceQuestionSet struct {
 	RequestID string          `json:"requestId"`
 	Questions []VoiceQuestion `json:"questions"`
+	// Permission marks a terminal approval dialog; it is resolved only in OpenHarness.
+	Permission *struct {
+		Dialog     string `json:"dialog"`
+		Resolution string `json:"resolution"`
+	} `json:"permission,omitempty"`
 }
+
+// ErrPermissionInDesktop refuses voice input while the agent waits on a permission dialog.
+var ErrPermissionInDesktop = errors.New("The Harness agent is waiting for permission; open OpenHarness to approve or deny it")
 
 // voiceOperationLock serializes wire operations, not remote engine turns.
 type voiceOperationLock struct {
@@ -103,6 +114,8 @@ type VoiceController struct {
 	pending    []*VoicePending
 	question   *voiceQuestionSet
 	answers    map[string]string
+
+	supportKnown bool
 }
 
 var voiceGeneration atomic.Uint64
@@ -273,8 +286,57 @@ func (v *VoiceController) setFocus(machine, agent, name, revision string, availa
 	}
 	v.mu.Unlock()
 }
-func (v *VoiceController) SetMode(_ context.Context, enabled bool) (VoiceModeState, error) {
+
+// SupportState loads board support on demand. Successful declarations are cached;
+// unavailable HAL can be retried by a later read without changing the mode.
+func (v *VoiceController) SupportState(ctx context.Context) VoiceModeState {
 	v.mu.Lock()
+	known := v.supportKnown
+	v.mu.Unlock()
+	if !known {
+		_ = v.RefreshSupport(ctx)
+	}
+	return v.State()
+}
+
+// RefreshSupport checks activation eligibility without changing the active mode.
+func (v *VoiceController) RefreshSupport(ctx context.Context) error {
+	supported := false
+	var err error
+	if v.callbacks.SupportsMode != nil {
+		ctx, cancel := context.WithTimeout(ctx, time.Second)
+		defer cancel()
+		supported, err = v.callbacks.SupportsMode(ctx)
+	}
+	supported = supported && err == nil
+	v.mu.Lock()
+	if err == nil {
+		v.state.Supported = supported
+		v.supportKnown = true
+	}
+	v.mu.Unlock()
+	if err != nil {
+		return fmt.Errorf("Cannot verify MPR121 support: %w", err)
+	}
+	if !supported {
+		return errors.New("Harness-only mode requires an enabled MPR121 input")
+	}
+	return nil
+}
+func (v *VoiceController) SetMode(ctx context.Context, enabled bool) (VoiceModeState, error) {
+	v.mu.Lock()
+	intent := v.modeIntent
+	v.mu.Unlock()
+	if enabled {
+		if err := v.RefreshSupport(ctx); err != nil {
+			return v.State(), err
+		}
+	}
+	v.mu.Lock()
+	if enabled && (v.modeIntent != intent || !v.state.Supported || ctx.Err() != nil) {
+		v.mu.Unlock()
+		return v.State(), errors.New("Voice mode changed while checking MPR121 support")
+	}
 	v.setModeLocked(enabled)
 	v.mu.Unlock()
 	v.NotifyFocusChanged()
@@ -317,6 +379,9 @@ func (v *VoiceController) liveQuestion(ctx context.Context, s VoiceModeState) (*
 	var q voiceQuestionSet
 	if e = json.Unmarshal(raw, &q); e != nil {
 		return nil, fmt.Errorf("decode Harness question: %w", e)
+	}
+	if q.Permission != nil {
+		return nil, ErrPermissionInDesktop
 	}
 	if q.RequestID == "" || len(q.Questions) == 0 {
 		return nil, errors.New("Harness question is malformed")

@@ -120,8 +120,7 @@ type capturedGELF struct {
 	body          string
 }
 
-// gelfCollector records every request so a test can assert where a record went
-// and with which credential.
+// gelfCollector records every request for assertions.
 type gelfCollector struct {
 	*httptest.Server
 	mu   sync.Mutex
@@ -155,9 +154,7 @@ func (c *gelfCollector) received() []capturedGELF {
 	return append([]capturedGELF(nil), c.reqs...)
 }
 
-// initTestLogger runs the real Init with GELF_URL set to gelfEnvURL ("" = the
-// relay path) and returns a func that flushes the sender and restores globals.
-// Records are only guaranteed delivered once that func has run.
+// initTestLogger runs Init with GELF_URL=gelfEnvURL ("" = relay) and returns a flush-and-restore func.
 func initTestLogger(t *testing.T, gelfEnvURL string) func() {
 	t.Helper()
 	t.Setenv("GELF_URL", gelfEnvURL)
@@ -243,8 +240,7 @@ func TestGELFRelayArmsLoggersCreatedBeforeIt(t *testing.T) {
 	collector := newGELFCollector(t)
 	done := initTestLogger(t, "")
 
-	// Package-level loggers are built long before config.json loads, so they
-	// hold handler copies made while the relay was still dormant.
+	// Package-level loggers hold handler copies made before the relay was configured.
 	early := slog.Default().With("component", "early")
 	EnableGELFRelay(collector.URL, "lobster-key")
 	early.Info("from early logger")
@@ -281,20 +277,46 @@ func TestGELFRelayStaysDormantWithoutCredentials(t *testing.T) {
 	}
 }
 
-func TestGELFRelaySecondCallKeepsFirstTarget(t *testing.T) {
+func TestGELFRelaySameTargetIsANoOp(t *testing.T) {
+	collector := newGELFCollector(t)
+	done := initTestLogger(t, "")
+
+	EnableGELFRelay(collector.URL, "key-1")
+	first := activeGELF.sink.load()
+	EnableGELFRelay(collector.URL+"/", " key-1 ")
+	if activeGELF.sink.load() != first {
+		t.Fatal("repeat call with the same target started a second sender")
+	}
+	slog.Info("once")
+	done()
+
+	if got := collector.received(); len(got) != 1 {
+		t.Fatalf("requests = %d, want 1", len(got))
+	}
+}
+
+func TestGELFRelayRetargetsWhenTheKeyChanges(t *testing.T) {
+	shortReplayTiming(t)
 	first := newGELFCollector(t)
 	second := newGELFCollector(t)
 	done := initTestLogger(t, "")
+	EnableGELFSpool(t.TempDir(), "os-server")
 
+	// A re-setup saves a new record's key; the relay must follow it, or every
+	// record would be sent with a key the cloud no longer accepts.
 	EnableGELFRelay(first.URL, "key-1")
+	slog.Info("before re-setup")
+	waitFor(t, func() bool { return len(first.received()) == 1 })
 	EnableGELFRelay(second.URL, "key-2")
-	slog.Info("once")
+	slog.Info("after re-setup")
+	waitFor(t, func() bool { return len(second.received()) == 1 })
 	done()
 
 	if got := first.received(); len(got) != 1 {
 		t.Fatalf("first target requests = %d, want 1", len(got))
 	}
-	if got := second.received(); len(got) != 0 {
-		t.Fatalf("second target requests = %d, want 0: a repeat call must not re-arm", len(got))
+	got := second.received()[0]
+	if got.authorization != "Bearer key-2" || !strings.Contains(got.body, "after re-setup") {
+		t.Errorf("second target got %+v, want the new record with the new key", got)
 	}
 }

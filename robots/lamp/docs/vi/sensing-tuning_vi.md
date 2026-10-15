@@ -1,69 +1,31 @@
-# Tuning Sensing — Phần SER (Nhận Diện Cảm Xúc Giọng Nói)
+# Hướng dẫn tinh chỉnh ngưỡng Sensing
 
-> Tài liệu tuning đầy đủ (motion, face, sound, …) bằng tiếng Anh: [sensing-tuning.md](../sensing-tuning.md).  
-> Kiến trúc SER: [speech-emotion_vi.md](../../../../docs/vi/speech-emotion_vi.md).
+Cách tinh chỉnh các ngưỡng sensing của Lamp trên phần cứng thật.
+Mọi hằng số nằm trong `hal/config.py` và `hal/drivers/voice/_internal/config.py`.
 
----
+> Bản tiếng Anh: [sensing-tuning.md](../sensing-tuning.md). Kiến trúc SER: [speech-emotion_vi.md](../../../../docs/vi/speech-emotion_vi.md).
 
-## Speech Emotion Recognition (SER)
+## Xem log
 
-**File:** `hal/config.py`, `hal/drivers/voice/voice_service.py` (`_submit_speech_emotion_from_session`, `_identify_and_decorate`, `_session_wav_for_ser`)
+SSH vào Pi, rồi:
 
-**Tích hợp voice (cuối phiên mic, độc lập transcript):** trong `finally` của `_stream_session`, `_identify_and_decorate(final_text, audio_buffer)` chạy **đúng 1 lần** để lấy đồng thời `final_msg` (cho Lamp POST khi STT có chữ) và `user_name` (cho SER submit). Sau đó gọi `_submit_speech_emotion_from_session(audio_buffer, user=...)` — chỉ build WAV và `SpeechEmotionService.submit`, không gọi speaker lần 2. Người không match / lỗi speaker vẫn enqueue SER dưới key dedup chung `unknown` nếu audio đủ dài.
+```bash
+# HAL log (motion, sound, light events all here)
+tail -f /var/log/hal/server.log
 
-```python
-SPEECH_EMOTION_ENABLED = True
-SPEECH_EMOTION_FLUSH_S = 10.0               # Chu kỳ drain buffer theo user
-SPEECH_EMOTION_DEDUP_WINDOW_S = 300.0       # TTL (user, bucket) — 5 phút
-SPEECH_EMOTION_MIN_AUDIO_S = 3.0            # Bỏ utterance ngắn hơn (mặc định config)
-SPEECH_EMOTION_API_TIMEOUT_S = 15           # Timeout HTTP perception-service
-DL_SER_ENDPOINT = "/lelamp/api/dl/ser/recognize"
+# Lamp log (confirms event received + forwarded to OpenClaw)
+journalctl -fu lamp -f
 ```
 
-Ngưỡng confidence **per-label** không nằm trong `config.py` — khai báo trong `hal/drivers/voice/speech_emotion/constants.py` qua `CONFIDENCE_THRESHOLD_BY_LABEL` (và `DEFAULT_CONFIDENCE_THRESHOLD` cho label không map). Negative emotion siết chặt hơn positive để giảm false positive:
-
-```python
-# constants.py
-CONFIDENCE_THRESHOLD_BY_LABEL = {
-    "happy":     0.5,
-    "surprised": 0.6,
-    "sad":       0.6,
-    "angry":     0.6,
-    "fearful":   0.7,
-    "disgusted": 0.7,
-}
-DEFAULT_CONFIDENCE_THRESHOLD = 0.5
-```
-
-Sửa trực tiếp dict để tune — không còn env override.
-
-### Đọc log
-
-Service gắn tag `[speech_emotion]`:
+Khi một event bắn, bạn sẽ thấy hai dòng — mỗi log một dòng:
 
 ```
-INFO lelamp.voice.speech_emotion: [speech_emotion] buffered: alice -> sad (0.72, 2.40s)
-INFO lelamp.voice.speech_emotion: [speech_emotion] flushing alice: Speech emotion detected: Sad. (weak voice cue; confidence=0.72; bucket=negative; ...) (mode of sad, fearful, sad)
-INFO lelamp.voice.speech_emotion: [speech_emotion] sent to Lamp: Speech emotion detected: Sad. ...
-INFO lelamp.voice.speech_emotion: [speech_emotion] dedup drop: angry bucket=negative (key seen 87.4s ago)
+# lelamp log
+INFO lelamp.service.sensing.sensing_service: [sensing] motion: Small movement detected...
+
+# lamp log
+[sensing] received motion event → forwarding to OpenClaw
 ```
-
-Dòng `flushing` hiển thị danh sách label thô — đó là mode trên các mẫu trong buffer.
-
-### Tuning
-
-| Triệu chứng | Cách chỉnh |
-|-------------|------------|
-| Cùng bucket fire quá thường xuyên | Tăng `SPEECH_EMOTION_DEDUP_WINDOW_S` (300 → 600) |
-| Một utterance nhiễu vẫn lọt | Tăng entry tương ứng trong `CONFIDENCE_THRESHOLD_BY_LABEL` (`constants.py`) — ví dụ `"sad": 0.6 → 0.7`. Chỉ tăng `DEFAULT_CONFIDENCE_THRESHOLD` khi nhiễu diện rộng |
-| "Ừ" / "ok" ngắn bị flag | Tăng `SPEECH_EMOTION_MIN_AUDIO_S` (3.0 → 4.0) |
-| Lamp phản ứng chậm sau đổi mood thật | Giảm `SPEECH_EMOTION_FLUSH_S` (10 → 5) |
-| Cảnh báo worker queue full | Kiểm tra độ trễ perception-service; tăng queue không đủ nếu downstream kẹt |
-| Quá nhiều `speech_emotion.detected` cho người lạ | **Kỳ vọng:** `user="unknown"`; siết entry per-label trong `CONFIDENCE_THRESHOLD_BY_LABEL` (`constants.py`) hoặc dedup — **không** tắt SER chỉ vì transcript có `Unknown Speaker:` |
-
-### Áp dụng thay đổi
-
-Sau khi sửa `hal/config.py` hoặc `voice_service.py` trên Pi: restart service HAL (xem [os-server_vi.md](../../../../docs/vi/os-server_vi.md)).
 
 ---
 
@@ -117,6 +79,89 @@ INFO hal...motion: [motion] transition bypass: ['sedentary'] → ['eat'] (last e
 
 ---
 
+## Phát hiện âm thanh (Sound Detection — Sensing)
+
+**File:** `hal/config.py`
+
+```python
+SOUND_RMS_THRESHOLD = 8000   # RMS level to trigger "loud noise" event (env HAL_SOUND_RMS_THRESHOLD)
+SOUND_SAMPLE_DURATION_S = 0.5 # sample window length
+```
+
+**Đọc log:**
+Message của event kèm mức RMS thực tế:
+
+```
+INFO lelamp.service.sensing.sensing_service: [sensing] sound: Loud noise detected (level: 9521)
+```
+
+Theo dõi giá trị `level` trong điều kiện môi trường bình thường so với khi bạn vỗ tay/nói to.
+
+**Tuning:**
+
+| Triệu chứng | Cách chỉnh |
+|-------------|------------|
+| Nói chuyện bình thường không kích hoạt event | Giảm `SOUND_RMS_THRESHOLD` (8000 → 4000) |
+| Bị kích hoạt bởi tiếng quạt / tiếng ù điều hoà | Tăng `SOUND_RMS_THRESHOLD` (8000 → 12000) |
+
+
+---
+
+## Voice Wake Word (VAD)
+
+**File:** `hal/drivers/voice/_internal/config.py` (tất cả đều chỉnh được qua env)
+
+```python
+HAL_VAD_THRESHOLD = 3500        # RMS to trigger speech detection (default 3500)
+HAL_SILENCE_TIMEOUT = 2.5       # fallback: stop STT session after this much silence (s)
+HAL_ENDPOINT_SILENCE_S = 0.8    # short clock used once STT emitted a final segment (s)
+HAL_SPEECH_HOLDOFF = 0.2        # min speech duration before opening STT — rejects short clicks (s)
+HAL_PRE_ROLL_FRAMES = 8         # rolling lookback frames kept BEFORE VAD trigger (8 × 64ms = 512ms)
+HAL_WEBRTCVAD_ENABLED = false   # secondary gate, recommended true for low-threshold setups
+HAL_SILERO_ENABLED = false      # tertiary gate (ONNX); webrtcvad usually enough
+```
+
+**Pre-roll hoạt động thế nào:** Mọi frame mic đều được đẩy vào một `deque(maxlen=PRE_ROLL_FRAMES)` cuộn, bất kể trạng thái VAD. Khi VAD cuối cùng trigger, lịch sử trước trigger (các frame nằm dưới `RMS_THRESHOLD` — ví dụ phụ âm tắc nhỏ như "b", "k", "t", "p") được ghép vào đầu luồng audio gửi lên STT. Nhờ vậy user không cần nói "Ừm..." để khởi động trước câu thật.
+
+**Tuning:**
+
+| Triệu chứng | Cách chỉnh |
+|-------------|------------|
+| Mất âm tiết đầu (STT nghe "ật đèn" thay vì "bật đèn") | Tăng `HAL_PRE_ROLL_FRAMES` (8 → 12) hoặc giảm `HAL_VAD_THRESHOLD` (3500 → 1500) |
+| Wake word bắt không ổn định | Giảm `HAL_VAD_THRESHOLD` (3500 → 1500) + bật `HAL_WEBRTCVAD_ENABLED=true` làm lưới an toàn |
+| Lamp bắt đầu nghe vì tiếng ồn môi trường | Tăng `HAL_VAD_THRESHOLD` và/hoặc bật `HAL_WEBRTCVAD_ENABLED=true` |
+| Lamp cắt lời trước khi bạn nói xong | Tăng `HAL_ENDPOINT_SILENCE_S` (đồng hồ thường dùng để kết thúc turn), sau đó đến `HAL_SILENCE_TIMEOUT` |
+| Lamp trả lời ~2 giây sau khi bạn ngừng nói | Giảm `HAL_ENDPOINT_SILENCE_S` (0.8 → 0.5) |
+| Audio cũ của turn trước lẫn vào phiên sau | Đã được xử lý: `lookback.clear()` chạy sau khi mỗi phiên đóng |
+| Lamp lặp lại TTS của chính nó lên OpenClaw (vòng echo) | Giảm `ECHO_SIMILARITY_THRESHOLD` (0.55 → 0.45) |
+
+---
+
+## Phát hiện mức ánh sáng (Light Level Detection)
+
+**File:** `hal/config.py`
+
+```python
+LIGHT_LEVEL_INTERVAL_S = 300.0  # check every 5 minutes (env HAL_LIGHT_LEVEL_INTERVAL_S)
+LIGHT_CHANGE_THRESHOLD = 100    # min brightness change (0–255) to trigger event (env HAL_LIGHT_CHANGE_THRESHOLD)
+```
+
+**Đọc log:**
+
+```
+INFO lelamp.service.sensing.sensing_service: [sensing] light.level: Ambient light decreased significantly (level: 45/255, change: -120)
+```
+
+**Tuning:**
+
+| Triệu chứng | Cách chỉnh |
+|-------------|------------|
+| Không có event khi bật/tắt đèn | Giảm `LIGHT_CHANGE_THRESHOLD` (100 → 50) |
+| Quá nhạy (bị kích hoạt khi đèn dịu dần) | Tăng `LIGHT_CHANGE_THRESHOLD` (100 → 150) |
+| Event quá thường xuyên | Tăng `LIGHT_LEVEL_INTERVAL_S` |
+
+---
+
 ## Nhận Diện Khuôn Mặt (Face Detection)
 
 **File:** `hal/config.py`
@@ -127,7 +172,6 @@ FACE_MAX_TRUNCATION = 0.05          # Bỏ qua mặt bị cắt >5% bbox ra ngo�
 FACE_MIN_SHARPNESS = 100.0          # Bỏ qua mặt nhoè quá mức, không nhận diện được
 FACE_STRANGER_MIN_TICKS = 2         # Số lần thấy trước khi cấp id cho mặt lạ
 FACE_STRANGER_CORROBORATION_S = 6.0 # Ứng viên chờ được tính trong bao lâu
-FACE_COPRESENCE_MIN_TICKS = 2       # Số nhịp box chủ nhà + box lạ phải cùng frame trước khi ghi "already present"
 HAL_FACE_LANDMARK_CONF_THRESHOLD = 0.99  # Bỏ qua crop mà face mesh không chắc
 FACE_MATCH_THRESHOLD = 0.40         # Ngưỡng cho match do ảnh upload đã enroll gánh
 FACE_EXTENDED_THRESHOLD = 0.45      # Ngưỡng cho match do RIÊNG bank extended gánh
@@ -136,11 +180,15 @@ FACE_EXTEND_MIN_ENROLL_SIM = 0.45   # Ngưỡng ảnh upload phải đạt để
 FACE_COOLDOWN_S = 10.0              # Số giây tối thiểu giữa hai presence event
 FACE_OWNER_FORGET_S = 3600.0        # Bắn lại presence sau N giây không thấy chủ
 FACE_STRANGER_FORGET_S = 1800.0     # Tương tự cho người lạ
+FACE_STRANGER_RETENTION_S = 2592000 # (HAL_FACE_STRANGER_RETENTION_S) Quên hẳn người lạ sau 30 ngày không ghé
+FACE_STRANGER_GAZE_TICKS = 3        # Chào người lạ: số nhịp face-ID trong lượt bỏ phiếu gaze
+FACE_STRANGER_GAZE_MIN_FACING = 2   # Chào người lạ: số nhịp nhìn về đèn cần có
+FACE_STRANGER_GAZE_WINDOW_S = 10.0  # Chào người lạ: tuổi tối đa của một phiếu gaze
 ```
 
 Ngưỡng height ratio lọc bỏ những khuôn mặt **quá nhỏ** so với frame — thường là người ở xa, hoặc false positive mà crop mặt quá thấp độ phân giải để nhận diện đáng tin. Mặt có chiều cao bbox dưới ngưỡng (theo tỉ lệ chiều cao frame) bị bỏ qua trước khi phân loại.
 
-**Vì sao dùng height chứ không dùng area.** Diện tích giảm theo 1/d² còn kích thước dài giảm theo 1/d, nên gate theo diện tích nhạy gấp đôi với cùng một thay đổi tầm xa. Quan trọng hơn: xoay đầu (yaw — trường hợp phổ biến) làm hẹp **chiều rộng** bbox nhưng giữ nguyên chiều cao, nên gate theo diện tích loại mặt nghiêng mạnh tay hơn mặt chính diện ở cùng khoảng cách — đi ngược lại chính tính năng extended set vốn sinh ra để học các góc nghiêng đó.
+**Vì sao dùng height chứ không dùng area.** Diện tích giảm theo 1/d² còn kích thước dài giảm theo 1/d, nên gate theo diện tích nhạy gấp đôi với cùng một thay đổi tầm xa — nới tầm từ 0.8 m lên 1.5 m cần đổi ngưỡng diện tích 3.8× nhưng ngưỡng chiều cao chỉ 1.95×. Quan trọng hơn: xoay đầu (yaw — trường hợp phổ biến) làm hẹp **chiều rộng** bbox nhưng giữ nguyên chiều cao, nên gate theo diện tích loại mặt nghiêng mạnh tay hơn mặt chính diện ở cùng khoảng cách — đi ngược lại chính tính năng extended set vốn sinh ra để học các góc nghiêng đó.
 
 **Cắt cụt (truncation).** `FACE_MAX_TRUNCATION` là gate riêng cho mặt bị mép frame cắt, chạy sau gate chiều cao và trước khi phân loại. Mặt bị cắt không phải là mặt nhỏ hơn — nó là mặt **thiếu bộ phận**. SCRFD vẫn trả về một box hợp lý (cạnh bị cắt đơn giản chạy ra ngoài frame, ví dụ `[573, -34, 710, 121]`), còn landmark mesh thì tự tin bịa ra phần nó không nhìn thấy. Đo trên một lamp ngày 2026-09-03: một khuôn mặt bị cắt phía trên lông mày sinh ra landmark mắt đặt nhầm lên gò má với độ tin cậy **0.90**, embedding chỉ giống ảnh enroll của chính người đó **0.007**, và vẫn ra verdict FRIEND hoàn toàn nhờ bank extended tự thu.
 
@@ -166,7 +214,7 @@ Phải đo trên crop **aligned**, tuyệt đối không đo trên crop của de
 
 Lưu ý gate này làm gì và không làm gì: nó tách **frame dùng được với frame không dùng được**, chứ không tách chủ nhân với người lạ. Frame nhoè của một người lạ thật cũng bị bỏ, khiến người đó chậm vài giây mới được cấp id — họ cũng sinh một frame mỗi 2 giây và sẽ được cấp id từ frame nét kế tiếp. Phương sai Laplacian co giãn theo ánh sáng và độ tương phản, nên con số này được hiệu chỉnh cho đúng camera này; hãy kiểm tra lại bằng các thư mục `FAIL-blurred` trong face debug log nếu phòng ốc hoặc quang học thay đổi.
 
-**Độ tin cậy landmark.** `HAL_FACE_LANDMARK_CONF_THRESHOLD` (nằm trong `model_store.py`) là gate áp dụng ngay trong aligner: detection nào có độ tin cậy face-mesh dưới ngưỡng sẽ bị bỏ và không bao giờ được embed. **Hãy đọc con số này theo đúng thang mà model phát ra** — điểm số bão hoà, trung vị đúng bằng 1.000 và nhỏ nhất 0.613 trên 990 frame đã log, nên khoảng dùng được chỉ nằm ở phần trăm cuối. Giá trị mặc định cũ 0.60 không có nghĩa là "khá chặt"; nó có nghĩa là gate chưa từng chặn được gì, một lần cũng không.
+**Độ tin cậy landmark.** `HAL_FACE_LANDMARK_CONF_THRESHOLD` (nằm trong `model_store.py`) là gate thứ ba, áp dụng ngay trong aligner: detection nào có độ tin cậy face-mesh dưới ngưỡng sẽ bị bỏ và không bao giờ được embed. **Hãy đọc con số này theo đúng thang mà model phát ra** — điểm số bão hoà, trung vị đúng bằng 1.000 và nhỏ nhất 0.613 trên 990 frame đã log, nên khoảng dùng được chỉ nằm ở phần trăm cuối. Giá trị mặc định cũ 0.60 không có nghĩa là "khá chặt"; nó có nghĩa là gate chưa từng chặn được gì, một lần cũng không.
 
 Nó lọc ra những crop tuy là mặt nhưng không mang danh tính — thực tế gặp phải là SCRFD bắt trúng **vành tai** ở cự ly gần. 26 frame kiểu đó xuất hiện trong một phiên 40 phút với similarity ~0.0 so với ảnh enroll của chính chủ; một frame cấp id `stranger_N` và 25 frame còn lại match vào chính id đó. `landmark_score` tách chúng khỏi mặt thật ở mức AUC 0.98:
 
@@ -178,7 +226,7 @@ Nó lọc ra những crop tuy là mặt nhưng không mang danh tính — thực
 
 Tỉ lệ nhận diện *tăng lên* khi siết gate, vì các crop vô danh rời khỏi mẫu số. Nó **không phải** bộ phát hiện che khuất: model ONNX chỉ là landmark regressor, không có detector head, nên nó nhận một ROI mà SCRFD đã khẳng định là mặt và trả về điểm cho bất cứ thứ gì bên trong — một khuôn mặt bị khăn giấy che vẫn đạt 0.9978.
 
-**Tầm xa.** Ở 640×480 với FOV ngang ~65°, ngưỡng 0.10 tương ứng box mặt 48 px ở khoảng 2.2 m. Lưu ý gate này bất biến theo tỉ lệ: tăng `HAL_CAMERA_WIDTH`/`HEIGHT` không đổi việc mặt nào lọt qua, nhưng làm tăng chất lượng pixel của crop đưa vào recognizer. Ở 1280×720 cùng ngưỡng 0.10 cho crop 72 px thay vì 48 px.
+**Tầm xa.** Ở 640×480 với FOV ngang ~65°, ngưỡng 0.10 tương ứng box mặt 48 px ở khoảng 2.2 m. Lưu ý gate này bất biến theo tỉ lệ: tăng `HAL_CAMERA_WIDTH`/`HEIGHT` không đổi việc mặt nào lọt qua, nhưng làm tăng chất lượng pixel của crop đưa vào recognizer (EdgeFace warp về 112×112, và SCRFD trả bbox theo toạ độ frame gốc, nên crop lấy từ frame độ phân giải đầy đủ). Ở 1280×720 cùng ngưỡng 0.10 cho crop 72 px thay vì 48 px.
 
 **Ba bank, ba ngưỡng.** Một khuôn mặt là FRIEND khi ảnh **upload** đã enroll đạt trên `FACE_MATCH_THRESHOLD` (0.40), **hoặc** các view **extended** tự thu đạt trên `FACE_EXTENDED_THRESHOLD` (0.45). Nếu không, nó là một người lạ đã biết khi **bank người lạ** đạt trên `FACE_STRANGER_THRESHOLD` (0.45). Danh tính lấy từ bank nào *cho phép* match — một view extended dưới ngưỡng của chính nó thì không cấp cả quyết định lẫn cái tên.
 
@@ -235,7 +283,15 @@ Cái giá đã biết của cổng này: một người khách quay lại ở g�
 
 Một người khách thật không bị ảnh hưởng quá một nhịp: 2 giây sau họ vẫn ở đó và được cấp id ngay lúc ấy. Cửa sổ cố tình đặt ~3 nhịp sensing thay vì bắt buộc liền kề tuyệt đối, để một frame bị rớt hoặc bị nhoè ở giữa không reset số đếm của một người khách thật.
 
-**Ghi user là "already present" cũng cần xác nhận như vậy.** Khi một người lạ vào trong lúc chủ nhà đang có box trong cùng frame, `presence.enter` thêm `already present: <tên> (friend)` để agent nói với user thay vì chào người khách (#426). Đoạn đó chỉ được ghi khi một box chủ nhà và một box không-phải-chủ-nhà đã cùng frame `FACE_COPRESENCE_MIN_TICKS` (2) nhịp liên tiếp — box `unsure` cũng tính, nên nhịp recognizer dùng để xác nhận người lạ là nhịp đầu trong hai nhịp, và một người khách thật được liệt kê ngay ở event enter báo về họ. Đặt `HAL_FACE_STRANGER_MIN_TICKS=1` thì bộ đếm chỉ bằng 1 ở nhịp cấp id, nên đoạn này chỉ xuất hiện khi lần flush người lạ tình cờ rơi vào nhịp sau; tăng `HAL_FACE_COPRESENCE_MIN_TICKS` nếu màn hình hay poster sau lưng user cứ bị báo là "có bạn tới".
+Việc kiểm tra ánh nhìn của người lạ dùng lại `GAZE_MAX_YAW_DEG`, `GAZE_EDGE_CONE_SCALE` và `GAZE_MIN_FACE_PX` của gaze wake, nên chỉnh các giá trị đó cho gaze wake cũng làm thay đổi thời điểm người lạ được chào. Nó đo trên box của face-ID chứ không qua bộ chọn mặt của gaze, nên ngưỡng 15% của bộ chọn (`HAL_GAZE_BEARING_MIN_FACE_HEIGHT_FRAC`, #567) không áp dụng cho nó.
+
+Mỗi nhịp face-ID có người lạ chưa được chào trong frame sẽ ghi một dòng log, kèm các số liệu đằng sau lá phiếu của từng người lạ và số phiếu cộng dồn:
+
+```
+[face] stranger gaze: stranger_16 yaw=51.6<=92.6 face=117px>=48 edge=0.68 -> facing 2/2; stranger_17 yaw=70.2>62.4 face=40px<48 edge=0.05 -> away (face too small, turned too far) 0/1; stranger_18 yaw=- face=120px>=48 edge=0.10 -> away (landmarks off-frame) 0/3
+```
+
+`yaw` là góc quay đầu, tính bằng độ, đặt cạnh cone được chấp nhận ở vị trí đó (`GAZE_MAX_YAW_DEG` nới rộng theo `GAZE_EDGE_CONE_SCALE`): `<=` là đạt, `>` là không đạt. `face` là chiều cao khuôn mặt theo pixel của gaze watcher (ảnh rộng 640), đặt cạnh `GAZE_MIN_FACE_PX`: `>=` là đạt, `<` là không đạt. Một nhịp chỉ được tính `facing` khi cả hai đều đạt. `edge` là khoảng cách tới tâm frame (0 = tâm, 1 = mép). Phiếu `away` ghi rõ điều kiện không đạt trong ngoặc: `face too small`, `turned too far`, hoặc khi hoàn toàn không đo được yaw (`yaw=-`) thì là `no keypoints`, `landmarks off-frame`, `no yaw` hay `no frame`. Khuôn mặt không đo được như vậy không bao giờ được tính là đang nhìn, nhưng cũng không phải người lạ đã quay đi.
 
 **Điều chỉnh (Tuning):**
 
@@ -256,8 +312,8 @@ Một người khách thật không bị ảnh hưởng quá một nhịp: 2 gi�
 | Lamp cấp `stranger_N` cho chính chủ trong lúc đang quay | Nhoè do chuyển động — đó là thứ `FACE_MIN_SHARPNESS` lọc ra; xem thư mục `FAIL-blurred` để biết độ nét thực tế |
 | Khách lạ mất quá lâu mới được ghi nhận | Giảm `FACE_STRANGER_MIN_TICKS` xuống 1 để cấp id ngay từ một frame (hành vi cũ) |
 | Vẫn xuất hiện id `stranger_N` giả | Tăng `FACE_STRANGER_MIN_TICKS` lên 3; mỗi bậc khiến khách thật chậm thêm một nhịp sensing |
-| Lamp bảo user "có bạn tới" khi sau lưng là poster hoặc màn hình | Tăng `FACE_COPRESENCE_MIN_TICKS` (2 → 3); khách thật chờ thêm một nhịp trước khi user được gọi tên |
-| Khách bị chào trong lúc user đang ngồi đó, `already present` không bao giờ xuất hiện | Kiểm tra `FACE_STRANGER_MIN_TICKS` ≥ 2 (nhịp xác nhận của nó nuôi bộ đếm); với 1 thì bộ đếm không thể chạm 2 khi cấp id |
+| Lamp không bao giờ chào một vị khách đã nhìn về phía nó | Giảm `FACE_STRANGER_GAZE_MIN_FACING` (2 → 1); kiểm tra `[face] stranger gaze:` trong log HAL |
+| Khách nhìn một lúc ngắn nhưng không được chào vì nhịp chậm hoặc bị bỏ qua | Tăng `FACE_STRANGER_GAZE_WINDOW_S` (10 → 15); quá lớn thì các cái liếc cách nhau vài phút sẽ cộng dồn |
 | Nhận diện chết hẳn trong phòng tối sau khi cập nhật | Phương sai Laplacian giảm theo ánh sáng; giảm `FACE_MIN_SHARPNESS` (100 → 70) rồi kiểm tra lại `FAIL-blurred` |
 | Lamp cấp id `stranger_N` cho chính chủ ở cự ly gần | Detector đang bắt trúng vành tai hoặc tương tự — đó là thứ `HAL_FACE_LANDMARK_CONF_THRESHOLD` 0.99 lọc ra |
 | Mặt rõ ràng bình thường lại ngừng được nhận diện sau khi cập nhật | Giảm `HAL_FACE_LANDMARK_CONF_THRESHOLD` (0.99 → 0.95); mặc định được tinh chỉnh trên một thiết bị |
@@ -288,3 +344,153 @@ Per-face motion mở WS session riêng cho từng khuôn mặt và chạy action
 | Phân loại nhiễu từ frame đơn lẻ | Tăng `MOTION_PER_FACE_MIN_FRAMES` (4 → 8) |
 | Session tồn đọng cho face thoáng qua | Giảm `MOTION_PER_FACE_SESSION_TTL_S` (30 → 15) |
 | WS connection chồng chất khi nhiều người | Tắt bằng `MOTION_PER_FACE_ENABLED=false` |
+
+---
+
+## Speech Emotion Recognition (SER)
+
+**File:** `hal/config.py`, `hal/drivers/voice/voice_service.py` (`_submit_speech_emotion_from_session`, `_identify_and_decorate`, `_session_wav_for_ser`) — xem thêm [speech-emotion_vi.md](../../../../docs/vi/speech-emotion_vi.md) cho toàn bộ kiến trúc. **Tiếng Anh:** [sensing-tuning.md](../sensing-tuning.md) (phần SER), [speech-emotion.md](../../../../docs/speech-emotion.md).
+
+**Tích hợp voice (cuối phiên mic, độc lập transcript):** trong khối `finally` của mọi phiên mic (VAD trigger → ~2.5 giây im lặng), `_stream_session` `_identify_and_decorate(final_text, audio_buffer)` chạy **đúng 1 lần** để lấy đồng thời `final_msg` (cho Lamp POST khi STT có chữ) và `user_name` (cho SER submit). Sau đó gọi `_submit_speech_emotion_from_session(audio_buffer, user=...)` — chỉ build WAV và `SpeechEmotionService.submit`, không gọi speaker lần 2. Người không match / lỗi speaker vẫn enqueue SER dưới key dedup chung `unknown` nếu audio đủ dài.
+
+```python
+SPEECH_EMOTION_ENABLED: bool = _cloud_perception_enabled("speech_emotion")  # owner opt-in, off by default
+SPEECH_EMOTION_FLUSH_S = 10.0               # Chu kỳ drain buffer theo user
+SPEECH_EMOTION_DEDUP_WINDOW_S = 300.0       # TTL (user, bucket) — 5 phút
+SPEECH_EMOTION_MIN_AUDIO_S = 3.0            # Bỏ utterance ngắn hơn (mặc định config)
+SPEECH_EMOTION_API_TIMEOUT_S = 15           # Timeout HTTP perception-service
+DL_SER_ENDPOINT = "/lelamp/api/dl/ser/recognize"
+```
+
+Ngưỡng confidence **per-label** không nằm trong `config.py` — khai báo trong `hal/drivers/voice/speech_emotion/constants.py` qua `CONFIDENCE_THRESHOLD_BY_LABEL` (và `DEFAULT_CONFIDENCE_THRESHOLD` cho label không map). Negative emotion siết chặt hơn positive để giảm false positive:
+
+```python
+# constants.py
+CONFIDENCE_THRESHOLD_BY_LABEL = {
+    "happy":     0.5,
+    "surprised": 0.6,
+    "sad":       0.6,
+    "angry":     0.6,
+    "fearful":   0.7,
+    "disgusted": 0.7,
+}
+DEFAULT_CONFIDENCE_THRESHOLD = 0.5
+```
+
+Sửa trực tiếp dict để tune — không còn env override.
+
+**Đọc log:**
+
+Service gắn tag `[speech_emotion]`:
+
+```
+INFO lelamp.voice.speech_emotion: [speech_emotion] buffered: alice -> sad (0.72, 2.40s)
+INFO lelamp.voice.speech_emotion: [speech_emotion] flushing alice: Speech emotion detected: Sad. (weak voice cue; confidence=0.72; bucket=negative; ...) (mode of sad, fearful, sad)
+INFO lelamp.voice.speech_emotion: [speech_emotion] sent to Lamp: Speech emotion detected: Sad. ...
+INFO lelamp.voice.speech_emotion: [speech_emotion] dedup drop: angry bucket=negative (key seen 87.4s ago)
+```
+
+Dòng `flushing` hiển thị danh sách label thô — đó là mode trên các mẫu trong buffer.
+
+**Tuning:**
+
+| Triệu chứng | Cách chỉnh |
+|-------------|------------|
+| Cùng bucket fire quá thường xuyên | Tăng `SPEECH_EMOTION_DEDUP_WINDOW_S` (300 → 600) |
+| Một utterance nhiễu vẫn lọt | Tăng entry tương ứng trong `CONFIDENCE_THRESHOLD_BY_LABEL` (`constants.py`) — ví dụ `"sad": 0.6 → 0.7`. Chỉ tăng `DEFAULT_CONFIDENCE_THRESHOLD` khi nhiễu diện rộng |
+| "Ừ" / "ok" ngắn bị flag | Tăng `SPEECH_EMOTION_MIN_AUDIO_S` (3.0 → 4.0) |
+| Lamp phản ứng chậm sau đổi mood thật | Giảm `SPEECH_EMOTION_FLUSH_S` (10 → 5) |
+| Cảnh báo worker queue full | Kiểm tra độ trễ perception-service; tăng queue không đủ nếu downstream kẹt |
+| Quá nhiều `speech_emotion.detected` cho người lạ | **Kỳ vọng:** `user="unknown"`; siết entry per-label trong `CONFIDENCE_THRESHOLD_BY_LABEL` (`constants.py`) hoặc dedup — **không** tắt SER chỉ vì transcript có `Unknown Speaker:` |
+
+
+---
+
+<a id="fire-hazard"></a>
+## Nguy cơ cháy (Fire Hazard)
+
+**File:** `hal/config.py`, `hal/drivers/sensing/perceptions/processors/fire_hazard.py`,
+`hal/drivers/sensing/perceptions/processors/fire_gate.py`. Pipeline hoạt động thế nào:
+[Hành vi cảm nhận](sensing-behavior_vi.md#fire-hazard). Chỉ chạy khi chủ máy bật opt-in
+`cloud_perception.fire_hazard` (không phải biến env).
+
+| Biến env | Mặc định | Tác dụng |
+|---|---|---|
+| `HAL_FIRE_HAZARD_CHECK_INTERVAL_S` | `5.0` | Khoảng cách tối thiểu giữa hai lượt kiểm tra. Lượt kiểm tra chạy theo tick sensing 2 s, nên 5 s nghĩa là khoảng 6 s một lần; 0 thì kiểm tra mỗi tick |
+| `HAL_FIRE_HAZARD_GATE_SCORE_THRESHOLD` | `0.2` | Gate trên đèn: điểm `fire`/`smoke` từ mức này trở lên thì gửi frame tới OWLv2 và bắt đầu escalation |
+| `HAL_FIRE_HAZARD_GATE_MODEL_PATH` | `/root/local/models/yolo26s_fire_e2e_320.onnx` | File model gate (thư mục theo `HAL_FACE_MODEL_PATH` nếu biến đó được đặt) |
+| `HAL_FIRE_HAZARD_GATE_MODEL_URL` | CDN model `onnx_models/yolo26s_fire_e2e_320.onnx` | Nơi tải model gate ở lần dùng đầu tiên |
+| `HAL_FIRE_HAZARD_GATE_THREADS` | `2` | Số thread intra-op của ONNX Runtime cho gate (CPU, core chậm) |
+| `HAL_FIRE_HAZARD_ESCALATION_HOLD_S` | `10.0` | OWLv2 tiếp tục chạy mỗi lượt kiểm tra cho tới chừng này giây sau lần cuối nó thấy lửa/khói |
+| `HAL_FIRE_HAZARD_PRESET` | `fire_hazard_v1` | Preset prompt của server, gửi thay cho 46 chuỗi class; rỗng = luôn gửi class |
+| `HAL_FIRE_HAZARD_DETECTOR` | `owlv2` | Tên detector trong đường dẫn endpoint mặc định |
+| `DL_FIRE_HAZARD_ENDPOINT` | `/detect/<detector>` | Đường dẫn endpoint nối vào sau `DL_BACKEND_URL` |
+| `HAL_FIRE_HAZARD_API_TIMEOUT_S` | `15.0` | Timeout HTTP của OWLv2 |
+| `HAL_FIRE_HAZARD_CONFIDENCE_THRESHOLD` | `0.3` | Detection của OWLv2 dưới mức này bị bỏ |
+| `HAL_FIRE_HAZARD_OVERLAP_THRESHOLD` | `0.2` | Mức chồng lấn lửa/vật tối thiểu để thành `safe_fire` hoặc `hazard_fire`; dưới mức này lửa là `unsure_fire` |
+| `HAL_FIRE_HAZARD_CONFIRM_S` | `10.0` | OWLv2 phải liên tục thấy lửa (hoặc khói) trong bao lâu mới cảnh báo |
+| `HAL_FIRE_HAZARD_FLUSH_S` | `10.0` | Khoảng cách tối thiểu giữa hai event `fire_hazard.detected` |
+| `HAL_FIRE_HAZARD_DEDUP_WINDOW_S` | `1800.0` | Nhịp nhắc lại cho `safe_fire` còn được xác nhận (30 phút) |
+| `HAL_FIRE_HAZARD_REALERT_S` | `60.0` | Nhịp nhắc lại cho `hazard_fire`, `unsure_fire` hoặc `smoke` còn được xác nhận |
+
+Cố định trong code, không có env: streak có lần thấy cuối cũ hơn 30 s thì bắt đầu lại
+(`_STREAK_MAX_GAP_S`); thời gian tạm dừng sau 429 là 5 s, gấp đôi sau mỗi lần 429 liên
+tiếp, tối đa 60 s, jitter ±20 % (`_RATE_LIMIT_BACKOFF_*`); model gate nạp lỗi được thử lại
+mỗi 10 phút (`_LOAD_RETRY_S` trong `fire_gate.py`).
+
+**Cách đọc log:**
+
+```bash
+tail -f /var/log/hal/server.log | grep -E '\[fire_(hazard|gate)\]'
+```
+
+```
+[fire_gate] model ready in <ms> ms (/root/local/models/yolo26s_fire_e2e_320.onnx, 320x320, 2 threads, threshold 0.20, names {...})
+[fire_hazard] gate hit: fire 0.41 — escalating to OWLv2
+[fire_hazard] Fire hazard detected: hazard_fire (1 snapshots)
+[fire_gate] model unavailable (...); OWLv2 runs every check until it loads
+[fire_hazard] preset fire_hazard_v1 rejected (400), retrying with classes
+[fire_hazard] preset response has no known classes; is the server older than the preset?
+[fire_hazard] HTTP 429 (quota) — pausing detection for 6s: ...
+```
+
+Dòng telemetry `fire_hazard_stats` mỗi giờ (các field ở
+[Hành vi cảm nhận](sensing-behavior_vi.md#fire-hazard)) cho cùng bức tranh trên cả đội
+máy: `gate_hits`, `escalations`, `owlv2_calls` và các số đếm lỗi.
+
+**Tuning:**
+
+| Triệu chứng | Cách chỉnh |
+|-------------|------------|
+| Lửa nhìn thấy rõ mà không bao giờ có log `gate hit` | Giảm `HAL_FIRE_HAZARD_GATE_SCORE_THRESHOLD` (0.2 → 0.15); nhiều frame tới OWLv2 hơn |
+| Một đèn escalation liên tục (`gate_hits` / `escalations` cao, `owlv2_calls` gần bằng số lượt kiểm tra) | Xem trong khung hình có gì (TV, chói sáng, nến đang cháy); chỉ tăng `HAL_FIRE_HAZARD_GATE_SCORE_THRESHOLD` (0.2 → 0.3) nếu đó không phải lửa thật |
+| `gate_unavailable` cao, hoặc log có `model unavailable` | Kiểm tra việc tải từ `HAL_FIRE_HAZARD_GATE_MODEL_URL` và file ở `HAL_FIRE_HAZARD_GATE_MODEL_PATH`; cho tới khi nạp được, OWLv2 chạy mỗi lượt kiểm tra |
+| Gate tốn CPU quá | Giảm `HAL_FIRE_HAZARD_GATE_THREADS` (2 → 1); mỗi frame chạy lâu hơn |
+| Cảnh báo đến quá muộn | Giảm `HAL_FIRE_HAZARD_CONFIRM_S` (10 → 6) hoặc `HAL_FIRE_HAZARD_CHECK_INTERVAL_S` (5 → 3, khoảng 4 s một lần); cả hai đều làm tăng cảnh báo sai hoặc lượt upload |
+| Cảnh báo sai vì lửa lóe lên chốc lát | Tăng `HAL_FIRE_HAZARD_CONFIRM_S` (10 → 15) hoặc `HAL_FIRE_HAZARD_CONFIDENCE_THRESHOLD` (0.3 → 0.4) |
+| Nguy cơ thật nhắc lại quá dày | Tăng `HAL_FIRE_HAZARD_REALERT_S` (60 → 120) |
+| Lò sưởi hoặc nến cảnh báo quá thường xuyên | Tăng `HAL_FIRE_HAZARD_DEDUP_WINDOW_S` (1800 → 3600) |
+| `owlv2_preset_fallback` > 0, hoặc log có `rejected (400)` | Server không biết preset: deploy server, hoặc đặt `HAL_FIRE_HAZARD_PRESET=` để gửi class |
+| Cảnh báo `preset response has no known classes` | Server cũ hơn preset nên bỏ qua nó: deploy server trước |
+| `owlv2_timeout` cao | Kiểm tra độ trễ DL backend; chỉ tăng `HAL_FIRE_HAZARD_API_TIMEOUT_S` nếu reply chậm nhưng vẫn về |
+
+---
+
+## Áp dụng thay đổi
+
+Sau khi sửa `hal/config.py` hoặc `voice_service.py` trên Pi:
+
+```bash
+sudo systemctl restart lelamp
+tail -f /var/log/hal/server.log
+```
+
+Không cần reboot — chỉ cần restart service.
+
+### Noise guard sau thu âm (thử nghiệm lamp-52e6)
+
+Bộ giá trị đã đo là `HAL_SILERO_THRESHOLD=0.15`, `HAL_REALTIME_NOISE_SPEECH_RATIO=0.45`, và `HAL_VOICE_NOISE_MIN_VOICED_MS=160` trong `/opt/hal/.env`, sau đó restart HAL. Điều kiện thời lượng cần code hỗ trợ key mới; chỉ hạ ratio không loại được xung nhiễu ngắn có ratio cao. Các giá trị này được lưu trong `robots/lamp/rootfs/opt/hal/.env` làm mặc định của profile lamp. Mặc định chung trong code vẫn là ratio `0.55` và thời lượng tối thiểu `0`; các biến thể mic vẫn cần kiểm chứng âm học riêng.
+
+Ngày 2026-10-08, 12 lượt thu qua pipeline sau AEC hiện có gồm nền (6), servo (3), và vọng loa (3). Replay trên device dùng hai câu người thật đã lưu cùng 14 biến thể giảm âm lượng/thêm im lặng. Guard cũ chỉ xét ratio nhận 7/12 mẫu nhiễu và 15/16 mẫu lời nói; bộ thử nhận tương ứng 0/12 và 16/16. Đây là quyết định của guard, không phải tỷ lệ dispatch nhầm đầu-cuối. Các biến thể không phải mẫu người nói độc lập; tuning và đánh giá dùng cùng bộ mẫu nhỏ, vẫn cần kiểm chứng thêm lời nói, tiếng tap vật lý và sleep/wake.
+
+Guard cũng áp dụng trong automatic và trước fallback OS khi realtime tắt/không khả dụng. Chỉ transcript rỗng/ngắn được chính sách hiện có chọn mới bị kiểm tra; các bộ lọc transcript khác giữ nguyên. Log có `voiced_ms`, `min_ratio`, `min_voiced_ms`, và `accepted`. Thời lượng là tổng audio voiced, không phải thời gian chờ bắt buộc: quyết định bổ sung chỉ tính toán trên kết quả Silero đã có.

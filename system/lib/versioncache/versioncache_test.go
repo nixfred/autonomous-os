@@ -1,6 +1,7 @@
 package versioncache
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -9,8 +10,7 @@ import (
 	"time"
 )
 
-// writeBin writes size bytes to path and stamps a distinct mtime so two writes
-// never produce the same stamp on a coarse-grained filesystem clock.
+// writeBin writes size bytes to path with a distinct mtime.
 func writeBin(t *testing.T, path string, size int, mtime time.Time) {
 	t.Helper()
 	if err := os.WriteFile(path, make([]byte, size), 0755); err != nil {
@@ -21,8 +21,7 @@ func writeBin(t *testing.T, path string, size int, mtime time.Time) {
 	}
 }
 
-// waitFor polls cond for up to a second — the refresh probe runs in its own
-// goroutine, so the new version lands shortly after the Get that triggered it.
+// waitFor polls cond for up to a second (the refresh probe is async).
 func waitFor(t *testing.T, cond func() bool) bool {
 	t.Helper()
 	deadline := time.Now().Add(time.Second)
@@ -40,7 +39,7 @@ func TestGetRefreshesAfterBinaryChange(t *testing.T) {
 	writeBin(t, bin, 10, time.Now().Add(-time.Hour))
 
 	var probes atomic.Int64
-	c := New(bin, "test-probe", func() (string, bool) {
+	c := New(bin, "test-probe", func(context.Context) (string, bool) {
 		return fmt.Sprintf("1.0.%d", probes.Add(1)), true
 	})
 
@@ -67,7 +66,7 @@ func TestFailedProbeDoesNotReprobeUntilBinaryChanges(t *testing.T) {
 	writeBin(t, bin, 10, time.Now().Add(-time.Hour))
 
 	var probes atomic.Int64
-	c := New(bin, "test-probe", func() (string, bool) {
+	c := New(bin, "test-probe", func(context.Context) (string, bool) {
 		probes.Add(1)
 		return "", false
 	})
@@ -89,7 +88,7 @@ func TestMissingBinaryKeepsCachedVersion(t *testing.T) {
 	bin := filepath.Join(t.TempDir(), "opencode")
 	writeBin(t, bin, 10, time.Now().Add(-time.Hour))
 
-	c := New(bin, "test-probe", func() (string, bool) { return "2.3.4", true })
+	c := New(bin, "test-probe", func(context.Context) (string, bool) { return "2.3.4", true })
 	c.Populate(0, 0)
 	if err := os.Remove(bin); err != nil {
 		t.Fatalf("remove %s: %v", bin, err)

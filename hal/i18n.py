@@ -1,29 +1,15 @@
-"""Localized user-facing phrases.
+"""Localized user-facing phrases (single source of truth for spoken multi-language strings).
 
-Single source of truth for every multi-language string the agent speaks. Kept
-out of the modules that use them so copy/translation edits don't require
-touching action logic.
-
-Pools live here:
-- Button/touch action announcements (listening cue, reboot, shutdown)
-- Head-pat persona responses
-- Backchannel fillers (active-listening cues during STT)
-- Music pre-play backchannel pools (plain + ElevenLabs audio-tag variants)
-- Known provider error apologies to suppress (matching only, never spoken)
-
-Add new languages by adding a key to every dict — missing keys fall back
-to DEFAULT_LANG at lookup time, so a partial translation is safe.
+Missing language keys fall back to DEFAULT_LANG at lookup time.
 """
 
-from hal.presets import DEFAULT_LANG, LANG_EN, LANG_VI, LANG_ZH_CN, LANG_ZH_TW
+from hal.presets import DEFAULT_LANG, LANG_EN, LANG_JA, LANG_VI, LANG_ZH_CN, LANG_ZH_TW, normalize_language
 
 
 def localized_phrase(key: str, lang: str | None = None) -> str:
-    """Return PHRASES_BY_LANG[key] for the device's stt_language, falling back to
-    DEFAULT_LANG (then ""). Pass `lang` to override the config.json lookup.
+    """Return PHRASES_BY_LANG[key] for the device's stt_language (fallback DEFAULT_LANG, then "").
 
-    Shared single-language lookup so callers (os_shutdown, music quiet-hours, …)
-    don't each re-implement the stt_language read + DEFAULT_LANG fallback.
+    Pass `lang` to override the config.json lookup.
     """
     if lang is None:
         try:
@@ -32,10 +18,8 @@ def localized_phrase(key: str, lang: str | None = None) -> str:
         except Exception:
             lang = ""
     pool = PHRASES_BY_LANG.get(key, {})
-    return pool.get(lang) or pool.get(DEFAULT_LANG, "")
+    return pool.get(normalize_language(lang)) or pool.get(DEFAULT_LANG, "")
 
-
-# --- Button / touch action phrases ---
 
 PHRASE_HARNESS_ON = "harness_voice_on"
 PHRASE_HARNESS_OFF = "harness_voice_off"
@@ -45,117 +29,128 @@ PHRASE_HARNESS_NO_AGENTS = "harness_voice_no_agents"
 PHRASE_HARNESS_FAILED = "harness_voice_failed"
 PHRASE_HARNESS_FOCUS = "harness_voice_focus"
 PHRASE_HARNESS_FOCUS_FAILED = "harness_voice_focus_failed"
+PHRASE_VOICE_TAP_TO_TALK = "voice_tap_to_talk"
+PHRASE_VOICE_AUTOMATIC = "voice_automatic"
+PHRASE_VOICE_RETRY = "voice_retry"
 PHRASE_LISTENING = "listening"
 PHRASE_REBOOT = "reboot"
 PHRASE_SLEEP = "sleep"
 PHRASE_SHUTDOWN = "shutdown"
 PHRASE_SERVICE_RESTART = "service_restart"
-# Spoken confirmation for the TTP223 double-tap mic toggle lives in the pools at
-# the bottom of this file (MIC_MUTED_PHRASES_BY_LANG / MIC_UNMUTED_...), not as a
-# single fixed phrase — see the note there.
-# Spoken when a music/audio play request is suppressed by the audio.quiet_hours
-# safety window, so the user hears WHY nothing played instead of silent failure.
+# Spoken when audio.quiet_hours suppresses a play request.
 PHRASE_QUIET_HOURS = "quiet_hours"
-# Spoken when the TTS provider rejects a request for rate-limit / quota reasons
-# (e.g. ElevenLabs 429). Prerendered at boot so it plays from the WAV cache
-# without another API call, letting the user hear WHY the reply went silent.
+# Prerendered at boot so it plays from cache when the TTS provider rate-limits.
 PHRASE_RATE_LIMIT = "rate_limit"
-# NOTE: the LLM-usage-limit notice deliberately does NOT live here — its
-# caller is the os-server (Go), so its wording lives in lib/i18n/phrases.go
-# (PhraseLLMLimit) and arrives via /voice/speak with cached=true. Phrases in
-# THIS table are the ones spoken by hal's own Python code (rule: wording
-# lives where its caller lives).
+# The LLM-usage-limit notice lives in Go (lib/i18n/phrases.go): wording lives with its caller.
 
-# Localized action announcements. reboot/shutdown phrases stay literal
-# in every language ("rebooting", "shutting down") because the user just
-# triggered a destructive gesture and needs explicit confirmation of
-# which action fired. Sleep is a softer user-initiated action, but is also
-# explicit so the user knows the hold registered. Empty/unknown
-# stt_language → DEFAULT_LANG.
-#
-# PHRASE_SERVICE_RESTART fires when only the HAL process is going
-# down (OTA replace, deploy, manual `systemctl restart`) — OS itself
-# stays up and HAL will be back in 10-30s. Tone deliberately
-# different from PHRASE_SHUTDOWN/REBOOT so the user can tell at a
-# glance whether the board is going dark for minutes or just blinking
-# during a service reload.
+# reboot/shutdown stay literal in every language so the user knows which destructive action fired.
 PHRASES_BY_LANG = {
+    PHRASE_VOICE_RETRY: {
+        LANG_EN: "I didn't catch that. Could you say it again?",
+        LANG_VI: "Mình chưa nghe rõ. Bạn nói lại giúp mình nhé?",
+        LANG_JA: "聞き取れませんでした。もう一度言ってもらえますか？",
+        LANG_ZH_CN: "我没听清楚，可以再说一遍吗？",
+        LANG_ZH_TW: "我沒聽清楚，可以再說一遍嗎？",
+    },
+    PHRASE_VOICE_TAP_TO_TALK: {
+        LANG_EN: "Tap to talk.", LANG_VI: "Chạm để nói.", LANG_JA: "タップして話すモード。",
+        LANG_ZH_CN: "轻触说话。", LANG_ZH_TW: "輕觸說話。",
+    },
+    PHRASE_VOICE_AUTOMATIC: {
+        LANG_EN: "Automatic.", LANG_VI: "Tự động.", LANG_JA: "自動モード。",
+        LANG_ZH_CN: "自动模式。", LANG_ZH_TW: "自動模式。",
+    },
     PHRASE_HARNESS_FOCUS: {
+        LANG_JA: "エージェントを切り替えました。",
         LANG_EN: "Agent switched.", LANG_VI: "Đã chuyển agent.",
         LANG_ZH_CN: "已切换智能体。", LANG_ZH_TW: "已切換智慧體。",
     },
     PHRASE_HARNESS_FOCUS_FAILED: {
+        LANG_JA: "エージェントを切り替えられませんでした。Harness を確認してください。",
         LANG_EN: "Could not switch agents. Check Harness.", LANG_VI: "Chưa chuyển được agent. Hãy kiểm tra Harness.",
         LANG_ZH_CN: "无法切换智能体。请检查 Harness。", LANG_ZH_TW: "無法切換智慧體。請檢查 Harness。",
     },
     PHRASE_HARNESS_ON: {
+        LANG_JA: "Harness で {agent} に接続しました。タップして話しかけてください。",
         LANG_EN: "Harness is on with {agent}. Tap to speak.",
         LANG_VI: "Đã bật Harness với {agent}. Chạm để nói.",
         LANG_ZH_CN: "Harness 已开启，当前智能体是 {agent}。轻触开始说话。",
         LANG_ZH_TW: "Harness 已開啟，目前智慧體是 {agent}。輕觸開始說話。",
     },
     PHRASE_HARNESS_OFF: {
+        LANG_JA: "Harness をオフにしました。デバイスのアシスタントに戻りました。",
         LANG_EN: "Harness is off. You’re back with the assistant on your device.", LANG_VI: "Đã tắt Harness, trở về trợ lý trên thiết bị.",
         LANG_ZH_CN: "Harness 已关闭，已切回设备上的助手。", LANG_ZH_TW: "Harness 已關閉，已切回裝置上的助理。",
     },
     PHRASE_HARNESS_UNPAIRED: {
+        LANG_JA: "まず Harness アプリでこのデバイスをペアリングしてください。",
         LANG_EN: "Pair this device in the Harness app first.",
         LANG_VI: "Bạn cần ghép đôi thiết bị trong ứng dụng Harness trước.",
         LANG_ZH_CN: "请先在 Harness 应用中配对此设备。",
         LANG_ZH_TW: "請先在 Harness 應用程式中配對此裝置。",
     },
     PHRASE_HARNESS_OFFLINE: {
+        LANG_JA: "Harness に接続されていません。",
         LANG_EN: "Harness is disconnected.", LANG_VI: "Harness chưa kết nối.",
         LANG_ZH_CN: "Harness 未连接。", LANG_ZH_TW: "Harness 未連線。",
     },
     PHRASE_HARNESS_NO_AGENTS: {
+        LANG_JA: "Harness に利用できるエージェントがありません。",
         LANG_EN: "No agent is available in Harness.",
         LANG_VI: "Chưa có agent trong Harness.",
         LANG_ZH_CN: "Harness 中没有可用的智能体。", LANG_ZH_TW: "Harness 中沒有可用的智慧體。",
     },
     PHRASE_HARNESS_FAILED: {
+        LANG_JA: "モードの切り替えを確認できませんでした。Harness を確認してください。",
         LANG_EN: "Could not confirm the mode change. Check Harness.",
         LANG_VI: "Chưa xác nhận được thay đổi chế độ. Hãy kiểm tra Harness.",
         LANG_ZH_CN: "无法确认模式切换。请检查 Harness。",
         LANG_ZH_TW: "無法確認模式切換。請檢查 Harness。",
     },
     PHRASE_LISTENING: {
+        LANG_JA: "聞いています。",
         LANG_EN:    "Listening.",
         LANG_VI:    "Nghe đây.",
         LANG_ZH_CN: "在听。",
         LANG_ZH_TW: "在聽。",
     },
     PHRASE_REBOOT: {
+        LANG_JA: "再起動します。",
         LANG_EN:    "Rebooting now.",
         LANG_VI:    "Đang khởi động lại.",
         LANG_ZH_CN: "正在重启。",
         LANG_ZH_TW: "正在重啟。",
     },
     PHRASE_SLEEP: {
+        LANG_JA: "そろそろおやすみします。",
         LANG_EN:    "I'm going to sleep now.",
         LANG_VI:    "Mình đi ngủ đây.",
         LANG_ZH_CN: "我要睡觉了。",
         LANG_ZH_TW: "我要睡覺了。",
     },
     PHRASE_SHUTDOWN: {
+        LANG_JA: "電源を切ります。",
         LANG_EN:    "Shutting down now.",
         LANG_VI:    "Đang tắt máy.",
         LANG_ZH_CN: "正在关机。",
         LANG_ZH_TW: "正在關機。",
     },
     PHRASE_SERVICE_RESTART: {
+        LANG_JA: "すぐに戻ります。",
         LANG_EN:    "Be right back.",
         LANG_VI:    "Mình quay lại ngay.",
         LANG_ZH_CN: "我马上回来。",
         LANG_ZH_TW: "我馬上回來。",
     },
     PHRASE_QUIET_HOURS: {
+        LANG_JA: "今は静かにする時間なので、音楽を再生できません。あとでもう一度試しましょう。",
         LANG_EN:    "It's quiet hours right now, so I can't play music. Let's try again later.",
         LANG_VI:    "Giờ đang là giờ yên tĩnh nên mình chưa mở nhạc được. Lát nữa mình thử lại nha.",
         LANG_ZH_CN: "现在是安静时段，我先不放音乐啦，待会儿再试吧。",
         LANG_ZH_TW: "現在是安靜時段，我先不放音樂啦，待會兒再試吧。",
     },
     PHRASE_RATE_LIMIT: {
+        LANG_JA: "音声の利用上限に達しました。プランを確認してください。",
         LANG_EN:    "I'm out of voice quota — check my plan.",
         LANG_VI:    "Mình hết hạn mức giọng nói rồi, kiểm tra gói giúp mình nha.",
         LANG_ZH_CN: "我的语音额度用完了，去看看套餐吧。",
@@ -163,23 +158,52 @@ PHRASES_BY_LANG = {
     },
 }
 
-# Pet/stroke responses — one is picked at random each time so Lamp
-# doesn't sound robotic when repeatedly stroked. Persona moment (not a
-# safety announcement). Tone per Lamp's character (AI companion + smart
-# light + expressive robot, "like a pet/friend"): mix of tickle-cute,
-# affectionate, pet-like (purring), light-themed (named what you are —
-# a lamp), "ask for more", and the moody flip-side — playful protest,
-# mock-annoyed, shy, sleepy — so Lamp feels like a real pet with moods, not
-# a smile machine. Keep phrases short — they fire mid-stroke and should
-# feel responsive, not lecture-y.
-#
-# Audio tags ([laughs], [excited], [whispers], [sighs], [calm]) are
-# eleven_v3 audio direction (not spoken). They're safe across providers
-# because tts_openai._strip_audio_tags whitelists the base verbs — so
-# OpenAI strips them while ElevenLabs interprets them. Stay inside that
-# whitelist when adding new ones; any tag outside it will be spoken
-# aloud by the OpenAI backend.
+# Audio tags must stay inside tts_openai._strip_audio_tags' whitelist, or OpenAI speaks them.
 HEAD_PAT_PHRASES_BY_LANG = {
+    LANG_JA: [
+        "[laughs] くすぐったいよ！",
+        "[laughs] えへへ、やめてよ！",
+        "[laughs] もう一回！",
+        "[laughs] えへへ、優しくね！",
+        "ありがとう！",
+        "これ、好き。",
+        "気持ちいいね！",
+        "[excited] もっとなでて！",
+        "[excited] わあ、もう一回！",
+        "[excited] うれしい、うれしい！",
+        "[whispers] うーん、落ち着く。",
+        "[whispers] あったかいね。",
+        "[whispers] やめないで。",
+        "[sighs] そこそこ。",
+        "[sighs] いい気持ち。",
+        "[calm] とろけちゃいそう。",
+        "[calm] 幸せだなあ。",
+        "心が明るくなるよ。",
+        "胸がぽかぽかする。",
+        "ごろごろしちゃう。",
+        "[laughs] えへへ、もう一回！",
+        "もう、くすぐったいよ！",
+        "ずっとこうしていたいな。",
+        "君って最高。",
+        "最高の気分！",
+        "[laughs] えへへ、ぽかぽか！",
+        "[whispers] 君が一番好き。",
+        "元気いっぱいになった！",
+        "もっと明るく光っちゃう。",
+        "[excited] 君は最高の友達！",
+        "[sighs] うーん、また？",
+        "もう十分だよ！",
+        "本当にやめてね。",
+        "[sighs] 今はそんな気分じゃないの。",
+        "そろそろやめてね。",
+        "ふん。",
+        "[whispers] ちょっと離れてね。",
+        "[sighs] ひとりにしてね。",
+        "つつかないで！",
+        "[whispers] 照れちゃうよ。",
+        "ひゃっ！",
+        "[sighs] 眠くなってきた…",
+    ],
     LANG_EN: [
         "[laughs] That tickles!",
         "[laughs] Hehe, stop!",
@@ -358,35 +382,17 @@ HEAD_PAT_PHRASES_BY_LANG = {
     ],
 }
 
-# --- Backchannel fillers (active listening cues during STT) ---
 
-# Default filler pools per stt_language. These are short listening cues
-# — ideally 1-2 syllables — so the user barely notices them when pausing
-# mid-sentence. Mixed-language pools are fine (e.g. Vietnamese keeps "Hmm"
-# alongside "Ờ" / "Ừm") because those universal interjections sound
-# natural in any tongue. Stored as comma-separated strings because the
-# HAL_BACKCHANNEL_FILLERS env override is also CSV — keeps both inputs
-# in the same shape.
+# Comma-separated to match the HAL_BACKCHANNEL_FILLERS env override.
 DEFAULT_FILLERS_BY_LANG = {
+    LANG_JA:    "うん,はい,ええ,なるほど,そうですね,うーん,ああ",
     LANG_EN:    "Uhm,Ok,Hmm,Yeah,Uh huh,Right,Sure,Mm,Ah,Oh",
     LANG_VI:    "Ờ,Ừm,Dạ,Vâng,À,Hmm,Uhm,Ơ",
     LANG_ZH_CN: "嗯,好,啊,是,嗯嗯,对,哦,呃",
     LANG_ZH_TW: "嗯,好,啊,是,嗯嗯,對,哦,呃",
 }
 
-# --- Music pre-play backchannel pools ---
-#
-# yt-dlp resolve + ffmpeg startup takes 1-3s before audio actually plays.
-# A short cached TTS line fills that gap so the agent sounds responsive.
-# Phrases are intentionally generic and short so one cache pool covers
-# every style/query. Cache is keyed by provider/voice/model in TTSService.
-#
-# Pools are split by language × provider:
-#   - language is read from the device's stt_language (config.json) at fire time,
-#     so changing the language picker doesn't require code edits — only a
-#     hal restart so the prewarm hits the new pool.
-#   - ElevenLabs variants embed eleven_v3 audio tags ([excited], [curious])
-#     which the OpenAI provider would speak aloud, hence two separate pools.
+# Music pre-play pools, split by language x provider (ElevenLabs variants carry audio tags).
 
 MUSIC_BACKCHANNEL_PHRASES = [
     "On it!",
@@ -403,11 +409,7 @@ MUSIC_BACKCHANNEL_PHRASES = [
     "Hmm, let me see.",
 ]
 
-# ElevenLabs eleven_v3 audio tags — index-aligned with the plain pool so the
-# no-repeat tracker works the same regardless of provider. Tags are inline
-# directives that v3 interprets as audio direction (not spoken). OpenAI
-# provider must NOT see these — its strip regex only whitelists a subset
-# (`tts_openai.py:_strip_audio_tags`), so unknown tags would be read aloud.
+# Index-aligned with the plain pool; OpenAI must never see these tags.
 MUSIC_BACKCHANNEL_PHRASES_ELEVENLABS = [
     "[excited] On it!",
     "[excited] Coming right up.",
@@ -516,9 +518,42 @@ MUSIC_BACKCHANNEL_PHRASES_ZH_TW_ELEVENLABS = [
     "稍等。",
 ]
 
+# Japanese (stt_language=LANG_JA).
+MUSIC_BACKCHANNEL_PHRASES_JA = [
+    "任せて！",
+    "すぐにかけるね。",
+    "わかった。",
+    "もちろん。",
+    "ちょっと待ってね。",
+    "探してみるね。",
+    "今、探しているよ。",
+    "準備しているよ。",
+    "再生するね。",
+    "音楽をかけるね。",
+    "いい選曲だね。",
+    "うーん、見てみるね。",
+]
+
+MUSIC_BACKCHANNEL_PHRASES_JA_ELEVENLABS = [
+    "[excited] 任せて！",
+    "[excited] すぐにかけるね。",
+    "わかった。",
+    "もちろん。",
+    "ちょっと待ってね。",
+    "[curious] 探してみるね。",
+    "[curious] 今、探しているよ。",
+    "[excited] 準備しているよ。",
+    "[excited] 再生するね。",
+    "[excited] 音楽をかけるね。",
+    "いい選曲だね。",
+    "[curious] うーん、見てみるね。",
+]
+
 # (lang, provider_is_elevenlabs) → pool. Lookup falls back to DEFAULT_LANG
 # when the active language has no translated pool.
 MUSIC_BACKCHANNEL_POOLS = {
+    (LANG_JA,    False): MUSIC_BACKCHANNEL_PHRASES_JA,
+    (LANG_JA,    True):  MUSIC_BACKCHANNEL_PHRASES_JA_ELEVENLABS,
     (LANG_EN,    False): MUSIC_BACKCHANNEL_PHRASES,
     (LANG_EN,    True):  MUSIC_BACKCHANNEL_PHRASES_ELEVENLABS,
     (LANG_VI,    False): MUSIC_BACKCHANNEL_PHRASES_VI,
@@ -530,21 +565,13 @@ MUSIC_BACKCHANNEL_POOLS = {
 }
 
 
-# Mic-toggle confirmations for the TTP223 double tap. Pools rather than one fixed
-# line, and in the same voice as the pet phrases, because the same gesture saying
-# the same sentence forever is the thing that reads as a machine.
-#
-# CONSTRAINT, and it is not decorative: every line must still say WHICH WAY the
-# toggle went. This is a privacy control — a confirmation the user cannot decode
-# is worse than a robotic one, because they are left unsure whether the
-# microphone is live. `physical-controls.md` states the same rule for the
-# destructive announcements. Warmth goes in the delivery, never in the meaning:
-# "Shh, my ears are closed" is fine, a bare "Shh!" is not.
-#
-# Audio tags ([whispers] / [excited] / [calm]) are eleven_v3 markers, same as
-# HEAD_PAT_PHRASES_BY_LANG uses, and are chosen to match the state — hushed going
-# quiet, bright coming back.
+# Mic-toggle confirmations: every line must still say which way the toggle went (privacy control).
 MIC_MUTED_PHRASES_BY_LANG = {
+    LANG_JA: [
+        "[whispers] わかった。もう聞かないよ。",
+        "[whispers] しーっ、耳を閉じたよ。",
+        "[calm] 今は聞いていないよ。",
+    ],
     LANG_EN: [
         "[whispers] Okay, I'll stop listening.",
         "[whispers] Shh, my ears are closed.",
@@ -568,6 +595,11 @@ MIC_MUTED_PHRASES_BY_LANG = {
 }
 
 MIC_UNMUTED_PHRASES_BY_LANG = {
+    LANG_JA: [
+        "[excited] また聞いているよ！",
+        "[excited] 耳を開いたよ！",
+        "また声が聞こえるよ。",
+    ],
     LANG_EN: [
         "[excited] I'm listening again!",
         "[excited] My ears are open!",

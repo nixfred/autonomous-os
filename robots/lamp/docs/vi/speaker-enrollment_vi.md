@@ -4,7 +4,9 @@
 
 ## Tổng quan
 
-Lamp nhận diện người nói qua **WeSpeaker ResNet34** (vector nhúng 256 chiều, ONNX Runtime). Khi không nhận ra người nói, HAL lưu audio và tuỳ điều kiện sẽ yêu cầu AI agent đăng ký giọng nói. Đăng ký chỉ áp dụng **tự phục vụ** — mỗi người tự đăng ký giọng nói của mình.
+Lamp nhận diện người nói qua **WeSpeaker ResNet293** theo mặc định (vector nhúng 256 chiều, ONNX Runtime; server chọn được qua `AUDIO_EMBEDDER__MODEL`). Khi không nhận ra người nói, HAL lưu audio và tuỳ điều kiện sẽ yêu cầu AI agent đăng ký giọng nói. Đăng ký chỉ áp dụng **tự phục vụ** — mỗi người tự đăng ký giọng nói của mình.
+
+Nhận diện người nói là **opt-in, mặc định tắt**: chủ máy phải bật **Voice recognition** (`cloud_perception.speaker_id`) trong web Settings > Privacy. Khi bật, clip mỗi câu nói (tối đa `HAL_SPEAKER_MAX_EMBED_AUDIO_S` = 20 s tiếng nói đã làm sạch, kể cả giọng người chưa đăng ký) và mẫu đăng ký được gửi lên perception service. Khi tắt, mọi lời gọi embedding (recognize, enroll, re-embed) bị từ chối trong `SpeakerRecognizer._call_embedding_api`, nên **đăng ký giọng cũng thất bại** cho tới khi bật opt-in. Xem [sensing-behavior_vi.md](sensing-behavior_vi.md#nhận-thức-camera-qua-cloud-mặc-định-tắt).
 
 ## Kiến trúc
 
@@ -78,10 +80,10 @@ Bốn lớp ngăn agent hỏi "bạn là ai?" liên tục:
 
 | Thuộc tính | Giá trị |
 |------------|---------|
-| Model | WeSpeaker ResNet34 (huấn luyện trên VoxCeleb) |
+| Model | WeSpeaker ResNet293-LM theo mặc định (`AUDIO_EMBEDDER__MODEL=resnet293`; lựa chọn khác `resnet34`, `ecapa-tdnn1024`, `campplus`) |
 | Chiều embedding | 256 |
 | Runtime | ONNX Runtime (CPU) trên perception-service (RunPod) |
-| Endpoint | `POST {DL_BACKEND_URL}/lelamp/api/dl/audio-recognizer/embed` |
+| Endpoint | `POST {DL_BACKEND_URL}/hal/api/dl/audio-recognizer/embed` (`DL_SPEAKER_ENDPOINT`; prefix cũ `/lelamp/` vẫn được nginx ánh xạ) |
 | Xác thực | Header `X-API-Key` |
 | Timeout | 15 giây |
 
@@ -158,7 +160,7 @@ Pipeline lọc/VAD/chuẩn hoá trước đây chạy trong perception-service n
 
 Một embedding đã lưu chỉ so sánh được với embedding truy vấn do **cùng một** model server tạo ra. Nếu model embedding của perception-service bị đổi, mọi vector đã lưu trước đó âm thầm trở nên vô nghĩa khi so sánh — cosine vẫn ra một con số, nên lỗi biểu hiện là **khớp sai người**, không phải báo lỗi. HAL chặn việc này bằng cách đóng dấu định danh model lên từng hồ sơ và tính lại embedding khi định danh đổi. Vì mọi WAV đăng ký đều được giữ trên đĩa, đây là một tác vụ nền tự động — không ai phải thu âm lại.
 
-- **Định danh model**: response `/audio-recognizer/embed` (và `/health`) trả `embed_model_version` — `<tên-model>:<sha256(trọng_số)[:12]>`, tính một lần khi model nạp. `<tên-model>` là giá trị config `AUDIO_EMBEDDER__MODEL` (`resnet293` / `resnet34` / `campplus` / `ecapa-tdnn1024`), ví dụ `resnet293:1a2b3c4d5e6f`. Hash file trọng số bắt được cả trường hợp **đổi checkpoint cùng số chiều** mà phép kiểm `embedding_dim` bỏ sót. Chỉ model được lấy vân tay; config tiền xử lý tại thiết bị **cố ý không** nằm trong đó.
+- **Định danh model**: response `/audio-recognizer/embed` trả `embed_model_version` (và `/health` trả cùng giá trị dưới tên `audio_embedder_version`) — `<tên-model>:<sha256(trọng_số)[:12]>`, tính một lần khi model nạp. `<tên-model>` là giá trị config `AUDIO_EMBEDDER__MODEL` (`resnet293` / `resnet34` / `campplus` / `ecapa-tdnn1024`), ví dụ `resnet293:1a2b3c4d5e6f`. Hash file trọng số bắt được cả trường hợp **đổi checkpoint cùng số chiều** mà phép kiểm `embedding_dim` bỏ sót. Chỉ model được lấy vân tay; config tiền xử lý tại thiết bị **cố ý không** nằm trong đó.
 - **Khi enroll**: HAL luôn lấy phiên bản mới nhất thấy được từ các lần gọi `/embed` của lần enroll đó và ghi vào `metadata.json` của giọng dưới khoá `embed_model_version` (đồng bộ vào registry).
 - **Khi recognize**: sau khi embed truy vấn (làm mới phiên bản server đang biết), HAL so từng hồ sơ đã đăng ký với phiên bản đó. Hồ sơ có phiên bản **khác** bị **loại khỏi so khớp trong lượt đó** (nên trả về **"unknown"** thay vì match sai với vector model cũ, và đổi dim cũng không làm crash phép match), đồng thời châm một lần migration re-embed chạy **nền** — single-flight, trên daemon thread, nên bản thân lượt recognize **không chờ** re-embed. Hồ sơ còn khớp phiên bản vẫn nhận diện bình thường trong cùng lượt; hồ sơ bị loại tự trở lại bình thường sau khi migration nền re-embed xong.
 - **Khi HAL khởi động lại**: một thread nền poll `/health` lấy `audio_embedder_version` hiện tại (thử lại vài lần để chờ server boot), quét metadata hồ sơ để tìm cái lỗi thời **trước khi** nạp model tiền xử lý nặng, rồi migrate các hồ sơ lỗi thời — để nhận diện đúng ngay từ turn đầu thay vì chờ một lần recognize phát hiện.
@@ -198,6 +200,7 @@ Mọi giọng lạ được gom cụm local để server biết "đây là cùng
 | Độ đa dạng | 0.7 | `SPEAKER_DIVERSITY_COS` | Trên mức này lượt nói trùng với mẫu đã lưu → không giữ. Đo độ dư thừa, không phải danh tính — phải nằm trên ngưỡng khớp |
 | Số mẫu extended tối đa | 3 | `SPEAKER_MAX_EXTENDED_SAMPLES` | Mẫu tự thu cho mỗi user. Cap an toàn: truy hồi là max-over-rows nên thêm hàng sẽ nâng điểm của mọi speaker |
 | Số mẫu cụm tối đa | 3 | `SPEAKER_MAX_CLUSTER_SAMPLES` | Số hàng giữ cho mỗi cụm giọng lạ |
+| Thời lượng embed tối đa | 20s | `HAL_SPEAKER_MAX_EMBED_AUDIO_S` | Clip speaker-ID đã làm sạch bị cắt còn 20 giây đầu trước khi gọi `/audio-recognizer/embed`. Clip enroll (≤ 15 giây) không bị ảnh hưởng; server cũng cắt ở 30 giây nên clip dài không thể làm TensorRT build lại engine (#555) |
 | Thời lượng tối thiểu để mở rộng | 2.0s | `SPEAKER_EXTEND_MIN_DURATION_SEC` | Lượt nói cần chừng này **giọng nói sau VAD** mới được một suất extended. Đo trên waveform đã làm sạch, nên im lặng trong một phiên mic dài không được tính |
 | Biên tối thiểu để mở rộng | 0.05 | `SPEAKER_EXTEND_MIN_MARGIN_COS` | ...và phải dẫn trước người **không thắng** mạnh nhất ít nhất bằng này. Là `inf` khi không có ai khác đã đăng ký — lúc đó thật sự không có á quân, và đó là lý do cổng 3 tồn tại |
 | Bắt buộc đồng thuận khi mở rộng | bật | `HAL_SPEAKER_EXTEND_REQUIRE_UNANIMOUS_CHUNKS` | Mọi chunk phải bầu cho người thắng. Không tác dụng khi dưới ~10 giây giọng nói (chỉ một chunk) |
@@ -212,7 +215,7 @@ Mọi giọng lạ được gom cụm local để server biết "đây là cùng
 | Ngưỡng match voice stranger | _(dùng chung)_ | `SPEAKER_MATCH_COS` | Dùng lại ngưỡng khớp known-speaker để gom giọng lạ vào `voice_N` đã có — không có knob riêng |
 | Số voice stranger tối đa | 50 | `HAL_MAX_VOICE_STRANGERS` | Giới hạn cluster; evict oldest khi vượt |
 | Thư mục voice strangers | `/root/local/voice_strangers` | `HAL_VOICE_STRANGERS_DIR` | Persist embedding cluster (tồn tại qua reboot) |
-| Bật/tắt nhận diện giọng nói | true | `HAL_SPEAKER_RECOGNITION_ENABLED` | Công tắc tổng (mặc định bật; gate theo capability `audio`) |
+| Bật/tắt nhận diện giọng nói | false | _(không đọc env)_ `SPEAKER_RECOGNITION_ENABLED` | Công tắc tổng, lấy từ key `speaker_id` của `cloud_perception` (opt-in của chủ máy trong Settings > Privacy, thiếu key là tắt; áp dụng live qua `POST /sensing/cloud-perception`); vẫn gate theo capability `audio`. Tắt: không upload clip, mọi người nói là `unknown`, không dùng danh tính cache, đăng ký thất bại; profile đã đăng ký vẫn giữ trên đĩa |
 
 ### Cấu hình tiền xử lý tại thiết bị
 
@@ -366,10 +369,10 @@ Bất kỳ đường nào khác khởi động pipeline trong lúc bản thu đa
 | Route thu + đăng ký | `hal/routes/speaker.py` | `speaker_record_enroll()` |
 | Chèn instruction + cooldown | `system/domain/voice.go` | `AppendEnrollNudge()` |
 | Đường trực tiếp | `system/server/sensing/delivery/http/handler.go` | `PostEvent()` |
-| Đường hàng đợi/phát lại | `runtimes/openclaw/service.go` | `drainPendingEvents()` |
-| Skill agent | `lamp/resources/openclaw-skills/speaker-recognizer/SKILL.md` | — |
-| Model embedding | `integrations/perception-service/src/core/audio_recognition/audio_recognizer.py` | `ResNet34Recognizer` (mặc định), `EcapaTdnn1024Recognizer`, `CamPPlusRecognizer` — chọn qua env `AUDIO_RECOGNIZER_ENGINE` |
-| Endpoint embedding | `integrations/perception-service/src/protocols/htpp/audio_recognizer.py` | `embed_audio()` |
+| Đường hàng đợi/phát lại | `runtimes/openclaw/service_events.go` | `drainPendingEvents()` |
+| Skill agent | `skills/speaker-recognizer/SKILL.md` | — |
+| Model embedding | `integrations/perception-service/src/core/perception/audio/predictors/` (`resnet34.py`, `resnet293.py`, `ecapa_tdnn.py`, `campplus.py`) | `ResNet293Embedder` (mặc định), `ResNet34Embedder`, `EcapaTdnn1024Embedder`, `CamPPlusEmbedder` — chọn qua env `AUDIO_EMBEDDER__MODEL` (`resnet293` \| `resnet34` \| `ecapa-tdnn1024` \| `campplus`) |
+| Endpoint embedding | `integrations/perception-service/src/dlserver/routes/audio.py` | `embed_audio()` |
 | Cấu hình | `hal/config.py` | Các hằng số `SPEAKER_*` |
 
 ## Ví dụ luồng message

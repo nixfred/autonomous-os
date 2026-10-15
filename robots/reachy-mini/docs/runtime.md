@@ -132,8 +132,18 @@ component scripts in order. Each of those also runs standalone:
 | 2 | `spike-hal.sh` | `hal` → `/opt/hal`, builds the venv (`uv sync --python 3.12 --extra hardware --extra reachy`), runs uvicorn on `127.0.0.1:5001` |
 | 3 | `spike-os.sh` | `os-server` → `/usr/local/bin/os-server`, seeds `/root/config/config.json`, runs it **as root with `WorkingDirectory=/root`** |
 | 4 | `spike-web.sh` | `web` → `/usr/share/nginx/html/setup`, installs nginx, writes the spike vhost |
-| 5 | `spike-agent.sh` | Node.js 22 (NodeSource) + `openclaw` at the OTA-pinned version, seeds `/root/.openclaw`, runs `openclaw gateway run` on loopback `18789` |
+| 5 | `spike-agent.sh` | Compatible Node.js (NodeSource 24.x when needed) + `openclaw` at the OTA-pinned version, seeds `/root/.openclaw`, runs `openclaw gateway run` on loopback `18789` |
 | 6 | `spike-bootstrap.sh` | `bootstrap` → `/usr/local/bin/bootstrap-server`, seeds `/root/config/bootstrap.json`, installs the `software-update` staged at the device-package root by `upload-device.sh` (canonical `scripts/provision/software-update`) → `/usr/local/bin/software-update` (the helper the worker execs; without it every apply fails with `executable file not found in $PATH` while all units report healthy) |
+
+Before installing OpenClaw, `spike-agent.sh` reads `engines.node` from npm for
+that exact version and checks the full semver range using npm's bundled semver.
+A compatible Node is kept; a missing Node/npm is bootstrapped from NodeSource
+24.x, and an incompatible Node is upgraded through the same channel and checked
+again. For example, OpenClaw `2026.9.3` requires
+`>=24.16.0 <25 || >=26.1.0`, so Node 22, early Node 24 and Node 25 do not pass.
+Missing/invalid metadata, checker failures, or an incompatible Node after the
+upgrade stop the installer before OpenClaw installation or gateway startup;
+check apt pins and PATH if the old Node still wins after an upgrade.
 
 Why that order, specifically:
 
@@ -180,6 +190,12 @@ an unknown flag. Teardown keeps going past a failing step, so a half-installed
 robot is still cleanable. `spike.sh` clears the metadata cache at the start of a
 run and the six steps then share one snapshot of the feed, so a publish landing
 mid-install cannot leave os-server and HAL on mismatched builds.
+
+If an install step fails, `spike.sh` exits with failure and prints commands from
+that step through the remaining non-skipped steps. After resolving the error,
+run those commands in order, stopping if any command fails; earlier successful
+steps need not run again. The printed commands preserve `--no-deps` only for
+HAL, and no later step executes automatically after the failure.
 
 Everything runs under **systemd** (`hal`, `os-server`, `openclaw`, `bootstrap`)
 and survives a reboot; tmux is gone. That is also why `--stop` and `--uninstall`
@@ -585,10 +601,21 @@ profile is measured.
    sudo bash ~/reachy-mini/spike-hal.sh --stop       # stop + hand media back
    ```
 
-   `spike-hal.sh` refuses to run the venv build with less than 4 GB free on `/`
-   (the venv is ~2 GB — torch, opencv, polars, pyarrow — and uv's wheel cache can
-   add as much again on a 14 GB eMMC that ships ~60 % full). It keeps that cache
-   in `/opt/hal/.uv-cache` so `--uninstall` reclaims every byte it wrote.
+   `spike-hal.sh` requires **4 GiB** free on `/` for a fresh environment, or
+   **1 GiB** when `/opt/hal/.venv/bin/uvicorn` is already executable.
+   `--no-deps` skips this check and dependency sync but still requires that
+   executable. The later `spike-agent.sh` check independently requires
+   **1.5 GiB** for Node and OpenClaw. Errors show available, required, and
+   missing space in MiB with exact KiB values, avoiding ambiguous rounded GB.
+
+   Passing HAL's check does not guarantee the whole stack fits. The earlier
+   observation of ~1.8 GB free after installation is not a guarantee for current
+   stock images or packages; [issue #627](https://github.com/autonomous-ai/Physical-AI-Operating-System/issues/627)
+   reports ~1.4 GB remaining after HAL. These thresholds are unchanged; peak
+   installation usage on current Reachy hardware has not been measured for this
+   fix. HAL keeps its uv cache in `/opt/hal/.uv-cache` and runs the existing
+   `uv cache prune` after a successful sync. This fix adds no automatic cleanup;
+   reported cache size is not a promise of recoverable disk space.
 
 3. **Manual install** (if not using the spike scripts):
 

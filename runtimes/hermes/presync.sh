@@ -1,46 +1,21 @@
 #!/usr/bin/env bash
-# runtime-hermes-presync — run by switch-runtime right before hermes starts (and
-# once at the end of install.sh). It OWNS the device-side Hermes model config in
-# config.yaml, in two layers:
-#
-#   1. STRUCTURE (static) — the provider wiring that routes Hermes at the device's
-#      campaign-api brain via anthropic_messages. `hermes claw migrate` does NOT
-#      carry it across, and a factory reset (`hermes setup --reset`) WIPES it back
-#      to defaults. We assert it idempotently here so it self-heals on the next
-#      switch — without this, only the first install.sh run ever wrote it, and
-#      switch-runtime skips install.sh once hermes is installed, so a reset left
-#      hermes pointed at a broken/default provider with no path to recover. The
-#      same layer also asserts two os-server-owned knobs: auxiliary.vision (the
-#      image-understanding model) and agent.image_input_mode.
-#
-#   2. DYNAMIC (per-device) — the real llm_model / llm_base_url / llm_api_key and
-#      channel tokens from /root/config/config.json, which override the defaults.
-#
-# This file is EMBEDDED IN os-server (runtimes/hermes/presync.sh) and materialized
-# to /usr/local/bin/runtime-hermes-presync on every switch, so a plain os-server
-# OTA refreshes it on disk — unlike a copy written by install.sh, which only re-runs
-# on a first install / failed verify.
+# runtime-hermes-presync: run by switch-runtime before hermes starts; owns config.yaml model wiring.
+# Static structure is re-asserted every run so it self-heals after `hermes setup --reset`.
 set -euo pipefail
-CONFIG_JSON="/root/config/config.json"
-HERMES_DIR="/root/.hermes"
+CONFIG_JSON="${CONFIG_JSON:-/root/config/config.json}"
+HERMES_DIR="${HERMES_DIR:-/root/.hermes}"
 ENV_FILE="$HERMES_DIR/.env"
 CONFIG_YAML="$HERMES_DIR/config.yaml"
 log() { echo "[hermes-presync] $*"; }
 
-# ── 0. SKILLS (restore OpenClaw-imported skills if missing) ─────────────────────
-# `hermes claw migrate` imports the device's OpenClaw skills into
-# ~/.hermes/skills/openclaw-imports. It runs from install.sh on first install, but
-# a factory reset (wipeHermesState) wipes that dir while leaving the OpenClaw
-# workspace intact — and install.sh does NOT re-run on a later switch (verify
-# passes), so the skills would never come back. Restore them here when the dir is
-# empty/absent. GUARDED so a normal switch is a no-op (re-running every switch with
-# --skill-conflict rename would pile up renamed duplicates). claw migrate has no
-# skills-only preset (it also touches SOUL/MEMORY), but that is harmless: the Go
-# persona migration runs afterwards (os-server boot) and re-writes SOUL/MEMORY
-# cleanly, so only the skills it imported actually persist.
+LLM_CONFIG_MODE="$(jq -r '.llm_config_mode // empty' "$CONFIG_JSON" 2>/dev/null || true)"
+
+# ── 0. SKILLS ──
+# Restore OpenClaw-imported skills only when the dir is empty (factory reset wipes it; rerunning
+# `claw migrate --skill-conflict rename` every switch would pile up duplicates).
 HERMES_BIN="${HERMES_BIN:-/usr/local/bin/hermes}"
 IMPORTS_DIR="$HERMES_DIR/skills/openclaw-imports"
-if [ ! -d "$IMPORTS_DIR" ] || [ -z "$(ls -A "$IMPORTS_DIR" 2>/dev/null)" ]; then
+if [ "$LLM_CONFIG_MODE" != runtime ] && { [ ! -d "$IMPORTS_DIR" ] || [ -z "$(ls -A "$IMPORTS_DIR" 2>/dev/null)" ]; }; then
   if [ -x "$HERMES_BIN" ] && [ -d /root/.openclaw ]; then
     log "openclaw-imported skills missing — restoring via claw migrate"
     "$HERMES_BIN" claw migrate --preset full --overwrite --skill-conflict rename --yes --migrate-secrets \
@@ -48,33 +23,19 @@ if [ ! -d "$IMPORTS_DIR" ] || [ -z "$(ls -A "$IMPORTS_DIR" 2>/dev/null)" ]; then
   fi
 fi
 
-# yq is required for the structured config.yaml edits. install.sh installs it; if
-# it is somehow absent we cannot safely patch — bail loudly (non-fatal to the
-# switch: the caller treats presync failure as a warning).
 if ! command -v yq >/dev/null 2>&1; then
   log "ERROR: yq not found — cannot ensure config.yaml structure" >&2
   exit 1
 fi
 
-# touch first so yq has a doc to edit on a fresh/absent config.yaml.
 touch "$CONFIG_YAML"
 
-# `hermes setup --reset` leaves top-level `.model` as an EMPTY STRING ('') and may
-# leave `.custom_providers` as a scalar too — yq cannot index `.model.provider` /
-# `.custom_providers[0]` into a scalar, so the structure assignment below would
-# no-op and the config stays broken (`model: ''`). Coerce each to its expected
-# container type FIRST, but only when it isn't already one, so a populated config
-# is preserved.
+if [ "$LLM_CONFIG_MODE" != runtime ]; then
+# `hermes setup --reset` leaves .model / .custom_providers as scalars; coerce before indexing.
 [ "$(yq '.model | tag' "$CONFIG_YAML" 2>/dev/null)" = "!!map" ] || yq -i '.model = {}' "$CONFIG_YAML"
 [ "$(yq '.custom_providers | tag' "$CONFIG_YAML" 2>/dev/null)" = "!!seq" ] || yq -i '.custom_providers = []' "$CONFIG_YAML"
 
-# ── 1. STRUCTURE (idempotent) ──────────────────────────────────────────────────
-# Assert the static provider wiring. `// default` keeps any existing value (so a
-# real llm_* already synced below is not stomped) and only fills it when missing.
-# os-server sends a fixed request model ("hermes-agent", constants.go); .model
-# .provider = custom:autonomous is what routes that bare model at the campaign-api
-# custom provider, so this is the field that actually matters (the .default value
-# is only a never-used fallback once a per-request model is sent).
+# ── 1. STRUCTURE (idempotent) ──
 log "ensure config.yaml model + custom_providers structure"
 yq -i '
   .model.provider = "custom:autonomous"
@@ -85,11 +46,7 @@ yq -i '
   | .custom_providers[0].base_url = (.custom_providers[0].base_url // "https://campaign-api.autonomous.ai/api/v1/ai")
 ' "$CONFIG_YAML"
 
-# ── 1b. AUXILIARY VISION + AGENT IMAGE INPUT (always overwrite) ─────────────────
-# os-server-owned knobs, asserted unconditionally (self-heal after reset). Coerce
-# .auxiliary/.agent to maps first (reset can leave scalars, like .model). Only
-# .auxiliary.vision (overwritten whole) and .agent.image_input_mode are touched —
-# other keys under both are preserved.
+# ── 1b. AUXILIARY VISION + AGENT IMAGE INPUT (always overwrite) ──
 [ "$(yq '.auxiliary | tag' "$CONFIG_YAML" 2>/dev/null)" = "!!map" ] || yq -i '.auxiliary = {}' "$CONFIG_YAML"
 [ "$(yq '.agent | tag' "$CONFIG_YAML" 2>/dev/null)" = "!!map" ] || yq -i '.agent = {}' "$CONFIG_YAML"
 log "ensure config.yaml auxiliary.vision + agent.image_input_mode"
@@ -104,73 +61,38 @@ yq -i '
   | .agent.image_input_mode = "auto"
 ' "$CONFIG_YAML"
 
-# ── 1b2. TERMINAL CWD (always overwrite) ──────────────────────────────────────
-# Hermes discovers project-context files (AGENTS.md, .cursorrules) by walking up
-# from the CONFIGURED cwd — `resolve_context_cwd` in agent/runtime_cwd.py, which
-# returns None rather than falling back to the launch dir (a guard against an
-# agent self-spawned inside the Hermes source tree swallowing that repo's own
-# AGENTS.md). The stock `terminal.cwd: .` is relative, never bridges to
-# TERMINAL_CWD, and leaves that lookup empty — so an AGENTS.md we write is never
-# read. Pinning the absolute Hermes home is what makes the OS block reachable.
-#
-# The process already runs there (`WorkingDirectory=/root/.hermes` in the unit
-# Hermes installs), so this only states an existing fact; the agent's shell cwd
-# does not move. Verified on-device: with `.` a codeword planted in AGENTS.md was
-# absent from the prompt; with the absolute path the agent returned it.
+fi
+
+# ── 1b2. TERMINAL CWD ──
+# Hermes finds AGENTS.md only by walking up from an absolute configured cwd; `.` never resolves.
 log "ensure config.yaml terminal.cwd (makes AGENTS.md discoverable)"
 [ "$(yq '.terminal | tag' "$CONFIG_YAML" 2>/dev/null)" = "!!map" ] || yq -i '.terminal = {}' "$CONFIG_YAML"
 yq -i '.terminal.cwd = "'"$HERMES_DIR"'"' "$CONFIG_YAML"
 
-# ── 1c. APPROVALS OFF (always overwrite) ───────────────────────────────────────
-# The device runs unattended (voice + chat channels) — a "Command Approval
-# Required" card is a dead end for a voice user and stalls the turn, so command
-# approval prompts are disabled entirely (product decision). Hermes' hardline
-# blocklist still applies; approvals.mode is the documented master switch for
-# the tirith/dangerous-command prompt flow. style="double" is REQUIRED: yq v4
-# (YAML 1.2) writes a bare `off`, but Hermes reads config.yaml with PyYAML
-# (YAML 1.1) where unquoted off parses as boolean False — the mode string is
-# never matched and prompts silently stay ON. Verified on-device: bare off →
-# parsed False; "off" → parsed 'off'.
+# ── 1c. APPROVALS OFF ──
+# style="double" is required: PyYAML (YAML 1.1) parses bare off as False, silently keeping prompts on.
 [ "$(yq '.approvals | tag' "$CONFIG_YAML" 2>/dev/null)" = "!!map" ] || yq -i '.approvals = {}' "$CONFIG_YAML"
 log "ensure config.yaml approvals.mode=off (no command-approval prompts)"
 yq -i '.approvals.mode = "off" | .approvals.mode style="double"' "$CONFIG_YAML"
 
-# ── 2. DYNAMIC (config.json wins) ──────────────────────────────────────────────
-# NOTE on .model.default: "Auto-AI" is an alias only the campaign-api proxy
-# understands — it resolves it to whatever model it picks. While the device is on
-# that proxy the alias is exactly right, and llm_model is left alone (it may hold
-# an OpenClaw primary model like claude-opus-4-6, which means nothing here).
-#
-# Point the device at another host — an operator supplying their own brain — and
-# the alias becomes an unknown model id. Measured on intern-v2-d16f against
-# openrouter: every turn came back `400 Auto-AI is not a valid model ID`, and
-# because this script self-heals on each boot, editing config.yaml by hand did
-# not survive a restart. So the alias is kept for the proxy and the operator's
-# llm_model is used everywhere else.
+# ── 2. DYNAMIC (config.json wins) ──
+# "Auto-AI" is a campaign-api alias; a custom base_url must use the operator's llm_model instead.
+if [ "$LLM_CONFIG_MODE" != runtime ]; then
 LLM_BASE_URL="$(jq -r '.llm_base_url // empty' "$CONFIG_JSON" 2>/dev/null || true)"
 LLM_MODEL="$(jq -r '.llm_model // empty' "$CONFIG_JSON" 2>/dev/null || true)"
 
-# Custom brain → the alias cannot resolve; use the operator's model. Empty base
-# URL means the device is on the default proxy, so that keeps the alias too.
 case "$LLM_BASE_URL" in
   ""|*campaign-api.autonomous.ai*)
-    # Prompt-cache markers for the Auto-AI alias. Hermes only emits Anthropic
-    # `cache_control` breakpoints for a custom provider when that model declares
-    # `prompt_caching: true`; without it every turn re-sends the whole ~18k-token
-    # floor (system + 25 tool schemas) uncached. Measured on lamp-0c4e 2026-09-16,
-    # same "hello" in one session: no markers 18.3s → 12.6s, cache_read 0;
-    # markers 13.8s → 9.2s steady, cache_read ~85%. Scoped to the campaign-api
-    # proxy (known to honour the markers); a BYO brain keeps Hermes' own
-    # per-provider caching policy.
+    # Hermes emits cache_control for a custom provider only when the model declares prompt_caching.
     yq -i '.custom_providers[0].models["Auto-AI"].prompt_caching = true' "$CONFIG_YAML"
     log "custom_providers[0].models.Auto-AI.prompt_caching = true (cache markers on)"
-    # 1h cache TTL: a lamp user typically speaks, then goes quiet for 10-20 min,
-    # which outlives the 5m default and re-bills the full prefill on the next
-    # turn (measured 2026-09-16: 3.6s with cache vs 11.8s after an 8 min gap).
-    # Hermes accepts only "5m" | "1h"; it sends `ttl: "1h"` on every marker. If
-    # the gateway ignores the field the cache silently stays at 5m - harmless.
+    # 1h TTL outlives typical 10-20 min gaps between voice turns (Hermes accepts only "5m" | "1h").
     yq -i '.prompt_caching.cache_ttl = "1h"' "$CONFIG_YAML"
     log "prompt_caching.cache_ttl = 1h"
+    # campaign-api reports no context window, so without this Hermes probes /models + /api/show
+    # (~0.8s on the network) at the start of EVERY turn, then falls back to 256K anyway.
+    yq -i '.custom_providers[0].models["Auto-AI"].context_length = 256000' "$CONFIG_YAML"
+    log "custom_providers[0].models.Auto-AI.context_length = 256000 (skips per-turn probe)"
     ;;
   *)
     if [ -n "$LLM_MODEL" ]; then
@@ -182,27 +104,32 @@ case "$LLM_BASE_URL" in
     ;;
 esac
 
+# Explicit OS ownership must restore the selected model even on the campaign endpoint.
+if [ "$LLM_CONFIG_MODE" = os ] && [ -n "$LLM_MODEL" ]; then
+  MODEL="$LLM_MODEL" yq -i '.model.default = strenv(MODEL)' "$CONFIG_YAML"
+fi
+
 if [ -n "$LLM_BASE_URL" ]; then
   yq -i ".custom_providers[0].base_url = \"$LLM_BASE_URL\"" "$CONFIG_YAML"
   log "custom_providers[0].base_url = $LLM_BASE_URL"
 fi
 
-# .env secrets/IDs: config.json wins — UPSERT each non-empty config.json field
-# into its Hermes env var (replace the existing line, or append if absent). Other
-# variables are never touched, so whatever `hermes claw migrate` carried over
-# from OpenClaw is kept as the fallback. Empty/missing config fields are skipped.
+fi
+
+# Upsert each non-empty config.json field into .env; other vars are left untouched.
 sync_env() {
   local key="$1" var="$2" val
   val="$(jq -r ".${key} // empty" "$CONFIG_JSON" 2>/dev/null || true)"
   [ -n "$val" ] || return 0
   sed -i "/^${var}=/d" "$ENV_FILE"
-  # guard against gluing onto a previous line that lacks a trailing newline
   [ -s "$ENV_FILE" ] && [ -n "$(tail -c1 "$ENV_FILE")" ] && printf '\n' >>"$ENV_FILE"
   echo "${var}=${val}" >>"$ENV_FILE"
   log "${var} synced"
 }
 
-sync_env llm_api_key        AUTONOMOUS_API_KEY
+if [ "$LLM_CONFIG_MODE" != runtime ]; then
+  sync_env llm_api_key AUTONOMOUS_API_KEY
+fi
 sync_env telegram_bot_token TELEGRAM_BOT_TOKEN
 sync_env telegram_user_id   TELEGRAM_ALLOWED_USERS
 sync_env slack_bot_token    SLACK_BOT_TOKEN
@@ -212,12 +139,81 @@ sync_env discord_bot_token  DISCORD_BOT_TOKEN
 sync_env discord_guild_id   DISCORD_GUILD_ID
 sync_env discord_user_id    DISCORD_ALLOWED_USERS
 sync_env whatsapp_user_id   WHATSAPP_ALLOWED_USERS
+sync_env bluebubbles_server_url   BLUEBUBBLES_SERVER_URL
+sync_env bluebubbles_password     BLUEBUBBLES_PASSWORD
+sync_env bluebubbles_user_address BLUEBUBBLES_ALLOWED_USERS
 
-# ── 3. API SERVER KEY (must match constants.go APIKey) ────────────────────────
-# Enforce on every presync so a key bump in os-server self-heals on the next
-# switch — install.sh only runs on first-install and cannot fix devices that
-# already have hermes installed with an older key.
-# API_SERVER_KEY MUST equal runtimes/hermes/constants.go APIKey.
+# Multi-line caller context cannot live in .env (systemd EnvironmentFile); caller_context_file_fallback.py reads this file.
+BB_CALLER_CTX_FILE="$HERMES_DIR/bluebubbles_caller_context.txt"
+BB_CALLER_CTX_VAL="$(jq -r '.bluebubbles_caller_context // empty' "$CONFIG_JSON" 2>/dev/null || true)"
+if [ -n "$BB_CALLER_CTX_VAL" ]; then
+  mkdir -p "$HERMES_DIR"
+  umask 077
+  printf '%s' "$BB_CALLER_CTX_VAL" >"$BB_CALLER_CTX_FILE"
+  chmod 600 "$BB_CALLER_CTX_FILE"
+  log "bluebubbles_caller_context written to ${BB_CALLER_CTX_FILE}"
+else
+  rm -f "$BB_CALLER_CTX_FILE"
+  log "bluebubbles_caller_context empty — removed ${BB_CALLER_CTX_FILE} if present"
+fi
+
+# The plugin binds 127.0.0.1 by default, which the Mac cannot reach; seed the LAN IP unless pinned.
+if [ -n "$(jq -r '.bluebubbles_server_url // empty' "$CONFIG_JSON" 2>/dev/null || true)" ]; then
+  LAN_IP="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for (i=1; i<=NF; i++) if ($i=="src") { print $(i+1); exit }}')"
+  [ -z "$LAN_IP" ] && LAN_IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
+
+  if [ -n "$LAN_IP" ]; then
+    # Refresh WEBHOOK_HOST when unset or a bare IPv4 no longer bound here; leave hostnames/tunnels alone.
+    # `|| true`: grep's exit 1 would abort under set -e on a fresh .env.
+    CURRENT_HOST="$(grep -E '^BLUEBUBBLES_WEBHOOK_HOST=' "$ENV_FILE" 2>/dev/null | tail -1 | cut -d= -f2- || true)"
+    NEED_REFRESH=false
+    REFRESH_REASON=""
+    if [ -z "$CURRENT_HOST" ]; then
+      NEED_REFRESH=true
+      REFRESH_REASON="unset"
+    elif printf '%s' "$CURRENT_HOST" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'; then
+      if ! ip -4 -o addr show 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | grep -qFx "$CURRENT_HOST"; then
+        NEED_REFRESH=true
+        REFRESH_REASON="stale ${CURRENT_HOST}"
+      fi
+    fi
+    if $NEED_REFRESH; then
+      sed -i "/^BLUEBUBBLES_WEBHOOK_HOST=/d" "$ENV_FILE"
+      [ -s "$ENV_FILE" ] && [ -n "$(tail -c1 "$ENV_FILE")" ] && printf '\n' >>"$ENV_FILE"
+      echo "BLUEBUBBLES_WEBHOOK_HOST=${LAN_IP}" >>"$ENV_FILE"
+      log "BLUEBUBBLES_WEBHOOK_HOST set to ${LAN_IP} (${REFRESH_REASON})"
+    fi
+  else
+    log "WARN: BlueBubbles configured but no LAN IP detected — webhook will bind loopback and Mac cannot reach it"
+  fi
+
+  if ! grep -q '^BLUEBUBBLES_WEBHOOK_PORT=' "$ENV_FILE" 2>/dev/null; then
+    [ -s "$ENV_FILE" ] && [ -n "$(tail -c1 "$ENV_FILE")" ] && printf '\n' >>"$ENV_FILE"
+    echo "BLUEBUBBLES_WEBHOOK_PORT=8645" >>"$ENV_FILE"
+    log "BLUEBUBBLES_WEBHOOK_PORT defaulted to 8645 (not pinned in .env)"
+  fi
+
+  # Customer-facing channel: allow all senders unless the operator pinned the flag.
+  if ! grep -q '^BLUEBUBBLES_ALLOW_ALL_USERS=' "$ENV_FILE" 2>/dev/null; then
+    [ -s "$ENV_FILE" ] && [ -n "$(tail -c1 "$ENV_FILE")" ] && printf '\n' >>"$ENV_FILE"
+    echo "BLUEBUBBLES_ALLOW_ALL_USERS=true" >>"$ENV_FILE"
+    log "BLUEBUBBLES_ALLOW_ALL_USERS defaulted to true (customer-facing default; not pinned in .env)"
+  fi
+
+  # Without a home channel Hermes nags every customer with a /sethome prompt.
+  if ! grep -q '^BLUEBUBBLES_HOME_CHANNEL=' "$ENV_FILE" 2>/dev/null; then
+    OP_HANDLE="$(jq -r '.bluebubbles_user_address // empty' "$CONFIG_JSON" 2>/dev/null || true)"
+    if [ -n "$OP_HANDLE" ]; then
+      [ -s "$ENV_FILE" ] && [ -n "$(tail -c1 "$ENV_FILE")" ] && printf '\n' >>"$ENV_FILE"
+      echo "BLUEBUBBLES_HOME_CHANNEL=any;-;${OP_HANDLE}" >>"$ENV_FILE"
+      log "BLUEBUBBLES_HOME_CHANNEL defaulted to any;-;${OP_HANDLE} (from bluebubbles_user_address)"
+    else
+      log "WARN: BlueBubbles configured but bluebubbles_user_address is empty — HOME_CHANNEL left unset (bot will nag customers with /sethome prompt)"
+    fi
+  fi
+fi
+
+# ── 3. API SERVER KEY ── must equal runtimes/hermes/constants.go APIKey.
 EXPECTED_API_KEY="hermes-local-api-key"
 sed -i "/^API_SERVER_KEY=/d" "$ENV_FILE"
 [ -s "$ENV_FILE" ] && [ -n "$(tail -c1 "$ENV_FILE")" ] && printf '\n' >>"$ENV_FILE"

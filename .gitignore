@@ -68,3 +68,7 @@ integrations/perception-service/tests/mock_data/audio/speakers/
 
 # Locally built wheels for the hal `aec` extra (scripts/release/build-aec-wheel.sh)
 dist/aec/
+
+# Language-ID model cache (downloaded release asset)
+.models-hal/
+hal/drivers/voice/resources/ambernet.onnx

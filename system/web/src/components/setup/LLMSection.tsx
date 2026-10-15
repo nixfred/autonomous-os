@@ -1,3 +1,4 @@
+import { SettingsSelect } from "@/components/SettingsSelect";
 import { Brain } from "lucide-react";
 import { Field, LockedField, SectionCard } from "./shared";
 import { SecretUpdateField } from "@/components/SecretUpdateField";
@@ -17,9 +18,6 @@ export function LLMSection({
   llmApiKey: string; setLlmApiKey: (v: string) => void;
   llmUrl: string; setLlmUrl: (v: string) => void;
   llmModel: string; setLlmModel: (v: string) => void;
-  // Which brain the device is on. Omit both to render the plain editable form
-  // (the first-run setup flow, where there is no Autonomous set to fall back to
-  // and nothing to choose between yet).
   mode?: LlmMode;
   onModeChange?: (m: LlmMode) => void;
 }) {
@@ -35,10 +33,10 @@ export function LLMSection({
           <label htmlFor="llm_mode" style={{ display: "block", fontSize: 11.5, color: "var(--lm-text-muted, #8a8a8a)", marginBottom: 5 }}>
             Provider
           </label>
-          <select
+          <SettingsSelect
             id="llm_mode"
             value={mode}
-            onChange={(e) => onModeChange(e.target.value as LlmMode)}
+            onValueChange={(value) => onModeChange(value as LlmMode)}
             style={{
               width: "100%", padding: "9px 10px", borderRadius: 7, fontSize: 12.5,
               background: "var(--lm-surface, #1a1a1a)", color: "var(--lm-text, #eee)",
@@ -46,14 +44,10 @@ export function LLMSection({
             }}>
             <option value="autonomous">Autonomous (included)</option>
             <option value="custom">Custom — bring your own</option>
-          </select>
+          </SettingsSelect>
         </div>
       )}
 
-      {/* Read-only on Autonomous. These are the credentials the device is sold
-          with; letting them be edited in place is how they used to get lost —
-          and an operator who wants their own provider is choosing Custom, not
-          quietly overwriting this one. The key is never shown either way. */}
       {locked ? (
         <>
           <Field label="API Key" id="llm_api_key" value="•••••••• (included)" onChange={() => {}} readOnly />
@@ -62,9 +56,6 @@ export function LLMSection({
         </>
       ) : (
         <>
-          {/* SecretUpdateField handles both empty (Setup) and configured
-              (Settings) states inline — a Pencil icon unlocks the input to
-              rotate the key without leaving the page. */}
           <SecretUpdateField
             label="API Key"
             id="llm_api_key"

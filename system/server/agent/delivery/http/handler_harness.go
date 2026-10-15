@@ -21,6 +21,26 @@ type harnessReplyState struct {
 	toolName    string
 	toolArgs    string
 	questionIDs map[string]bool
+	lastLine    string
+}
+
+// pushHarnessLine shows one Harness line in chat as its own line. With dedupe, a status
+// line equal to the run's previous one is dropped so repeated receipt updates don't pile up.
+func (h *AgentHandler) pushHarnessLine(runID, text string, dedupe bool, detail map[string]string) {
+	if h.monitorBus == nil {
+		return
+	}
+	h.harnessRepliesMu.Lock()
+	if state, ok := h.harnessReplies[runID]; ok {
+		if dedupe && state.lastLine == text {
+			h.harnessRepliesMu.Unlock()
+			return
+		}
+		state.lastLine = text
+		h.harnessReplies[runID] = state
+	}
+	h.harnessRepliesMu.Unlock()
+	h.monitorBus.Push(domain.MonitorEvent{Type: "assistant_delta", Summary: text + "\n", RunID: runID, Detail: detail})
 }
 
 // MarkHarnessResponseRun holds a user turn open for the final recap from its
@@ -38,9 +58,8 @@ func (h *AgentHandler) markHarnessResponseRun(runID string, webChat, delegated, 
 	if runID == "" {
 		return
 	}
-	// Harness run ids carry no creation stamp, so the click watermark would
-	// otherwise date this run from its first spoken reply -- which lands
-	// after the click it should have respected. Date it from registration.
+	// Harness run ids carry no creation stamp; date the run from registration so the click
+	// watermark isn't compared against its later first reply.
 	h.runCreatedAtMs(runID)
 	h.harnessRepliesMu.Lock()
 	if h.harnessReplies == nil {
@@ -61,9 +80,8 @@ func (h *AgentHandler) markHarnessResponseRun(runID string, webChat, delegated, 
 	h.harnessRepliesMu.Unlock()
 }
 
-// suppressHarnessAgentReply retains ownership after either lifecycle ordering.
-// OpenClaw may emit a generic final after lifecycle:end; keep the tombstone
-// until expiry so that final cannot overwrite the Harness response.
+// suppressHarnessAgentReply keeps a tombstone until expiry so a late OpenClaw generic final
+// cannot overwrite the Harness response.
 func (h *AgentHandler) suppressHarnessAgentReply(runID string) bool {
 	h.harnessRepliesMu.Lock()
 	defer h.harnessRepliesMu.Unlock()
@@ -79,10 +97,8 @@ func (h *AgentHandler) clearHarnessResponseRun(runID string) {
 	}
 }
 
-// DeliverHarnessProgress shows a lifecycle update emitted by Harness while the
-// original user turn remains pending. It deliberately never speaks: voice
-// users hear the terminal result, while Web Chat replaces this pending text
-// with that exact result when turn.summary arrives.
+// DeliverHarnessProgress shows a Harness lifecycle update while the original turn is pending.
+// It never speaks.
 func (h *AgentHandler) DeliverHarnessProgress(runID, text string) bool {
 	if runID == "" || text == "" {
 		return false
@@ -93,19 +109,12 @@ func (h *AgentHandler) DeliverHarnessProgress(runID, text string) bool {
 	if !pending || state.delivered {
 		return false
 	}
-	if h.monitorBus != nil {
-		h.monitorBus.Push(domain.MonitorEvent{
-			Type: "assistant_delta", Summary: text, RunID: runID,
-			Detail: map[string]string{"role": "assistant", "source": "harness"},
-		})
-	}
+	h.pushHarnessLine(runID, text, true, map[string]string{"role": "assistant", "source": "harness"})
 	return true
 }
 
-// DeliverHarnessTool retains a remote tool start for the voice filler that
-// stays alive after the device agent has handed work to Harness. Tool events
-// can beat the device agent's NO_REPLY lifecycle by a few milliseconds, so
-// the tool is stored as well as forwarded to an already-active filler.
+// DeliverHarnessTool retains a remote tool start for the voice filler; stored as well as forwarded
+// because tool events can beat the device agent's NO_REPLY lifecycle.
 func (h *AgentHandler) DeliverHarnessTool(runID, toolName, toolArgs string) bool {
 	if runID == "" || toolName == "" {
 		return false
@@ -124,18 +133,12 @@ func (h *AgentHandler) DeliverHarnessTool(runID, toolName, toolArgs string) bool
 	if !state.webChat {
 		sensinghttp.DefaultFillerManager.OnToolStart(runID, toolArgs, toolName)
 	}
-	if h.monitorBus != nil {
-		h.monitorBus.Push(domain.MonitorEvent{
-			Type: "assistant_delta", Summary: "Harness is " + toolName + ".", RunID: runID,
-			Detail: map[string]string{"role": "assistant", "source": "harness"},
-		})
-	}
+	h.pushHarnessLine(runID, "Harness is "+toolName+".", true, map[string]string{"role": "assistant", "source": "harness"})
 	return true
 }
 
-// ResumeHarnessVoiceFillers recreates a voice-only filler after the device
-// agent returns NO_REPLY. Its normal lifecycle cancellation must not silence a
-// long-running Harness task that it has just delegated.
+// ResumeHarnessVoiceFillers recreates a voice-only filler after the device agent returns NO_REPLY,
+// so its lifecycle cancellation doesn't silence the delegated Harness task.
 func (h *AgentHandler) ResumeHarnessVoiceFillers(runID string) {
 	h.harnessRepliesMu.Lock()
 	state, pending := h.harnessReplies[runID]
@@ -165,7 +168,6 @@ func (h *AgentHandler) DeliverHarnessResponse(runID, text string) bool {
 	state.delivered = true
 	h.harnessReplies[runID] = state
 	h.harnessRepliesMu.Unlock()
-	// Persist the same final text for web recovery when its live SSE is closed.
 	flow.Log("harness_response", map[string]any{"run_id": runID, "text": text}, runID)
 	// A final remote answer replaces any generic progress filler immediately.
 	sensinghttp.DefaultFillerManager.Cancel(runID)
@@ -176,11 +178,8 @@ func (h *AgentHandler) DeliverHarnessResponse(runID, text string) bool {
 		})
 	}
 	if !state.webChat && !state.restored {
-		// Same gate as every other reply: a run the user cancelled by click
-		// keeps its answer in history but loses the speaker. Harness results
-		// land tens of seconds later, exactly when a bypass is audible.
-		// Remote results are written for a screen, so HAL's announcer renders
-		// them for speech; device-generated notices are already spoken text.
+		// Same cancel gate as every reply: a click-cancelled run keeps history but loses the speaker.
+		// Remote results go through HAL's announcer; device notices are already speech text.
 		speak := func(text string) error {
 			return hal.AnnounceHarnessUpdate(hal.HarnessUpdateResult, text, runID, "")
 		}
@@ -196,9 +195,8 @@ func (h *AgentHandler) DeliverHarnessResponse(runID, text string) bool {
 	return true
 }
 
-// AnnounceHarnessProgress offers a Harness lifecycle or tool update to HAL's
-// announcer, which speaks only an occasional one (see HAL
-// HARNESS_PROGRESS_SPEAK_P). DeliverHarnessProgress stays display-only.
+// AnnounceHarnessProgress offers a progress update to HAL's announcer, which speaks only occasionally
+// (HAL HARNESS_PROGRESS_SPEAK_P).
 func (h *AgentHandler) AnnounceHarnessProgress(runID, text string) {
 	if runID == "" || text == "" {
 		return
@@ -209,14 +207,25 @@ func (h *AgentHandler) AnnounceHarnessProgress(runID, text string) {
 	if !pending || state.delivered || state.webChat || state.restored || state.localOnly {
 		return
 	}
-	// A progress line is never worth a speech-cancel record or a history feed:
-	// a cancelled run simply stays quiet.
+	// Progress never records a speech-cancel or feeds history; a cancelled run stays quiet.
 	if h.isHarnessSpeechCancelled(runID) {
 		return
 	}
 	go func() {
 		if err := hal.AnnounceHarnessUpdate(hal.HarnessUpdateProgress, text, runID, ""); err != nil && !errors.Is(err, hal.ErrSpeakerMuted) {
 			slog.Debug("Harness progress announcement not queued", "component", "agent", "run_id", runID, "error", err)
+		}
+	}()
+}
+
+// AnnounceHarnessNotice speaks a device-level Harness notice that belongs to no local run.
+func (h *AgentHandler) AnnounceHarnessNotice(text string) {
+	if text == "" {
+		return
+	}
+	go func() {
+		if err := hal.AnnounceHarnessUpdate(hal.HarnessUpdateResult, text, "", ""); err != nil && !errors.Is(err, hal.ErrSpeakerMuted) {
+			slog.Warn("Harness notice announcement not queued", "component", "agent", "error", err)
 		}
 	}()
 }

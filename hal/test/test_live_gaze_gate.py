@@ -1,4 +1,6 @@
 """Live entry needs wake focus; closed focus must still allow STT wake detection."""
+import threading
+
 
 from types import MethodType, SimpleNamespace
 from unittest.mock import Mock
@@ -51,10 +53,8 @@ def test_wake_focus_opens_live_and_expiry_returns_to_stt(monkeypatch, gaze, shad
     service._wakeword_focus = WakeWordFocus(20, clock=lambda: now[0])
     service._realtime = Mock()
     service._realtime.wait_until_available.return_value = True
-    # Ambient speech must reach STT without preparing or sending live audio.
     assert service._live_decision([]) == "turn"
     service._realtime.prepare_turn.assert_not_called()
-    # The existing confirmed-wake dispatch (or a button/gaze) grants focus.
     service._wakeword_focus.refresh()
     assert service._live_decision([]) == "live"
     now[0] = 20.0
@@ -77,6 +77,11 @@ def test_live_opener_uses_stt_confirmation_before_granting_focus(
     monkeypatch.setattr(config, "REALTIME_ENABLED", True)
     monkeypatch.setattr(voice_service.voice_cfg, "LIVE_MODE", True)
     service = Mock()
+    service._automatic_reply_lock = threading.Lock()
+    service._automatic_reply_stop = None
+    service._automatic_reply_cancelled_at = None
+    service._stt_drain_worker = None
+    service._stt_drain_future = None
     service._running = False
     service._try_live_opener = MethodType(VoiceService._try_live_opener, service)
     service._tts = None
@@ -86,6 +91,8 @@ def test_live_opener_uses_stt_confirmation_before_granting_focus(
     service._music_is_playing.return_value = False
     service._decorator.starts_with_wake_word.side_effect = lambda text: text.lower().startswith("hello lamp")
     service._decorator.matches_wake_word_loosely.return_value = False
+    service._decorator.matches_wake_prefix_slot.return_value = False
+    service.bare_wake_phrase.return_value = False
     service._decorator.classify_wake_word.return_value = (final, "voice_command")
     service._decorator.identify_and_decorate.return_value = (final, None, None)
     stt = Mock()

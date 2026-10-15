@@ -1,8 +1,4 @@
-"""Keeping a local-model target on the local model.
-
-Two gates decided whether tracking a cup or a book felt like tracking a face,
-and both were sized for the face detector. These cover them.
-"""
+"""Keeping a local-model target on the local model."""
 
 import numpy as np
 
@@ -40,12 +36,7 @@ def _frame():
 
 
 def test_coco_miss_does_not_reach_remote_mid_session(monkeypatch):
-    """A local miss on a routine redetect must not spend a network round-trip on remote.
-
-    The detect thread is single-flight, so one such round-trip stretches the
-    confirm cycle past the trust window and freezes the servo while the object
-    is still in frame.
-    """
+    """A local miss on a routine redetect must not spend a network round-trip on remote."""
     calls: list = []
     det = _detector(monkeypatch, calls)
     assert det.detect(_frame(), "cup", strict=False,
@@ -70,6 +61,18 @@ def test_open_vocab_target_always_reaches_remote(monkeypatch):
     assert calls == ["rubik cube"]
 
 
+def test_people_never_reach_remote(monkeypatch):
+    """Unprompted look-arounds search for people; a miss must not upload the frame."""
+    calls: list = []
+    det = _detector(monkeypatch, calls)
+    monkeypatch.setattr(detection, "_detect_face_yunet", lambda frame: None)
+    for target in ("person", "people", "human", "face", "human face"):
+        assert det.detect(_frame(), target, strict=False) is None
+    monkeypatch.setattr(detection, "_get_local_yolo", lambda: None)  # weights missing
+    assert det.detect(_frame(), "person", strict=False) is None
+    assert calls == []
+
+
 def test_trust_window_floors_at_the_constant_for_a_fast_detector():
     """YuNet at ~30ms keeps exactly the window face tracking always had."""
     assert trust_window_s(0.03) == C.TRUST_TRACKER_S
@@ -81,6 +84,4 @@ def test_trust_window_grows_with_a_slower_detector():
     window = trust_window_s(0.6)
     assert window > C.TRUST_TRACKER_S
     assert window == C.YOLO_REDETECT_S + 1.2 + C.TRUST_MARGIN_S
-    # The point of the whole change: an ordinary miss (one full redetect cycle
-    # plus a detection) no longer reads as a lost lock.
     assert window > C.YOLO_REDETECT_S + 0.6

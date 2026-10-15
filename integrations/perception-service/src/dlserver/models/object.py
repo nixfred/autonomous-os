@@ -7,8 +7,6 @@ from pydantic import BaseModel, ConfigDict, Discriminator, Field, Tag
 from core.models.object import ObjectDetection
 from core.types import Omit, omit
 
-# --- WebSocket messages ---
-
 
 class ObjectFrameRequest(BaseModel):
     type: Literal["frame"] = "frame"
@@ -38,14 +36,13 @@ ObjectRequest = Annotated[
 ]
 
 
-# --- HTTP request/response ---
-
-
 class ObjectDetectRequest(BaseModel):
     """HTTP request for single-image object detection."""
 
     image_b64: str
     classes: list[str] | None = Field(None, max_length=500)
+    # Named server-side prompt list (e.g. "fire_hazard_v1"); wins over `classes`, unknown -> 400.
+    preset: str | None = Field(None, max_length=64)
 
 
 class ObjectDetectionItemResponse(BaseModel):

@@ -5,9 +5,7 @@ import { C, Field, SectionCard, ConfirmDialog, LABEL_STYLE } from "@/components/
 import { CameraCaptureModal } from "./CameraCaptureModal";
 import type { FaceOwner } from "@/hooks/setup/useFaceEnroll";
 
-// Phones get the OS camera app via <input capture>; desktops open the in-page
-// live-preview modal (getUserMedia). Coarse pointer + touch is a good enough
-// proxy for "this is a phone/tablet where the native camera UX is better".
+// Phones get the OS camera app via <input capture>
 function prefersNativeCapture(): boolean {
   if (typeof window === "undefined") return false;
   const coarse = window.matchMedia?.("(pointer: coarse)").matches ?? false;
@@ -15,23 +13,16 @@ function prefersNativeCapture(): boolean {
   return coarse && touch;
 }
 
-// A file paired with its object-URL preview. We keep the URL alongside the file
-// so the thumbnail grid can render it and we can revoke it precisely on removal.
 interface PendingPhoto {
   file: File;
   url: string;
 }
 
-// What the inline confirm dialog should do once the user accepts. We stash the
-// pending destructive action in state instead of calling window.confirm() so the
-// prompt matches the dark-amber theme.
 type PendingConfirm =
   | { kind: "owner"; label: string }
   | { kind: "photo"; label: string; filename: string };
 
-// Face enroll for edit-mode owners. State is local since nothing outside the
-// section reads it; faceOwners list comes from the page so Voice section can
-// share it.
+// Face enroll for edit-mode owners.
 export function FaceSection({
   active, faceOwners, loadFaceOwners,
 }: {
@@ -42,43 +33,31 @@ export function FaceSection({
   const [faceName, setFaceName] = useState("");
   const [pending, setPending] = useState<PendingPhoto[]>([]);
   const [faceUploading, setFaceUploading] = useState(false);
-  // Per-photo upload progress (count of photos sent so far). null when idle.
   const [uploadProgress, setUploadProgress] = useState<number | null>(null);
-  // Typed result message so we don't string-match "Error" to pick the colour.
   const [faceMsg, setFaceMsg] = useState<{ type: "success" | "error"; text: string } | null>(null);
   const [dragging, setDragging] = useState(false);
   const [cameraOpen, setCameraOpen] = useState(false);
-  // Decided once on mount (client-side). Routes the "Take photo" button: on
-  // phones/tablets it opens the OS camera app (native `capture` input); on
-  // desktop it opens the in-page live-preview modal, which the native picker
-  // can't replicate.
   const [nativeCapture] = useState(prefersNativeCapture);
   const faceInputRef = useRef<HTMLInputElement>(null);
-  // Separate hidden input with `capture` so the OS camera app opens directly on
-  // phones, leaving the plain picker above for library photos.
   const cameraInputRef = useRef<HTMLInputElement>(null);
   const [faceExpanded, setFaceExpanded] = useState<Record<string, boolean>>({});
   const [confirm, setConfirm] = useState<PendingConfirm | null>(null);
   const toggleFaceExpanded = (label: string) =>
     setFaceExpanded((prev) => ({ ...prev, [label]: !prev[label] }));
 
-  // Revoke all outstanding object URLs when the component unmounts so we don't
-  // leak blob references across the section's lifetime.
   useEffect(() => {
     return () => { pending.forEach((p) => URL.revokeObjectURL(p.url)); };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // Append picked/dropped image files to the pending list (skips non-images),
-  // minting a preview URL for each. Used by both the native picker and drop.
+  // Append picked/dropped image files to the pending list (skips non-images), minting a preview URL for each.
   const addFiles = (files: FileList | File[]) => {
     const imgs = Array.from(files).filter((f) => f.type.startsWith("image/"));
     if (imgs.length === 0) return;
     setPending((prev) => [...prev, ...imgs.map((file) => ({ file, url: URL.createObjectURL(file) }))]);
   };
 
-  // "Take photo" entry point: native camera app on phones, in-page live preview
-  // on desktop. Both paths feed addFiles(), so the rest of the flow is identical.
+  // "Take photo": native camera app on phones, live-preview modal on desktop.
   const openCamera = () => {
     if (nativeCapture) cameraInputRef.current?.click();
     else setCameraOpen(true);
@@ -143,10 +122,7 @@ export function FaceSection({
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ label, image_base64: b64 }),
         });
-        // Parse JSON defensively. A failed device call (HAL down, 404/502 from
-        // the proxy) returns an HTML error page, and resp.json() would throw
-        // "Unexpected token '<'" — a raw technical string an end-user can't act
-        // on. Read text first, try to parse, and fall back to a friendly line.
+        // Parse defensively: proxy errors return HTML.
         const raw = await resp.text();
         let data: { detail?: string; message?: string } = {};
         try { data = raw ? JSON.parse(raw) : {}; } catch { /* non-JSON (HTML error page) */ }
@@ -156,7 +132,6 @@ export function FaceSection({
           lastErr = data.detail || data.message || "Couldn't reach the camera. Make sure the robot is on and connected.";
         }
       } catch {
-        // Network failure / fetch rejected — device unreachable.
         lastErr = "Couldn't reach the camera. Make sure the robot is on and connected.";
       }
       setUploadProgress((n) => (n ?? 0) + 1);
@@ -192,21 +167,15 @@ export function FaceSection({
       <Field label="Name" id="face_name" value={faceName} onChange={setFaceName} placeholder="e.g. Leo" />
       <div style={{ marginBottom: 14 }}>
         <label style={{ ...LABEL_STYLE, marginBottom: 8 }}>Photos</label>
-        {/* Hidden native input keeps all enroll logic intact; the styled
-            dropzone below is just a click target that proxies to it. */}
         <input
           ref={faceInputRef}
           type="file"
           accept="image/*"
           multiple
-          // Reset value after reading so re-picking a file that was removed from
-          // the pending grid still fires onChange — otherwise the input holds the
-          // same value, the event never fires, and no preview appears.
+          // Reset so re-picking the same file fires onChange.
           onChange={(e) => { if (e.target.files) addFiles(e.target.files); e.target.value = ""; }}
           style={{ display: "none" }}
         />
-        {/* Phone-only path: `capture` opens the OS camera app straight away. On
-            desktop openCamera() ignores this and opens the live-preview modal. */}
         <input
           ref={cameraInputRef}
           type="file"
@@ -243,15 +212,11 @@ export function FaceSection({
                 ? `${pending.length} photo${pending.length !== 1 ? "s" : ""} selected`
                 : "Choose photos or drag them here…"}
           </span>
-          <span style={{ flexShrink: 0, fontSize: 11, color: C.textMuted }}>
+          <span style={{ flexShrink: 0, fontSize: 12, color: C.textDim }}>
             {pending.length ? "Add more" : "Browse"}
           </span>
         </button>
 
-        {/* Secondary capture path, on every device. openCamera() branches by
-            device: phones open the OS camera app (the `capture` input above) so
-            you can snap a face directly; desktop opens the in-page live-preview
-            modal. Both feed the same pending grid. */}
         <button
           type="button"
           onClick={openCamera}
@@ -267,13 +232,10 @@ export function FaceSection({
           <Camera size={16} />Take photo
         </button>
 
-        {/* Preview grid of the photos staged for enroll. Seeing the actual faces
-            before upload is the whole point — a "3 selected" count can't catch a
-            blurry or wrong-person pick. Each tile removes just itself. */}
         {pending.length > 0 && (
           <div style={{ marginTop: 10 }}>
             <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 8 }}>
-              <span style={{ fontSize: 11, color: C.textMuted }}>
+              <span style={{ fontSize: 12, color: C.textDim }}>
                 {pending.length} ready to enroll
               </span>
               <button
@@ -281,7 +243,7 @@ export function FaceSection({
                 onClick={clearPending}
                 style={{
                   background: "none", border: "none", cursor: "pointer",
-                  fontSize: 11, color: C.textMuted, padding: 0,
+                  fontSize: 12, color: C.textDim, padding: 0,
                 }}
               >
                 Clear all
@@ -289,13 +251,13 @@ export function FaceSection({
             </div>
             <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
               {pending.map((p, idx) => (
-                <div key={p.url} style={{ position: "relative", width: 64, height: 64 }}>
+                <div key={p.url} style={{ position: "relative", width: 88, height: 88 }}>
                   <img
                     src={p.url}
                     alt={p.file.name}
                     title={p.file.name}
                     style={{
-                      width: 64, height: 64, borderRadius: 8, objectFit: "cover",
+                      width: 88, height: 88, borderRadius: 8, objectFit: "cover",
                       border: `1px solid ${C.border}`, display: "block",
                     }}
                   />
@@ -305,14 +267,14 @@ export function FaceSection({
                     title={`Remove ${p.file.name}`}
                     aria-label={`Remove ${p.file.name}`}
                     style={{
-                      position: "absolute", top: -6, right: -6,
-                      width: 20, height: 20, borderRadius: "50%",
+                      position: "absolute", top: 0, right: 0,
+                      width: 40, height: 40, borderRadius: 8,
                       background: C.bg, border: `1px solid ${C.border}`,
                       cursor: "pointer", color: C.red, padding: 0,
                       display: "flex", alignItems: "center", justifyContent: "center",
                     }}
                   >
-                    <X size={12} />
+                    <X size={16} />
                   </button>
                 </div>
               ))}
@@ -325,17 +287,14 @@ export function FaceSection({
           role="status"
           aria-live="polite"
           style={{
-            fontSize: 11, padding: "6px 10px", borderRadius: 8, marginBottom: 10,
+            fontSize: 12, padding: "6px 10px", borderRadius: 8, marginBottom: 10,
             background: faceMsg.type === "error" ? "var(--lm-red-dim)" : "var(--lm-green-dim)",
             color: faceMsg.type === "error" ? C.red : C.green,
           }}
         >{faceMsg.text}</div>
       )}
-      {/* Why-disabled hint for the exact confusing state: photos are staged but
-          the Name field is still empty, so Enroll stays disabled. Without this,
-          a greyed-out button after picking photos reads as a bug. */}
       {pending.length > 0 && !faceName.trim() && !faceUploading && (
-        <div style={{ fontSize: 11, color: C.textMuted, marginBottom: 8, textAlign: "center" }}>
+        <div style={{ fontSize: 12, color: C.textDim, marginBottom: 8, textAlign: "center" }}>
           Enter a name above to enroll these {pending.length} photo{pending.length !== 1 ? "s" : ""}.
         </div>
       )}
@@ -359,7 +318,7 @@ export function FaceSection({
       </button>
       {enrolled.length > 0 && (
         <div style={{ marginTop: 16, borderTop: `1px solid ${C.border}`, paddingTop: 14 }}>
-          <div style={{ fontSize: 10, fontWeight: 700, color: C.textDim, textTransform: "uppercase", letterSpacing: "0.09em", marginBottom: 10 }}>
+          <div style={{ fontSize: 12, fontWeight: 700, color: C.textDim, textTransform: "uppercase", letterSpacing: "0.09em", marginBottom: 10 }}>
             Face Photos
           </div>
           {enrolled.map((p) => {
@@ -372,16 +331,15 @@ export function FaceSection({
                     onClick={() => toggleFaceExpanded(p.label)}
                     aria-expanded={expanded}
                     style={{
-                      // minWidth:0 lets the label truncate instead of pushing the
-                      // "Remove all" button off-screen on narrow phones.
+                      // minWidth:0 lets the label truncate.
                       flex: 1, minWidth: 0, display: "flex", alignItems: "center", gap: 8,
                       background: "none", border: "none", cursor: "pointer", padding: 0,
                       textAlign: "left", color: C.text,
                     }}
                   >
-                    <span style={{ flexShrink: 0, fontSize: 11, color: C.textMuted, transition: "transform 0.15s", transform: expanded ? "rotate(90deg)" : "none" }}>▶</span>
+                    <span style={{ flexShrink: 0, fontSize: 12, color: C.textDim, transition: "transform 0.15s", transform: expanded ? "rotate(90deg)" : "none" }}>▶</span>
                     <span style={{ fontSize: 13, fontWeight: 600, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{p.label}</span>
-                    <span style={{ flexShrink: 0, fontSize: 10, color: C.textMuted, fontWeight: 400 }}>({p.photo_count} photo{p.photo_count !== 1 ? "s" : ""})</span>
+                    <span style={{ flexShrink: 0, fontSize: 12, color: C.textDim, fontWeight: 400 }}>({p.photo_count} photo{p.photo_count !== 1 ? "s" : ""})</span>
                   </button>
                   {p.label !== "unknown" && (
                     <button
@@ -390,7 +348,7 @@ export function FaceSection({
                       style={{
                         flexShrink: 0,
                         background: "none", border: `1px solid ${C.border}`, borderRadius: 5,
-                        cursor: "pointer", fontSize: 10, color: C.red, padding: "3px 8px",
+                        cursor: "pointer", fontSize: 12, color: C.red, padding: "3px 8px",
                       }}
                     >
                       Remove all
@@ -400,13 +358,14 @@ export function FaceSection({
                 {expanded && p.photos.length > 0 && (
                   <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
                     {p.photos.map((photo) => (
-                      <div key={photo} style={{ position: "relative", width: 56, height: 56 }}>
+                      <div key={photo} style={{ position: "relative", width: 88, height: 88 }}>
                         <img
                           src={hwUrl(`/face/photo/${encodeURIComponent(p.label)}/${encodeURIComponent(photo)}`)}
                           title={photo}
+                          alt={`${p.label}: ${photo}`}
                           onClick={() => window.open(hwUrl(`/face/photo/${encodeURIComponent(p.label)}/${encodeURIComponent(photo)}`), "_blank", "noopener,noreferrer")}
                           style={{
-                            width: 56, height: 56, borderRadius: 8, objectFit: "cover",
+                            width: 88, height: 88, borderRadius: 8, objectFit: "cover",
                             border: `1px solid ${C.border}`, cursor: "pointer", display: "block",
                           }}
                         />
@@ -417,14 +376,14 @@ export function FaceSection({
                             title={`Delete ${photo}`}
                             aria-label={`Delete ${photo}`}
                             style={{
-                              position: "absolute", top: -6, right: -6,
-                              width: 18, height: 18, borderRadius: "50%",
+                              position: "absolute", top: 0, right: 0,
+                              width: 40, height: 40, borderRadius: 8,
                               background: C.bg, border: `1px solid ${C.border}`,
                               cursor: "pointer", color: C.red, padding: 0,
                               display: "flex", alignItems: "center", justifyContent: "center",
                             }}
                           >
-                            <X size={11} />
+                            <X size={16} />
                           </button>
                         )}
                       </div>

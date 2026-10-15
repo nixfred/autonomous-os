@@ -22,7 +22,8 @@ _dl_stall_lock = threading.Lock()
 
 def record_dl_stall(task: str, detail: str) -> None:
     """Append one line to the perception-service stall log so recurring WS recv timeouts
-    can be audited over time. Best-effort: never raises into the caller."""
+    can be audited over time.
+    """
     line = f"{datetime.now(timezone.utc).isoformat()}\t{task}\t{detail}\n"
     try:
         with _dl_stall_lock:
@@ -42,9 +43,12 @@ class DataObserver[T]:
 
     def _on_update(self):
         data = self.data
+        # Snapshot: subscriptors can be (un)registered at runtime from another thread.
+        with self._lock:
+            subscriptors = list(self._subscriptors)
 
         if data is not None:
-            for s in self._subscriptors:
+            for s in subscriptors:
                 s(data)
 
     def register(self, subscriptor: Callable[[T], None]):

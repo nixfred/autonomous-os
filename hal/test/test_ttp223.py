@@ -1,37 +1,14 @@
-"""TTP223 session / decision state machine — the D3 gap in the build plan.
-
-Until now the touch path had no test at all: `test_board.py` pins the wiring and
-nothing covered the state machine that turns edges into gestures. Phase 3 adds
-traversal classification and a second wake entrance to that machine, so the
-coverage stops being optional.
-
-Everything here drives `_on_edge(chip, gpio, level, tick)` directly with
-synthetic edge sequences — the same signature lgpio calls — so no hardware, no
-lgpio, and no timers wait in real time: the session and decision timers are
-fired by hand.
-
-Pads rest HIGH (pull-up), so level 0 is a touch and level 1 a release.
-
-The lamp runs TWO pads (96 and 100) since 2026-08-28, so that is the default
-geometry here. TestGeometryIndependent re-runs the core gestures on three pads:
-the classifier must not care how many are wired, and pad 98 silently vanishing
-from a 2-pad profile is exactly how a 3-pad test can pass while proving nothing.
-"""
+"""TTP223 session / decision state machine — the D3 gap in the build plan."""
 
 import importlib
 import os
 import unittest
 
-# PARKED (no issue): tap / double tap / swipe return early in _on_decision, only pet acts.
-# Drop this decorator from the tests below when they come back.
-parked = unittest.skip("PARKED: only pet acts on TTP223")
 from unittest import mock
 
 
 def _driver(swipe: bool, min_gap_ms: str = "35"):
-    """Re-import the driver with the flag in a given state — SWIPE_ENABLED is
-    resolved at import, which is what makes `flag off == today's behaviour`
-    testable at all."""
+    """Re-import the driver with SWIPE_ENABLED set, since it is read at import."""
     os.environ["HAL_TOUCH_SWIPE"] = "true" if swipe else "false"
     os.environ["HAL_TOUCH_SWIPE_MIN_GAP_MS"] = min_gap_ms
     os.environ["HAL_TOUCH_DEBUG"] = "false"
@@ -48,27 +25,31 @@ class _Harness:
         self.mod = mod
         self.h = mod.TTP223Handler(mod.TouchConfig(chip=0, lines=list(lines), axis=axis))
         self.h._chip, self.h._lines, self.h._axis = 0, list(lines), axis
-        self.h._ignore_edges_until = 0.0  # settle window already elapsed
+        self.h._ignore_edges_until = 0.0
         self.fired = []
         self._now_ms = 0.0
 
-    def touch(self, line, at_ms=None):
-        """One touch edge, optionally at a controlled monotonic time."""
-        self._edge(line, 0, at_ms)
+    def touch(self, line, at_ms=None, edge_ms=None):
+        """One touch edge, optionally at a controlled monotonic time.
 
-    def release(self, line, at_ms=None):
-        """One release edge. Release times matter too: how long the surface
-        stays empty is what separates a lift from a slide between pads."""
-        self._edge(line, 1, at_ms)
+        at_ms is when the callback runs; edge_ms is the edge's own kernel timestamp,
+        for callbacks delivered late or in a batch. They coincide unless edge_ms is given.
+        """
+        self._edge(line, 0, at_ms, edge_ms)
 
-    def _edge(self, line, level, at_ms):
-        # An untimed edge lands at the same instant as the previous one, so a
-        # sequence that never mentions time has no gaps anywhere.
+    def release(self, line, at_ms=None, edge_ms=None):
+        """One release edge."""
+        self._edge(line, 1, at_ms, edge_ms)
+
+    def _edge(self, line, level, at_ms, edge_ms=None):
+        # Untimed edges land at the same instant, so there are no gaps.
         if at_ms is None:
             at_ms = self._now_ms
         self._now_ms = at_ms
+        # lgpio passes the edge timestamp in nanoseconds.
+        tick = int((at_ms if edge_ms is None else edge_ms) * 1_000_000)
         with mock.patch.object(self.mod.time, "monotonic", return_value=at_ms / 1000.0):
-            self.h._on_edge(0, line, level, 0)
+            self.h._on_edge(0, line, level, tick)
 
     def end_session(self):
         """Fire the session-end timer by hand."""
@@ -86,12 +67,7 @@ class _Harness:
 
 def _record(mod, harness):
     """Patch every action the driver can dispatch."""
-    names = [
-        "single_click_action",
-        "head_pat_action",
-        "swipe_action",
-        "mic_toggle_action",
-    ]
+    names = ["head_pat_action"]
     patches = [
         mock.patch.object(
             mod, n, side_effect=lambda *a, _n=n, **k: harness.fired.append(_n)
@@ -105,8 +81,7 @@ def _record(mod, harness):
 
 class _Base(unittest.TestCase):
     swipe = False
-    # Tracks the shipped default so the suite exercises the real floor; override
-    # per-class only when a test is specifically about a different threshold.
+    # Tracks the shipped default so the suite exercises the real floor.
     min_gap = "35"
 
     def setUp(self):
@@ -122,9 +97,7 @@ class TestShippedDefaults(unittest.TestCase):
     """The two flags ship in opposite states, and both matter."""
 
     def test_gesture_classification_is_ON_by_default(self):
-        """Enabled 2026-08-27 after hands-on validation. A double tap toggles
-        the microphone and a swipe sleeps the device, so this default is a
-        user-visible commitment, not an implementation detail."""
+        """Swipe detection is enabled by default."""
         for var in ("HAL_TOUCH_SWIPE", "HAL_TOUCH_SWIPE_MIN_GAP_MS"):
             os.environ.pop(var, None)
         import hal.drivers.ttp223 as t
@@ -136,8 +109,7 @@ class TestShippedDefaults(unittest.TestCase):
         self.assertEqual(t.PRESS_MIN_EMPTY_MS, 15.0)
 
     def test_tracing_is_OFF_by_default(self):
-        """The tracer sits in the lgpio callback path and writes files. It must
-        cost nothing on a device nobody is debugging."""
+        """The tracer is off by default."""
         os.environ.pop("HAL_TOUCH_DEBUG", None)
         import hal.drivers.touch_debug as td
 
@@ -145,18 +117,16 @@ class TestShippedDefaults(unittest.TestCase):
         self.assertFalse(td._init())
 
 
-class TestFlagOffIsUnchanged(_Base):
-    """The default path must behave exactly as the shipped driver always has."""
+class TestFlagOffPetMapping(_Base):
+    """Disabling spatial classification still makes every headpad touch a pet."""
 
     swipe = False
-
-    @parked
 
     def test_one_contact_resolves_to_tap(self):
         self.hz.touch(96)
         self.hz.end_session()
         self.hz.decide()
-        self.assertEqual(self.hz.fired, ["single_click_action"])
+        self.assertEqual(self.hz.fired, ["head_pat_action"])
 
     def test_two_contacts_fire_pet_inline_on_count(self):
         for _ in range(2):
@@ -164,16 +134,13 @@ class TestFlagOffIsUnchanged(_Base):
             self.hz.end_session()
         self.assertEqual(self.hz.fired, ["head_pat_action"])
 
-    @parked
-
     def test_monotonic_three_pad_traversal_is_still_only_a_tap(self):
-        """With the flag off, traversal is recorded but must not classify —
-        otherwise 'default is unchanged' is not true."""
+        """With the flag off, traversal still resolves to one pet response."""
         for i, line in enumerate((96, 98, 100)):
             self.hz.touch(line, at_ms=i * 100)
         self.hz.end_session()
         self.hz.decide()
-        self.assertEqual(self.hz.fired, ["single_click_action"])
+        self.assertEqual(self.hz.fired, ["head_pat_action"])
 
     def test_pet_cooldown_swallows_further_contacts(self):
         for _ in range(2):
@@ -182,7 +149,7 @@ class TestFlagOffIsUnchanged(_Base):
         self.assertEqual(self.hz.fired, ["head_pat_action"])
         self.hz.touch(96)
         self.hz.end_session()
-        self.assertEqual(self.hz.fired, ["head_pat_action"])  # nothing new
+        self.assertEqual(self.hz.fired, ["head_pat_action"])
 
     def test_settle_window_suppresses_edges_entirely(self):
         self.hz.h._ignore_edges_until = self.mod.time.monotonic() + 5
@@ -194,14 +161,12 @@ class TestFlagOffIsUnchanged(_Base):
 class TestSwipe(_Base):
     swipe = True
 
-    @parked
-
     def test_a_pass_over_all_pads_is_a_swipe(self):
         for i, line in enumerate((96, 100)):
             self.hz.touch(line, at_ms=i * 100)
         self.hz.end_session()
         self.hz.decide()
-        self.assertEqual(self.hz.fired, ["swipe_action"])
+        self.assertEqual(self.hz.fired, ["head_pat_action"])
 
     def test_a_swipe_never_also_fires_a_tap(self):
         for i, line in enumerate((96, 100)):
@@ -210,79 +175,54 @@ class TestSwipe(_Base):
         self.hz.decide()
         self.assertNotIn("single_click_action", self.hz.fired)
 
-    @parked
-
     def test_both_directions_are_the_same_gesture(self):
-        """Left-to-right and right-to-left both resolve to swipe_action, which
-        always sleeps. Direction is not read anywhere in the path."""
+        """Both swipe directions resolve to head_pat_action."""
         for lines in ((96, 100), (100, 96)):
             self.hz.fired.clear()
             self.hz.h._reset_cycle()
+            self.hz.h._pet_cooldown_until = 0.0
             for i, line in enumerate(lines):
                 self.hz.touch(line, at_ms=i * 100)
             self.hz.end_session()
             self.hz.decide()
-            self.assertEqual(self.hz.fired, ["swipe_action"], lines)
-
-    @parked
+            self.assertEqual(self.hz.fired, ["head_pat_action"], lines)
 
     def test_a_RIGHT_TO_LEFT_swipe_registers_despite_a_bridged_landing(self):
-        """The reported bug, 2026-08-27: L->R swipes worked, R->L never did.
-
-        The surface is not symmetric. Starting from the right lands on L100 and
-        L98 together — adjacent pads, cross-talk bridges them in 5-28ms — and
-        only then travels to L96 over 65-104ms. Requiring EVERY gap to clear the
-        floor made that impossible. Real timings from trace 164804.
-        """
+        """A right-to-left swipe registers despite a bridged landing."""
         for at, line in ((0, 100), (109, 96)):
             self.hz.touch(line, at_ms=at)
         self.hz.end_session()
         self.hz.decide()
-        self.assertEqual(self.hz.fired, ["swipe_action"])
-
-    @parked
+        self.assertEqual(self.hz.fired, ["head_pat_action"])
 
     def test_cross_talk_burst_is_not_a_swipe(self):
-        """Device-measured shape: three pads inside ~20ms from one finger.
-        Ordering alone is not evidence — the gaps have to clear the floor."""
+        """Near-simultaneous pads are not a swipe."""
         for i, line in enumerate((96, 100)):
             self.hz.touch(line, at_ms=i * 10)
         self.hz.end_session()
         self.hz.decide()
-        self.assertEqual(self.hz.fired, ["single_click_action"])
-
-    @parked
+        self.assertEqual(self.hz.fired, ["head_pat_action"])
 
     def test_touching_only_one_pad_is_not_a_swipe(self):
         for i, line in enumerate((96,)):
             self.hz.touch(line, at_ms=i * 100)
         self.hz.end_session()
         self.hz.decide()
-        self.assertEqual(self.hz.fired, ["single_click_action"])
+        self.assertEqual(self.hz.fired, ["head_pat_action"])
 
 
 class TestPetKeepsWorking(_Base):
     swipe = True
 
     def test_a_CONTINUOUS_stroke_is_one_contact_and_still_a_pet(self):
-        """The reported bug, 2026-08-27: six pets in a row came back TAP.
-
-        A finger that never leaves the surface never lets the 200ms session
-        lapse, so a whole ~1s stroke arrives as a SINGLE contact and the
-        contact-count gate discarded it. What identifies it is the revisit —
-        the finger goes back over a pad it had left. Real sequence from trace
-        162337.
-        """
+        """A continuous stroke is one contact and still fires pet."""
         for i, line in enumerate((96, 100, 96, 100, 96, 100)):
             self.hz.touch(line, at_ms=i * 120)
         self.hz.end_session()
         self.assertEqual(self.hz.fired, ["head_pat_action"])
 
     def test_a_back_and_forth_stroke_is_a_pet_not_a_swipe(self):
-        """Device trace 160546: the user stroked left-right-left and got
-        DOUBLE_TAP. Each leg of a stroke is itself a clean one-direction pass,
-        so a swipe has to be the whole gesture — one contact — or every pet
-        resolves as a swipe."""
+        """A swipe must be a single contact; a multi-leg stroke is not a swipe."""
         for lines in ((96, 100), (100, 96)):
             for i, line in enumerate(lines):
                 self.hz.touch(line, at_ms=len(self.hz.h._contacts) * 1000 + i * 120)
@@ -290,48 +230,27 @@ class TestPetKeepsWorking(_Base):
         self.assertEqual(self.hz.fired, ["head_pat_action"])
 
     def test_a_hand_moving_between_contacts_fires_pet_immediately(self):
-        """A stroke is contacts in DIFFERENT places. Once they share no pad the
-        gesture cannot be a double tap, so pet keeps its fast path rather than
-        waiting out the decision window."""
+        """Contacts sharing no pad resolve to pet without waiting."""
         for n, line in enumerate((96, 100), 1):
             self.hz.touch(line)
             self.hz.end_session()
         self.assertEqual(self.hz.fired, ["head_pat_action"])
 
-    @parked
-
     def test_a_revisit_that_LANDED_is_a_double_tap_not_a_pet(self):
-        """The rule that replaced burst clustering. A revisit alone is not a
-        stroke: if two pads ever lit together the hand landed, so it tapped
-        twice. Device-measured 2026-08-28 — three double taps on the two-pad
-        lamp were read as PET because the old rule demanded every burst be
-        multi-pad, and one tap lit only one pad."""
+        """A revisit where pads lit together is a double tap, not a stroke."""
         for i, line in enumerate((96, 100, 96)):
-            self.hz.touch(line, at_ms=i * 10)     # 10ms steps -> landings
+            self.hz.touch(line, at_ms=i * 10)
         self.hz.end_session()
         self.hz.decide()
-        self.assertEqual(self.hz.fired, ["mic_toggle_action"])
-
-    @parked
+        self.assertEqual(self.hz.fired, ["head_pat_action"])
 
     def test_repeated_contact_in_one_place_is_a_double_tap_not_a_pet(self):
-        """The accepted cost of giving double tap an action.
-
-        "Two contacts, same pad" is simultaneously the double-tap signature and
-        the pet count-fallback signature. They are indistinguishable at the
-        signal level, so only one can win, and double tap does (decided
-        2026-08-27). The consequence, pinned here so it is impossible to change
-        by accident: a stroke so noisy that it registers as a single pad now
-        MUTES THE MIC instead of giggling.
-
-        The pet fallback still covers the commoner failure — a stroke whose pads
-        move but never resolve a clean reversal — see the test below.
-        """
+        """Repeated contact at one pad gets the same pet action as a stroke."""
         for _ in range(2):
             self.hz.touch(96)
             self.hz.end_session()
         self.hz.decide()
-        self.assertEqual(self.hz.fired, ["mic_toggle_action"])
+        self.assertEqual(self.hz.fired, ["head_pat_action"])
 
     def test_multi_pad_contacts_without_reversal_still_fall_back_to_pet(self):
         for n, line in enumerate((96, 100)):
@@ -344,87 +263,57 @@ class TestPetKeepsWorking(_Base):
 class TestDoubleTap(_Base):
     swipe = True
 
-    @parked
-
-    def test_a_FAST_double_tap_lands_in_one_contact_and_still_toggles_the_mic(self):
-        """The reported bug, 2026-08-27: fast multi-finger double taps came back
-        PET, slow ones worked.
-
-        Tapping quickly never lets the 200ms session lapse, so both taps arrive
-        in a SINGLE contact — and the second tap re-touches the same pads, which
-        the revisit rule reads as a stroke. What separates them is shape: a
-        double tap is two TIGHT bursts with a gap between (fingers landing
-        together), a stroke is evenly spread. Real sequence from trace 163036.
-        """
+    def test_a_FAST_double_tap_lands_in_one_contact_and_still_gives_one_pet(self):
+        """A fast double tap arriving in one contact fires one pet response."""
         # burst 1 at 0/2/12 ms, burst 2 at 300/302/312 ms
         for base in (0, 300):
             for off, line in ((0, 96), (8, 100)):
                 self.hz.touch(line, at_ms=base + off)
         self.hz.end_session()
         self.hz.decide()
-        self.assertEqual(self.hz.fired, ["mic_toggle_action"])
+        self.assertEqual(self.hz.fired, ["head_pat_action"])
 
     def test_an_evenly_spread_stroke_is_NOT_read_as_burst_pairs(self):
-        """The other side of the same rule. A stroke's steps are evenly spaced,
-        so it has no multi-pad clusters and can never look like repeated taps —
-        this is what keeps the fast-double-tap fix from eating pets."""
+        """An evenly spread stroke fires one pet response."""
         for i, line in enumerate((96, 100, 96, 100, 96, 100)):
             self.hz.touch(line, at_ms=i * 120)
         self.hz.end_session()
         self.assertEqual(self.hz.fired, ["head_pat_action"])
 
-    @parked
-
-    def test_repeated_contact_on_one_pad_toggles_the_mic(self):
+    def test_repeated_contact_on_one_pad_gives_one_pet(self):
         for _ in range(2):
             self.hz.touch(96)
             self.hz.end_session()
         self.hz.decide()
-        # Same pad twice: the case ttp223.py:70-76 documented as a known false
-        # positive now resolves to its own gesture.
-        self.assertEqual(self.hz.fired, ["mic_toggle_action"])
+        self.assertEqual(self.hz.fired, ["head_pat_action"])
 
-    @parked
-
-    def test_a_MULTI_FINGER_double_tap_in_one_place_still_toggles_the_mic(self):
-        """Double tap must not need a single fingertip. Three fingers light up
-        three pads, but they land TOGETHER — device-measured spread 1-23ms,
-        against 53-322ms for a finger that travels. Timing is what separates
-        them; pad count cannot."""
+    def test_a_MULTI_FINGER_double_tap_in_one_place_still_gives_one_pet(self):
+        """A multi-finger double tap fires one pet response."""
         for c in range(2):
             for i, line in enumerate((96, 100)):
                 self.hz.touch(line, at_ms=c * 1000 + i * 8)   # ~8ms apart
             self.hz.end_session()
         self.hz.decide()
-        self.assertEqual(self.hz.fired, ["mic_toggle_action"])
-
-    @parked
+        self.assertEqual(self.hz.fired, ["head_pat_action"])
 
     def test_a_three_finger_tap_is_one_tap_not_a_swipe(self):
-        """Three fingers light every pad at once. Without the timing test that
-        looks identical to a hand crossing the surface."""
+        """All pads lit together is a tap, not a crossing."""
         for i, line in enumerate((96, 100)):
             self.hz.touch(line, at_ms=i * 8)
         self.hz.end_session()
         self.hz.decide()
-        self.assertEqual(self.hz.fired, ["single_click_action"])
-
-    @parked
+        self.assertEqual(self.hz.fired, ["head_pat_action"])
 
     def test_a_contact_that_recorded_no_pads_still_counts(self):
-        """Device trace 154507: the second contact's touch edge fell the other
-        side of a session boundary, so it recorded only a release and no pads.
-        Counting contacts by pad-set would drop it to a single tap; the session
-        count is what the gate reads."""
+        """Contacts are counted by session, not by pad set."""
         self.hz.touch(96)
         self.hz.end_session()
-        self.hz.end_session()          # a contact that recorded nothing
+        self.hz.end_session()
         self.hz.decide()
-        self.assertEqual(self.hz.fired, ["mic_toggle_action"])
+        self.assertEqual(self.hz.fired, ["head_pat_action"])
 
     def test_contacts_in_different_places_are_a_pet_not_a_double_tap(self):
-        """The other side of the same rule — sharing no pad means the hand
-        moved, so multi-pad contacts must not all collapse into double tap."""
+        """Multi-pad contacts sharing no pad do not collapse into double tap."""
         for pads in ((96,), (100,)):
             for line in pads:
                 self.hz.touch(line)
@@ -432,21 +321,15 @@ class TestDoubleTap(_Base):
         self.assertIn("head_pat_action", self.hz.fired)
         self.assertNotIn("mic_toggle_action", self.hz.fired)
 
-    @parked
-
     def test_a_single_contact_is_not_a_double_tap(self):
         self.hz.touch(96)
         self.hz.end_session()
         self.hz.decide()
-        self.assertEqual(self.hz.fired, ["single_click_action"])
+        self.assertEqual(self.hz.fired, ["head_pat_action"])
 
 
 class TestTapReasonNamesTheNearestMiss(_Base):
-    """TAP is the fall-through, so "decision window expired" is true and
-    useless — it describes the branch that caught the gesture, not the rule that
-    declined it. Device traces 102922/102935 (2026-08-28) were swipes missing
-    the movement floor by 1.1 ms and read identically to a deliberate tap.
-    """
+    """A TAP reports the rule that declined the swipe, not the fall-through."""
 
     swipe = True
 
@@ -481,8 +364,7 @@ class TestSequenceHygiene(_Base):
     swipe = True
 
     def test_a_pad_refiring_under_a_still_finger_is_not_a_step(self):
-        """FastMode re-triggers on a stationary finger; counting the repeat
-        would invent a direction change."""
+        """A stationary repeat is not a direction change."""
         for line in (96, 96, 96, 100):
             self.hz.touch(line)
         self.assertEqual([l for l, _ in self.hz.h._contact], [96, 100])
@@ -494,8 +376,7 @@ class TestSequenceHygiene(_Base):
         self.assertEqual([l for l, _ in self.hz.h._contact], [96, 100])
 
     def test_contacts_are_cleared_once_a_gesture_resolves(self):
-        """Stale contacts would leak the previous gesture into the next one
-        and misclassify it."""
+        """Contacts are cleared between gestures."""
         for i, line in enumerate((96, 100)):
             self.hz.touch(line, at_ms=i * 100)
         self.hz.end_session()
@@ -505,8 +386,7 @@ class TestSequenceHygiene(_Base):
 
 
 class TestAxis(_Base):
-    """Axis only bites when three or more pads are wired — with two there is
-    exactly one ordering, so these declare a three-pad profile explicitly."""
+    """Three-pad profile, since axis only matters with three or more pads."""
 
     swipe = True
 
@@ -519,8 +399,7 @@ class TestAxis(_Base):
         self.assertTrue(is_swipe)
 
     def test_a_measured_axis_reorders_the_traversal_test(self):
-        """With a real axis where line order != spatial order, the same edge
-        sequence reads as a turn rather than a straight pass."""
+        """With a real axis, line order and spatial order can differ."""
         hz = _Harness(self.mod, lines=(96, 98, 100), axis=[96, 100, 98])
         for i, line in enumerate((96, 98, 100)):
             hz.touch(line, at_ms=i * 100)
@@ -529,31 +408,19 @@ class TestAxis(_Base):
 
 
 class TestTravelBand(_Base):
-    """A swipe's gap must be a JOURNEY — not a landing, and not a lift.
-
-    Two deliberate taps landing on different pads produce exactly the shape of
-    a swipe: each pad once, no revisit, a gap above the floor. Only the size of
-    the gap tells them apart. Measured 2026-08-28 on labelled gestures:
-
-        landing   6.4  7.6  27.2 ms
-        travel   69.7  80.6 ms
-        lift    196.7  273.7  291.6  291.8 ms
-    """
+    """A swipe's gap must be a JOURNEY — not a landing, and not a lift."""
 
     swipe = True
-
-    @parked
 
     def test_a_gap_inside_the_band_is_a_swipe(self):
         for at, line in ((0, 96), (80, 100)):
             self.hz.touch(line, at_ms=at)
         self.hz.end_session()
         self.hz.decide()
-        self.assertEqual(self.hz.fired, ["swipe_action"])
+        self.assertEqual(self.hz.fired, ["head_pat_action"])
 
     def test_a_gap_above_the_ceiling_is_a_lift_not_a_swipe(self):
-        """Device trace 120736: two taps on separate pads, 196.7 ms apart, read
-        as a swipe because the rule had a floor but no ceiling."""
+        """A gap above the travel ceiling is a lift, not a swipe."""
         for at, line in ((0, 100), (197, 96)):
             self.hz.touch(line, at_ms=at)
         self.hz.end_session()
@@ -569,13 +436,7 @@ class TestTravelBand(_Base):
 
 
 class TestReTouchAfterRelease(_Base):
-    """A touch following a RELEASE of the same pad is a real second contact.
-
-    A line cannot emit two falling edges without a rising edge between, so the
-    repeat-collapse that swallows FastMode chatter was also swallowing genuine
-    re-touches. Device trace 120736: tap L100, release, tap L100 again, and the
-    second one vanished — leaving one long journey instead of a double tap.
-    """
+    """A touch following a RELEASE of the same pad is a real second contact."""
 
     swipe = True
 
@@ -591,8 +452,6 @@ class TestReTouchAfterRelease(_Base):
         self.hz.touch(100, at_ms=5)
         self.assertEqual([l for l, _ in self.hz.h._contact], [100])
 
-    @parked
-
     def test_the_full_120736_sequence_resolves_to_a_double_tap(self):
         for at, line, lvl in ((0, 100, 0), (92, 100, 1), (183, 100, 0),
                               (197, 96, 0), (288, 96, 1), (291, 100, 1)):
@@ -602,104 +461,70 @@ class TestReTouchAfterRelease(_Base):
                 self.hz.release(line)
         self.hz.end_session()
         self.hz.decide()
-        self.assertEqual(self.hz.fired, ["mic_toggle_action"])
+        self.assertEqual(self.hz.fired, ["head_pat_action"])
 
 
 class TestPressCount(_Base):
-    """A PRESS is the hand arriving on the surface — nothing held, then held.
-
-    During a swipe the finger reaches the far pad before the near one
-    auto-releases, so the surface never empties: the whole gesture is ONE press.
-    Two taps always empty it in between. Device-measured 2026-08-28 over every
-    labelled gesture — swipes 1 press, double taps 2, no overlap at all.
-
-    This is what catches two taps on DIFFERENT pads, which have no revisit and
-    no landing and are otherwise shaped exactly like a swipe (traces 131615 and
-    131625: tap L96, lift, tap L100).
-    """
+    """A PRESS is the hand arriving on the surface — nothing held, then held."""
 
     swipe = True
 
-    @parked
-
     def test_a_swipe_is_one_press(self):
         self.hz.touch(96, at_ms=0)
-        self.hz.touch(100, at_ms=80)      # far pad before the near one releases
+        self.hz.touch(100, at_ms=80)
         self.hz.release(96)
         self.hz.release(100)
         self.assertEqual(self.hz.h._presses, 1)
         self.hz.end_session(); self.hz.decide()
-        self.assertEqual(self.hz.fired, ["swipe_action"])
-
-    @parked
+        self.assertEqual(self.hz.fired, ["head_pat_action"])
 
     def test_two_taps_on_DIFFERENT_pads_is_a_double_tap(self):
         """No revisit and no landing — the press count is the only evidence."""
         self.hz.touch(96, at_ms=0)
-        self.hz.release(96, at_ms=92)     # surface empties, and stays empty
+        self.hz.release(96, at_ms=92)
         self.hz.touch(100, at_ms=272)
         self.hz.release(100, at_ms=345)
         self.assertEqual(self.hz.h._presses, 2)
         self.hz.end_session(); self.hz.decide()
-        self.assertEqual(self.hz.fired, ["mic_toggle_action"])
+        self.assertEqual(self.hz.fired, ["head_pat_action"])
 
     def test_a_second_press_stops_it_being_a_swipe(self):
-        """Even inside the travel band, the hand having left means it did not
-        cross the surface — it tapped twice."""
+        """A second press inside the travel band stops it being a swipe."""
         self.hz.touch(96, at_ms=0)
-        self.hz.release(96, at_ms=20)     # ...and the hand stayed off for 60 ms
-        self.hz.touch(100, at_ms=80)      # gap is inside the band
+        self.hz.release(96, at_ms=20)
+        self.hz.touch(100, at_ms=80)
         self.hz.end_session(); self.hz.decide()
         self.assertNotIn("swipe_action", self.hz.fired)
 
     def test_a_slide_between_pads_is_not_a_second_press(self):
-        """The finger leaves the near pad microseconds after reaching the far
-        one, so the surface is briefly empty mid-swipe. Counting that hole as
-        the hand arriving again turned a swipe into a double tap — device trace
-        135217, a textbook 105.8 ms travel gap lost on a 0.7 ms hole."""
+        """A brief empty surface mid-swipe is not a lift."""
         self.hz.touch(100, at_ms=0)
-        self.hz.release(100, at_ms=0)  # surface empty...
-        self.hz.touch(96, at_ms=0.7)  # ...for 0.7 ms
+        self.hz.release(100, at_ms=0)
+        self.hz.touch(96, at_ms=0.7)
         self.assertEqual(self.hz.h._presses, 1)
 
     def test_a_real_lift_still_counts(self):
-        """Every genuine lift in the captured traces left the surface empty for
-        at least 23.8 ms; the floor sits at 15."""
+        """A genuine lift above the 15 ms floor still counts as a press."""
         self.hz.touch(96, at_ms=0)
         self.hz.release(96, at_ms=0)
         self.hz.touch(100, at_ms=30)
         self.assertEqual(self.hz.h._presses, 2)
 
-    @parked
-
     def test_the_full_135217_sequence_resolves_to_a_swipe(self):
         for at, line, lvl in ((0, 100, 0), (105.8, 100, 1), (106.5, 96, 0), (241, 96, 1)):
             self.hz.touch(line, at_ms=at) if lvl == 0 else self.hz.release(line, at_ms=at)
         self.hz.end_session(); self.hz.decide()
-        self.assertEqual(self.hz.fired, ["swipe_action"])
-
-    @parked
+        self.assertEqual(self.hz.fired, ["head_pat_action"])
 
     def test_the_full_131615_sequence_resolves_to_a_double_tap(self):
         for at, line, lvl in ((0, 96, 0), (92, 96, 1), (272, 100, 0), (345, 100, 1)):
             self.hz.touch(line, at_ms=at) if lvl == 0 else self.hz.release(line, at_ms=at)
         self.hz.end_session(); self.hz.decide()
-        self.assertEqual(self.hz.fired, ["mic_toggle_action"])
+        self.assertEqual(self.hz.fired, ["head_pat_action"])
 
 
 class TestGeometryIndependent(_Base):
-    """The same rules must hold on three pads.
-
-    The classifier was rewritten for a three-pad lamp and the lamp then dropped
-    to two, so "works on the current hardware" is not the property worth
-    testing — "does not depend on how many pads are wired" is. These re-run the
-    core gestures with a three-pad profile.
-
-    They also guard a trap: when the board profile went to two pads, every
-    existing three-pad test kept passing, because a touch on the unwired middle
-    pad is silently dropped from the position map. They proved nothing until the
-    wiring was declared explicitly, as it is here.
-    """
+    """The same rules must hold on three pads."""
 
     swipe = True
 
@@ -712,23 +537,19 @@ class TestGeometryIndependent(_Base):
         for p in self._p:
             p.start()
 
-    @parked
-
     def test_a_pass_over_three_pads_is_a_swipe(self):
         for i, line in enumerate((96, 98, 100)):
             self.hz.touch(line, at_ms=i * 100)
         self.hz.end_session()
         self.hz.decide()
-        self.assertEqual(self.hz.fired, ["swipe_action"])
-
-    @parked
+        self.assertEqual(self.hz.fired, ["head_pat_action"])
 
     def test_a_three_finger_landing_is_a_tap(self):
         for i, line in enumerate((96, 98, 100)):
             self.hz.touch(line, at_ms=i * 8)
         self.hz.end_session()
         self.hz.decide()
-        self.assertEqual(self.hz.fired, ["single_click_action"])
+        self.assertEqual(self.hz.fired, ["head_pat_action"])
 
     def test_a_stroke_over_three_pads_is_a_pet(self):
         """All travel, revisits — no landing anywhere."""
@@ -737,16 +558,14 @@ class TestGeometryIndependent(_Base):
         self.hz.end_session()
         self.assertEqual(self.hz.fired, ["head_pat_action"])
 
-    @parked
-
-    def test_a_fast_double_tap_over_three_pads_toggles_the_mic(self):
+    def test_a_fast_double_tap_over_three_pads_gives_one_pet(self):
         """Two landings with a gap between, in one contact."""
         for base in (0, 300):
             for off, line in ((0, 96), (8, 98), (16, 100)):
                 self.hz.touch(line, at_ms=base + off)
         self.hz.end_session()
         self.hz.decide()
-        self.assertEqual(self.hz.fired, ["mic_toggle_action"])
+        self.assertEqual(self.hz.fired, ["head_pat_action"])
 
     def test_missing_a_pad_is_not_a_swipe(self):
         """Every wired pad is the proof it crossed; two of three is not."""
@@ -755,6 +574,164 @@ class TestGeometryIndependent(_Base):
         self.hz.end_session()
         self.hz.decide()
         self.assertNotIn("swipe_action", self.hz.fired)
+
+
+class TestDetectedPads(_Base):
+    """Four candidate lines, two wired: rules follow the detected pads."""
+
+    swipe = True
+
+    def setUp(self):
+        super().setUp()
+        self.hz = _Harness(self.mod, lines=(37, 96, 97, 98))
+        self.hz.h._active = {97, 98}
+        for p in self._p:
+            p.stop()
+        self._p = _record(self.mod, self.hz)
+        for p in self._p:
+            p.start()
+
+    def _is_swipe(self):
+        self.hz.h._close_contact()
+        return self.hz.h._classify()[0]
+
+    def test_a_pass_over_the_two_wired_pads_is_a_swipe(self):
+        for i, line in enumerate((97, 98)):
+            self.hz.touch(line, at_ms=i * 100)
+        self.assertTrue(self._is_swipe())
+
+    def test_one_wired_pad_is_not_a_swipe(self):
+        self.hz.touch(97, at_ms=0)
+        self.assertFalse(self._is_swipe())
+
+    def _run_armed_timers(self):
+        """Fire only the timers the edges armed, as the real driver would."""
+        if self.hz.h._session_end_timer is not None:
+            self.hz.end_session()
+        if self.hz.h._decision_timer is not None:
+            self.hz.decide()
+
+    def test_a_glitch_on_an_undetected_line_is_not_learned_and_fires_nothing(self):
+        """A 1 ms transient on a bare candidate pin is not a pad and not a gesture."""
+        self.hz.touch(37, at_ms=1000)
+        self.hz.release(37, at_ms=1001)
+        self.assertEqual(self.hz.h._active, {97, 98})
+        self.assertIsNone(self.hz.h._session_end_timer)
+        self.assertEqual((self.hz.h._contact, self.hz.h._presses), ([], 0))
+        self._run_armed_timers()
+        self.assertEqual(self.hz.fired, [])
+        self.assertEqual(self.hz.h._wired(), {97, 98})
+
+    def test_a_fall_with_no_release_is_not_learned_and_fires_nothing(self):
+        self.hz.touch(37, at_ms=1000)
+        self.assertEqual(self.hz.h._active, {97, 98})
+        self._run_armed_timers()
+        self.assertEqual(self.hz.fired, [])
+
+    def test_a_sustained_touch_on_an_undetected_line_is_learned_and_delivered(self):
+        """A pad the startup probe missed is admitted by its first real touch."""
+        self.hz.touch(37, at_ms=1000)
+        self.assertEqual(self.hz.h._active, {97, 98})
+        self.hz.release(37, at_ms=1060)
+        self.assertEqual(self.hz.h._active, {37, 97, 98})
+        self._run_armed_timers()
+        self.assertEqual(self.hz.fired, ["head_pat_action"])
+
+    def test_a_low_just_under_the_floor_is_not_learned(self):
+        self.hz.touch(37, at_ms=1000)
+        self.hz.release(37, at_ms=1000 + self.mod.LEARN_MIN_LOW_MS - 1)
+        self.assertEqual(self.hz.h._active, {97, 98})
+
+    def test_a_glitch_whose_callbacks_run_far_apart_is_still_a_glitch(self):
+        """A 1 ms pulse stays a transient even when its release callback runs 50 ms late."""
+        self.hz.touch(37, at_ms=1000, edge_ms=1000)
+        self.hz.release(37, at_ms=1050, edge_ms=1001)
+        self.assertEqual(self.hz.h._active, {97, 98})
+        self.assertIsNone(self.hz.h._session_end_timer)
+        self._run_armed_timers()
+        self.assertEqual(self.hz.fired, [])
+
+    def test_a_real_touch_whose_callbacks_run_back_to_back_is_still_learned(self):
+        """An 80 ms touch stays a touch even when both callbacks are delivered 1 ms apart."""
+        self.hz.touch(37, at_ms=2000, edge_ms=1000)
+        self.hz.release(37, at_ms=2001, edge_ms=1080)
+        self.assertEqual(self.hz.h._active, {37, 97, 98})
+        self._run_armed_timers()
+        self.assertEqual(self.hz.fired, ["head_pat_action"])
+
+    def test_a_glitch_does_not_stop_a_later_real_touch_being_learned(self):
+        self.hz.touch(37, at_ms=1000)
+        self.hz.release(37, at_ms=1001)
+        self.hz.touch(37, at_ms=2000)
+        self.hz.release(37, at_ms=2080)
+        self.assertEqual(self.hz.h._active, {37, 97, 98})
+
+    def test_a_learned_pad_is_handled_at_once_from_then_on(self):
+        self.hz.touch(37, at_ms=1000)
+        self.hz.release(37, at_ms=1060)
+        self._run_armed_timers()
+        self.hz.h._pet_cooldown_until = 0.0
+        self.hz.touch(37, at_ms=5000)
+        self.assertEqual(self.hz.h._contact, [(37, 5.0)])
+
+    def test_nothing_detected_learns_each_pad_from_its_first_touch(self):
+        self.hz.h._active = set()
+        for line, down, up in ((96, 0, 60), (37, 100, 160)):
+            self.hz.touch(line, at_ms=down)
+            self.hz.release(line, at_ms=up)
+        self.assertEqual(self.hz.h._active, {37, 96})
+        self._run_armed_timers()
+        self.assertEqual(self.hz.fired, ["head_pat_action"])
+        self.hz.h._pet_cooldown_until = 0.0
+        for i, line in enumerate((96, 37)):
+            self.hz.touch(line, at_ms=5000 + i * 100)
+        self.assertTrue(self._is_swipe())
+
+    def test_release_never_marks_a_line_wired(self):
+        self.hz.release(37, at_ms=0)
+        self.assertEqual(self.hz.h._active, {97, 98})
+        self.assertIsNone(self.hz.h._session_end_timer)
+
+
+class TestPetOnlyActions(_Base):
+    swipe = True
+
+    def test_resolved_tap_arms_and_extends_pet_cooldown(self):
+        with mock.patch.object(self.mod.time, "monotonic", return_value=10.0):
+            self.hz.touch(96, at_ms=10000)
+            self.hz.release(96, at_ms=10050)
+            self.hz.end_session()
+            self.hz.decide()
+        self.assertEqual(self.hz.fired, ["head_pat_action"])
+        self.assertEqual(self.hz.h._pet_cooldown_until, 11.5)
+        with mock.patch.object(self.mod.time, "monotonic", return_value=10.5):
+            self.hz.touch(96, at_ms=10500)
+            self.hz.release(96, at_ms=10550)
+            self.hz.end_session()
+            self.hz.decide()
+        self.assertEqual(self.hz.fired, ["head_pat_action"])
+        self.assertEqual(self.hz.h._pet_cooldown_until, 12.0)
+        with mock.patch.object(self.mod.time, "monotonic", return_value=12.1):
+            self.hz.touch(96, at_ms=12100)
+            self.hz.release(96, at_ms=12150)
+            self.hz.end_session()
+            self.hz.decide()
+        self.assertEqual(self.hz.fired, ["head_pat_action", "head_pat_action"])
+
+    def test_first_contact_only_plays_chime_during_speech(self):
+        from hal import app_state
+        from hal.routes import voice
+        tts = mock.Mock(speaking=True)
+        def inline_thread(*, target, **kwargs):
+            return mock.Mock(start=target)
+        with mock.patch.object(app_state, "tts_service", tts), \
+             mock.patch.object(voice, "stop_tts") as stop, \
+             mock.patch.object(self.mod, "play_pet_chime") as chime, \
+             mock.patch.object(self.mod.threading, "Thread", side_effect=inline_thread):
+            self.mod.TTP223Handler._ack_first_session(self.hz.h)
+        chime.assert_called_once_with(source="TTP223")
+        stop.assert_not_called()
+        tts.stop.assert_not_called()
 
 
 if __name__ == "__main__":

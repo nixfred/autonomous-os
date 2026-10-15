@@ -28,7 +28,7 @@ func newFocusStepController(t *testing.T) (*VoiceController, *focusStepTransport
 		f.focusRevision = "rev-2"
 		return Frame{"focus": f.focus, "focusRevision": f.focusRevision}, nil
 	}
-	v := NewVoiceController(f, VoiceCallbacks{})
+	v := NewVoiceController(f, VoiceCallbacks{SupportsMode: func(context.Context) (bool, error) { return true, nil }})
 	if err := v.RefreshFocus(context.Background()); err != nil {
 		t.Fatal(err)
 	}
@@ -100,8 +100,7 @@ func TestFocusStepUnknownDeliveryDoesNotRetry(t *testing.T) {
 }
 func TestFocusStepSucceedsWhenRefreshLagsBehindCommittedSwitch(t *testing.T) {
 	v, f := newFocusStepController(t)
-	// The app switched and said so in the reply, but focus.get is still stale
-	// (or failing) right after the step. The gesture must not report failure.
+	// Stale focus.get right after an accepted step must not report failure.
 	f.step = func(Frame) (Frame, error) {
 		f.focusRevision = ""
 		return Frame{"focus": Frame{"machineId": "computer", "agentId": "lagging-agent", "name": "Lagging"}, "focusRevision": "rev-9"}, nil

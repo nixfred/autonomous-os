@@ -1,13 +1,8 @@
-"""DL Backend Load Balancer — round-robin reverse proxy with encryption.
+"""DL Backend Load Balancer: round-robin reverse proxy with optional RSA/AES encryption.
 
-All incoming requests are prefixed with /_internal and forwarded back
-through nginx, which routes /_internal/hal/ → :8001 (DL server)
-and /_internal/ → :8000 (old DL server), stripping the prefix.
-
-When crypto is enabled, the LB handles encryption/decryption:
-- GET /api/crypto/public-key returns the RSA public key
-- HTTP: CipherHTTPRequest decrypted before forwarding, response encrypted
-- WS: WSKeyExchangeRequest first, then WSCipherMessage both directions
+Requests are forwarded to backends under INTERNAL_PREFIX. With crypto enabled,
+HTTP bodies carry a per-request RSA-wrapped AES key; WS does one key exchange
+up front and encrypts every frame in both directions.
 """
 
 import argparse
@@ -15,6 +10,7 @@ import asyncio
 import logging
 import logging.handlers
 import os
+import re
 import signal
 import sys
 from contextlib import asynccontextmanager
@@ -35,8 +31,10 @@ from lbserver.models import WSCipherMessage, WSKeyExchangeRequest
 from lbserver.routes.crypto import router as crypto_router
 from lbserver.utils import RoundRobin
 from lbserver.utils.crypto import encrypt_http_response, try_decrypt_http_body
+from lbserver.utils.switch import read_active, resolve_backends, write_ack
 from core.livez import router as livez_router
-from core.logging_ext import ResilientRotatingFileHandler
+from core.logging_ext import ResilientRotatingFileHandler, queued, uvicorn_file_log_config
+from core.stackdump import install_stack_dump, stack_dump_name
 from core.request_context import (
     InstanceAlreadyRunning,
     acquire_instance_lock,
@@ -47,17 +45,23 @@ from lbserver.utils.state import get_crypto, set_crypto
 
 LOG_FORMAT = "%(asctime)s [%(name)s] [%(request_id)s] %(levelname)s: %(message)s"
 
+# A regex, not json.loads: frames are ~100 KB and this runs on the event loop for
+# every message, only to build a log line.
+_FRAME_B64 = re.compile(r'"frame_b64"\s*:\s*"([^"]*)"')
+
+
+def _loggable_ws_text(data: str) -> str:
+    """Log form of a client WS message: the base64 frame replaced by its length."""
+    return _FRAME_B64.sub(
+        lambda m: f'"frame_b64": "<{len(m.group(1))} chars>"', data
+    )[:100]
+
+
 # Must run before any record is emitted: LOG_FORMAT references %(request_id)s.
 install_request_id_logging()
 
-# Holds the single-instance flock for the process lifetime; closing it releases.
 _instance_lock: object | None = None
 logger = logging.getLogger("lbserver")
-
-
-# ---------------------------------------------------------------------------
-# Config
-# ---------------------------------------------------------------------------
 
 INTERNAL_PREFIX: str = settings.lb.internal_prefix
 BACKENDS: list[str] = [b.strip().rstrip("/") for b in settings.lb.backends.split(",") if b.strip()]
@@ -69,15 +73,50 @@ if not BACKENDS:
 http_rr = RoundRobin(BACKENDS)
 ws_rr = RoundRobin(BACKENDS)
 
+STATE_FILE: Path | None = Path(settings.lb.state_file) if settings.lb.state_file else None
 
-# ---------------------------------------------------------------------------
-# App
-# ---------------------------------------------------------------------------
+
+def apply_state_file() -> list[str]:
+    """Point http_rr/ws_rr at the slot named in lb.state_file and ack it.
+
+    proxy_http/proxy_ws read these module globals on every request, so rebinding
+    them moves new requests; in-flight requests and open WebSockets keep the
+    backend they already picked.
+    """
+    global http_rr, ws_rr
+    if STATE_FILE is None:
+        return list(BACKENDS)
+    backends = resolve_backends(BACKENDS, read_active(STATE_FILE))
+    http_rr, ws_rr = RoundRobin(backends), RoundRobin(backends)
+    write_ack(STATE_FILE, backends)
+    logger.warning("[switch] backends -> %s", ", ".join(backends))
+    return backends
+
+
+def install_switch() -> None:
+    """Apply lb.state_file now and again on every SIGHUP.
+
+    A bad state file never takes lbserver down: the error is logged, the current
+    backends stay and no ack is written, so the deploy script sees the switch did
+    not happen and rolls back.
+    """
+    if STATE_FILE is None:
+        return
+
+    def _apply(context: str) -> None:
+        try:
+            apply_state_file()
+        except Exception:
+            logger.exception(
+                "[switch] %s: state file not applied, keeping backends", context
+            )
+
+    _apply("startup")
+    signal.signal(signal.SIGHUP, lambda signum, frame: _apply("SIGHUP"))
 
 
 @asynccontextmanager
 async def _lifespan(app: FastAPI):
-    # Initialize crypto if enabled
     if settings.crypto.enabled:
         crypto = RSAAESCrypto(
             key_dir=settings.crypto.key_dir,
@@ -86,8 +125,7 @@ async def _lifespan(app: FastAPI):
         set_crypto(crypto)
         logger.info("Encryption enabled (key_dir=%s)", settings.crypto.key_dir)
 
-    # One client for the whole process. Created last so an earlier startup failure
-    # cannot leak it, and closed first on shutdown.
+    # Created last so an earlier startup failure cannot leak it.
     app.state.http_client = httpx.AsyncClient(
         timeout=httpx.Timeout(
             settings.lb.http_timeout, connect=settings.lb.connect_timeout
@@ -115,15 +153,8 @@ async def _lifespan(app: FastAPI):
 app = FastAPI(title="DL Backend Load Balancer", lifespan=_lifespan)
 app.middleware("http")(request_id_middleware)
 app.include_router(crypto_router, prefix="/api/crypto")
-# Liveness: no prefix, no auth. MUST be registered before the catch-all
-# proxy route below, or /livez would be forwarded to a backend instead of
-# answering locally -- which would make lbserver look dead whenever dlserver is.
+# Must be registered before the catch-all proxy route, or /livez gets forwarded.
 app.include_router(livez_router)
-
-
-# ---------------------------------------------------------------------------
-# HTTP reverse proxy (all methods, all paths)
-# ---------------------------------------------------------------------------
 
 
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"])
@@ -140,19 +171,11 @@ async def proxy_http(request: Request, path: str) -> Response:
     body: bytes = await request.body()
     encrypted_key: bytes | None = None
 
-    # HTTP is stateless (no persistent session like WS), so each encrypted request
-    # carries its own RSA-wrapped AES key. We capture that `encrypted_key` here and
-    # reuse it below to encrypt the RESPONSE with the same AES session — that is the
-    # only thing tying request and response together. `encrypted_key is not None`
-    # therefore doubles as the "this exchange is encrypted" flag.
-    # When crypto is off (or the body is plaintext and require_encryption is false)
-    # `try_decrypt_http_body` returns the body unchanged and encrypted_key stays None.
+    # Each encrypted request carries its own RSA-wrapped AES key; the response is
+    # encrypted with the same key. encrypted_key is None means plaintext exchange.
     if request.method in ("POST", "PUT", "PATCH") and body:
         body, encrypted_key = try_decrypt_http_body(body)
 
-    # Reuse the process-wide pooled client. Constructing one per request re-parsed
-    # the CA bundle every time (~11ms of CPU even for a plaintext localhost call)
-    # and opened a fresh TCP connection that was never reused.
     client: httpx.AsyncClient | None = getattr(request.app.state, "http_client", None)
     if client is None:  # pragma: no cover - only if lifespan did not run
         logger.error("[HTTP] No pooled client; lifespan did not run")
@@ -166,11 +189,7 @@ async def proxy_http(request: Request, path: str) -> Response:
             params=dict(request.query_params),
             content=body,
         )
-    # Order matters: TimeoutException is a subclass of RequestError, so it must be
-    # caught first. A hung-but-listening backend completes the TCP handshake (the
-    # kernel does it, into the accept queue), so ConnectError never fires and the
-    # read times out instead -- previously that escaped uncaught and Starlette
-    # rendered a generic 500, hiding the fact that the backend was the problem.
+    # TimeoutException subclasses RequestError, so it must be caught first.
     except httpx.TimeoutException:
         logger.error(
             "[HTTP] Backend timed out after %ss: %s", settings.lb.http_timeout, backend
@@ -193,7 +212,6 @@ async def proxy_http(request: Request, path: str) -> Response:
         resp.text[:100],
     )
 
-    # Encrypt response if request was encrypted
     if encrypted_key is not None:
         content = encrypt_http_response(content, encrypted_key)
         resp_headers["content-type"] = "application/json"
@@ -206,18 +224,12 @@ async def proxy_http(request: Request, path: str) -> Response:
     )
 
 
-# ---------------------------------------------------------------------------
-# WebSocket reverse proxy
-# ---------------------------------------------------------------------------
-
-
 @app.websocket("/{path:path}")
 async def proxy_ws(client_ws: WebSocket, path: str) -> None:
     backend: str = ws_rr.next()
     ws_backend: str = backend.replace("http://", "ws://").replace("https://", "wss://")
     ws_url: str = f"{ws_backend}{INTERNAL_PREFIX}/{path}"
 
-    # Forward auth headers
     extra_headers: dict[str, str] = {}
     for key in ("x-api-key", "authorization"):
         val: str | None = client_ws.headers.get(key)
@@ -230,23 +242,9 @@ async def proxy_ws(client_ws: WebSocket, path: str) -> None:
     crypto = get_crypto()
     session: AESGCMSession | None = None
 
-    # Handle key exchange BEFORE connecting to the backend. Unlike HTTP, a WS
-    # connection is long-lived, so we establish one AES session up front and reuse it
-    # for every frame in both directions.
-    #
-    # Close-code convention (RFC 6455):
-    #   1008 (policy violation) — client failed to follow the required handshake
-    #       (no key-exchange frame, or it didn't validate) while encryption is
-    #       mandatory. It's the client's fault, so we signal a policy breach.
-    #   1011 (internal error)   — the key-exchange frame WAS well-formed but
-    #       decryption/session setup threw (bad RSA key, tampered payload). The
-    #       failure is server-side crypto, so we signal an internal error.
-    #
-    # require_encryption gating:
-    #   - true  → a missing/invalid handshake closes the socket (fail closed).
-    #   - false → we fall through with session=None and `first_msg` preserved, so
-    #       the connection proceeds as PLAINTEXT (the first message is forwarded
-    #       verbatim to the backend below). This is the dev/back-compat path.
+    # Key exchange happens before connecting to the backend. Close 1008 = missing or
+    # invalid handshake while require_encryption; 1011 = AES key unwrap failed.
+    # Without require_encryption a non-handshake first frame is forwarded as plaintext.
     first_msg: str | None = None
     if crypto is not None:
         try:
@@ -256,28 +254,23 @@ async def proxy_ws(client_ws: WebSocket, path: str) -> None:
                 session = crypto.create_session(key_req.to_raw_key())
                 await client_ws.send_json({"status": "key_exchange_ok"})
                 logger.info("[WS] /%s → %s: Encrypted session established", path, ws_url)
-                first_msg = None  # consumed — it was the handshake, not real traffic
+                first_msg = None
             except ValidationError:
-                # First frame wasn't a key exchange. Reject only if encryption is required;
-                # otherwise keep first_msg and treat the connection as plaintext.
                 if settings.crypto.require_encryption:
                     await client_ws.close(code=1008, reason="Key exchange required")
                     return
         except asyncio.TimeoutError:
-            # Client sent nothing within 5s — same policy as a missing handshake.
             if settings.crypto.require_encryption:
                 await client_ws.close(code=1008, reason="Key exchange required")
                 return
             first_msg = None
         except (ValueError, InvalidTag) as e:
-            # Handshake parsed but the wrapped AES key could not be decrypted.
             logger.error("[WS] /%s → %s: Key exchange failed: %s", path, ws_url, e)
             await client_ws.close(code=1011, reason=f"Key exchange failed: {e}")
             return
 
     try:
         async with websockets.connect(ws_url, additional_headers=extra_headers, open_timeout=settings.lb.ws_open_timeout) as backend_ws:
-            # Forward the first message if it wasn't a key exchange
             if first_msg is not None:
                 await backend_ws.send(first_msg)
 
@@ -306,7 +299,7 @@ async def proxy_ws(client_ws: WebSocket, path: str) -> None:
                             path,
                             ws_url,
                             session is not None,
-                            data[:100],
+                            _loggable_ws_text(data),
                         )
                         await backend_ws.send(data)
                 except WebSocketDisconnect:
@@ -361,7 +354,7 @@ async def proxy_ws(client_ws: WebSocket, path: str) -> None:
                 await asyncio.gather(*tasks, return_exceptions=True)
 
     except TimeoutError as e:
-        # websockets raises this on open_timeout; it is what a hung backend produces.
+        # Raised by websockets on open_timeout (hung backend).
         logger.error("[WS] Backend handshake timed out: %s — %s", backend, e)
         await client_ws.close(code=1011, reason=f"Backend timed out: {backend}")
     except (websockets.exceptions.InvalidStatus, OSError) as e:
@@ -369,11 +362,6 @@ async def proxy_ws(client_ws: WebSocket, path: str) -> None:
         await client_ws.close(code=1011, reason=f"Backend unreachable: {backend}")
     except WebSocketDisconnect:
         logger.info("[WS] Client disconnected: /%s", path)
-
-
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
 
 
 def parse_args() -> argparse.Namespace:
@@ -393,52 +381,28 @@ def _setup_logging(log_dir: str | None) -> dict[str, Any] | None:
 
     try:
         Path(log_dir).mkdir(parents=True, exist_ok=True)
-        # Hold this for the process lifetime -- see acquire_instance_lock. It must
-        # be taken BEFORE the rotation below, which renames/unlinks unconditionally.
+        # Must be taken before the rotation below, which renames/unlinks unconditionally.
         global _instance_lock
         _instance_lock = acquire_instance_lock(log_dir)
         log_path = Path(log_dir) / "lbserver.log"
         uvicorn_log_path = Path(log_dir) / "uvicorn.log"
-        # Rotate old logs
         for prefix in ("lbserver.log", "uvicorn.log"):
             for bak in Path(log_dir).glob(f"{prefix}*.bak"):
                 bak.unlink()
             for old in Path(log_dir).glob(f"{prefix}*"):
                 old.rename(Path(str(old) + ".bak"))
-        handler = ResilientRotatingFileHandler(str(log_path), maxBytes=1_048_576, backupCount=3)
-        handler.setFormatter(logging.Formatter(LOG_FORMAT))
-        logging.basicConfig(level=logging.INFO, handlers=[handler])
+        file_handler = ResilientRotatingFileHandler(
+            str(log_path), maxBytes=1_048_576, backupCount=3
+        )
+        file_handler.setFormatter(logging.Formatter(LOG_FORMAT))
+        # Queued: logger.info() on the event loop only enqueues. A write that hangs
+        # on the log volume blocks the writer thread, not every request (#530).
+        logging.basicConfig(level=logging.INFO, handlers=[queued(file_handler)])
 
-        # Route uvicorn/fastapi logs to a separate file.
-        # NOTE: "uvicorn" and "uvicorn.access" MUST share a single handler instance.
-        # Two RotatingFileHandlers on the same path keep independent byte counters and
-        # roll over independently, so one eventually unlinks the inode the other still
-        # holds open. On MooseFS (/workspace) writing to a deleted-but-open file returns
-        # EIO, which floods stderr with logging tracebacks and can wedge the process.
-        return {
-            "version": 1,
-            "disable_existing_loggers": False,
-            "formatters": {
-                "default": {"format": LOG_FORMAT},
-            },
-            "handlers": {
-                "file": {
-                    "formatter": "default",
-                    "class": "core.logging_ext.ResilientRotatingFileHandler",
-                    "filename": str(uvicorn_log_path),
-                    "maxBytes": 1_048_576,
-                    "backupCount": 3,
-                },
-            },
-            "loggers": {
-                "uvicorn": {"handlers": ["file"], "level": "INFO", "propagate": False},
-                "uvicorn.error": {"level": "INFO"},
-                "uvicorn.access": {"handlers": ["file"], "level": "INFO", "propagate": False},
-            },
-        }
+        # Route uvicorn/fastapi logs to a separate file (one shared, queued handler).
+        return uvicorn_file_log_config(str(uvicorn_log_path), LOG_FORMAT)
     except InstanceAlreadyRunning:
-        # Never fall back to console here: continuing would run a second instance
-        # that clobbers the live one's log files. Propagate and let main() exit.
+        # Never fall back to console: a second instance would clobber the live one's logs.
         raise
     except Exception as e:
         logging.basicConfig(level=logging.INFO, format=LOG_FORMAT)
@@ -458,6 +422,12 @@ def main() -> None:
         logger.critical("SIGTERM received — shutting down (pid=%d)", os.getpid())
 
     signal.signal(signal.SIGTERM, _handle_sigterm)
+    install_switch()
+    try:
+        dump = install_stack_dump(stack_dump_name(args.log_dir, "lbserver"))
+        logger.info("Stack dump on SIGUSR1 → %s", dump)
+    except OSError as e:
+        logger.warning("Stack dump not installed: %s", e)
 
     if args.pid_file:
         try:

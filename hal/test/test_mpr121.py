@@ -103,14 +103,13 @@ class TestMPR121(unittest.TestCase):
     def make_handler(self, **kwargs):
         return MPR121Handler(MPR121Config(bus=5, **kwargs))
 
-    def test_hold_feedback_follows_debounced_tiers_until_release(self):
+    def test_disabled_hold_does_not_arm_led_feedback(self):
         handler = self.make_handler()
         handler._hold_led = feedback = mock.Mock()
         for sample in [(False, 0), (True, 1), (True, 1.04),
                        (True, 2.999), (True, 3), (True, 6), (True, 11)]:
             handler._process_touch(*sample)
-        self.assertEqual(feedback.set_tier.call_args_list,
-                         [mock.call(1), mock.call(2)])
+        feedback.set_tier.assert_not_called()
         feedback.commit.assert_not_called()
         feedback.release.reset_mock()
         handler._process_touch(False, 11.1)
@@ -128,24 +127,14 @@ class TestMPR121(unittest.TestCase):
         feedback.set_tier.assert_not_called()
         feedback.commit.assert_not_called()
 
-    def test_feedback_commits_before_shared_hold_action(self):
+    def test_holds_never_call_shared_sleep_or_shutdown(self):
         handler = self.make_handler()
         handler._hold_led = feedback = mock.Mock()
-        calls = mock.Mock()
-        calls.attach_mock(feedback.commit, 'led')
-        with mock.patch('hal.drivers.mpr121.hold_release_action') as hold:
-            calls.attach_mock(hold, 'action')
-            handler._execute(_GestureEvent('hold', 1, held_s=5))
-        self.assertEqual(calls.mock_calls,
-                         [mock.call.led(5, factory_reset=False), mock.call.action(5, source='MPR121')])
-
-    def test_cancelled_feedback_commit_does_not_start_hold_action(self):
-        handler = self.make_handler()
-        handler._hold_led = mock.Mock()
-        handler._hold_led.commit.return_value = False
-        with mock.patch('hal.drivers.mpr121.hold_release_action') as hold:
-            handler._execute(_GestureEvent('hold', 1, held_s=10))
-        hold.assert_not_called()
+        with mock.patch('hal.drivers.button_actions.hold_release_action') as action:
+            for seconds in (2, 4.99, 5, 10, 30):
+                handler._execute(_GestureEvent('hold', 1, held_s=seconds))
+        action.assert_not_called()
+        feedback.commit.assert_not_called()
 
     def test_stop_and_poll_fault_stop_feedback(self):
         for fault in (False, True):
@@ -186,7 +175,10 @@ class TestMPR121(unittest.TestCase):
         handler._initialize()
         for electrode in range(12):
             self.assertIn(mock.call(0x5A, 0x41 + electrode * 2, 6), bus.write_reg.call_args_list)
-            self.assertIn(mock.call(0x5A, 0x42 + electrode * 2, 3), bus.write_reg.call_args_list)
+            self.assertIn(mock.call(0x5A, 0x42 + electrode * 2, 4), bus.write_reg.call_args_list)
+        # Lamp filter: FFI 34 (code 3), SFI 10 (code 2), ESI 1 ms (code 0); chip debounce 2/2.
+        for register, value in ((0x5B, 0x22), (0x5C, 0xD0), (0x5D, 0x30), (0x7B, 0xCB)):
+            self.assertIn(mock.call(0x5A, register, value), bus.write_reg.call_args_list)
 
     def test_autoconfig_disabled(self):
         handler = self.make_handler(autoconfig=False)
@@ -198,7 +190,6 @@ class TestMPR121(unittest.TestCase):
     def test_selected_electrodes_overlap_form_one_touch(self):
         handler = self.make_handler(electrodes=(0, 1))
         handler._bus = mock.Mock()
-        # Electrode 2 is excluded. Overlapping 0 and 1 must not split the tap.
         masks = [4, 1, 1, 3, 2, 2, 4, 4]
         handler._bus.read_regs.side_effect = [mask.to_bytes(2, 'little') for mask in masks]
         times = [0, 1, 1.04, 2, 3, 3.04, 4, 4.04]
@@ -211,12 +202,33 @@ class TestMPR121(unittest.TestCase):
         handler = self.make_handler(electrodes=(0,))
         handler._bus = mock.Mock()
         handler._bus.read_regs.side_effect = [mask.to_bytes(2, 'little') for mask in (0, 1, 1, 3, 2)]
-        with self.assertLogs('hal.drivers.mpr121', level='INFO') as logs:
+        with self.assertLogs('hal.drivers.mpr121', level='DEBUG') as logs:
             results = [handler._read_touched() for _ in range(5)]
         self.assertEqual(results, [False, True, True, True, False])
         self.assertEqual(len(logs.output), 4)
         self.assertIn('raw_mask=0x003 selected_mask=0x001 selected_active=0x001 touched=[1] released=[]', logs.output[2])
         self.assertIn('raw_mask=0x002 selected_mask=0x001 selected_active=0x000 touched=[] released=[0]', logs.output[3])
+
+    def test_normal_tap_polling_is_quiet_at_info(self):
+        handler = self.make_handler()
+        handler._bus = mock.Mock()
+        handler._bus.read_regs.side_effect = [mask.to_bytes(2, 'little') for mask in (1, 1, 0, 0)]
+        handler._detector.update(False, 0)
+        with self.assertNoLogs('hal.drivers.mpr121', level='INFO'):
+            for now in (1, 1.04, 1.2, 1.24):
+                handler._process_touch(handler._read_touched(), now)
+        self.assertEqual(handler._pending.get_nowait()[1].kind, 'single')
+
+    def test_debug_retains_tap_gesture_and_queue_diagnostics(self):
+        handler = self.make_handler()
+        handler._detector.update(False, 0)
+        with self.assertLogs('hal.drivers.mpr121', level='DEBUG') as logs:
+            for touched, now in ((True, 1), (True, 1.04), (False, 1.2), (False, 1.24)):
+                handler._process_touch(touched, now)
+        output = '\n'.join(logs.output)
+        for kind in ('press', 'release', 'single'):
+            self.assertIn(f'event=gesture kind={kind}', output)
+        self.assertIn('event=action_queued gesture_id=1 action=single', output)
 
     def test_overcurrent_is_fault_not_release(self):
         handler = self.make_handler()
@@ -321,8 +333,10 @@ class TestMPR121(unittest.TestCase):
                 handler.stop()
             action.assert_called_once_with(source='MPR121', announce=False)
         output = '\n'.join(logs.output)
-        for event in ('action_queued', 'action_begin', 'action_complete'):
+        for event in ('action_begin', 'action_complete'):
             self.assertIn(f'event={event} gesture_id=1 action=single', output)
+        self.assertNotIn('event=action_queued', output)
+        self.assertNotIn('event=gesture', output)
 
     def test_poll_failure_closes_bus_and_stops_dispatch(self):
         handler = self.make_handler(poll_ms=1)
@@ -390,8 +404,7 @@ class TestMPR121(unittest.TestCase):
                     self.assertLogs('hal.drivers.mpr121', level='INFO') as logs:
                 handler._action_thread = threading.Thread(target=handler._dispatch)
                 handler._action_thread.start()
-                # Observing an empty queue means the worker has consumed the request;
-                # stop then joins it before assertions about execution/logging.
+                # An empty queue means the worker consumed the request; stop then joins it.
                 deadline = time.monotonic() + 1
                 while not handler._pending.empty() and time.monotonic() < deadline:
                     threading.Event().wait(.001)

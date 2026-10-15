@@ -14,8 +14,7 @@ type halAnnounceTransport func(*http.Request) (*http.Response, error)
 
 func (f halAnnounceTransport) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
 
-// captureHALUpdates records every HAL request body by path; HAL's client uses
-// http.DefaultTransport.
+// captureHALUpdates records every HAL request body by path.
 func captureHALUpdates(t *testing.T) <-chan map[string]any {
 	t.Helper()
 	original := http.DefaultTransport
@@ -110,8 +109,7 @@ func TestHarnessProgressAnnouncedOnlyForLiveVoiceRuns(t *testing.T) {
 	}
 }
 
-// A realtime reply to a newer, unrelated utterance must not mute a Harness
-// update: the announcer waits for a free moment itself. Only the click does.
+// A realtime reply to a newer utterance must not mute a Harness update; only the click does.
 func TestHarnessUpdatesIgnoreRealtimeSupersedeButHonorClick(t *testing.T) {
 	const run = "device-chat-270-1790318924951"
 	later := int64(1790319247903) // someone chatted after the task was sent
@@ -141,5 +139,28 @@ func TestHarnessUpdatesIgnoreRealtimeSupersedeButHonorClick(t *testing.T) {
 	err := clicked.SpeakHarnessGroupedResult("Story done.", "completed", []string{run})
 	if !errors.Is(err, ErrHarnessResultSpeechSuppressed) {
 		t.Fatalf("click must still silence the result, got %v", err)
+	}
+}
+
+func TestHarnessPermissionNoticeSpeaksOnVoiceRunAndStaysSilentInChat(t *testing.T) {
+	got := captureHALUpdates(t)
+	h := &AgentHandler{}
+	const notice = "Agent test needs permission. Open OpenHarness to review and approve or deny."
+	h.MarkHarnessResponseRun("chat-run", true, false)
+	if !h.DeliverHarnessQuestion("chat-run", "q1", notice) {
+		t.Fatal("chat notice not delivered")
+	}
+	h.MarkHarnessResponseRun("voice-run", false, false)
+	if !h.DeliverHarnessQuestion("voice-run", "q2", notice) {
+		t.Fatal("voice notice not delivered")
+	}
+	// Only the voice run reaches the speaker; a chat notice would arrive first otherwise.
+	payload := nextHALUpdate(t, got)
+	if payload["kind"] != "question" || payload["text"] != notice || payload["turn_id"] != "voice-run" {
+		t.Fatalf("wrong update %v", payload)
+	}
+	h.AnnounceHarnessNotice(notice)
+	if payload := nextHALUpdate(t, got); payload["kind"] != "result" || payload["turn_id"] != "" {
+		t.Fatalf("device notice %v", payload)
 	}
 }

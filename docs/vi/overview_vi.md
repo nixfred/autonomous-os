@@ -1,5 +1,13 @@
 # Tổng Quan Kiến Trúc — Autonomous
 
+README dùng [sơ đồ stack tĩnh nền tối](../architecture/autonomous-stack-dark.svg). Bản này giữ nguyên nhãn, thứ tự tầng và sắc màu riêng của từng tầng trong [sơ đồ gốc](../architecture/autonomous-stack.svg), tăng độ sáng của chữ trên nền tối. Ô nét đứt vẫn chỉ các điểm mở rộng. Không có animation tuần tự: thứ tự các tầng không phải luồng thực thi request. Khi sửa sơ đồ gốc, cập nhật bản trình bày này để mọi nhãn luôn khớp.
+
+### Ba nhánh trên cùng một SVG
+
+[platform-flows.svg](../architecture/platform-flows.svg) dùng chung các khối thiết bị, realtime, runtime chính và đầu ra giọng nói cho ba ví dụ: hội thoại trực tiếp, phát nhạc và chỉnh âm lượng qua music/audio skills → OS dispatch hoặc HAL API → driver, và tác vụ máy tính qua Harness. Kết quả cuối của Harness đi qua OS về HAL, không quay lại runtime chính. Ví dụ âm nhạc dùng `music` để phát và gửi emotion marker, `audio` để chỉnh âm lượng. Mic là đầu vào voice; LED khi phát nhạc là phản ứng của HAL trên body có RGB, còn tùy ưu tiên sleep/TTS, không phải một skill bắt buộc khác. Phần cứng hỗ trợ tùy body; đường tắt local intent và các nhánh định tuyến khác nằm ngoài minh họa này.
+
+SVG độc lập, không có script hay tài nguyên bên ngoài. Vòng CSS dài 18 giây lần lượt nhấn sáng từng nhánh, hiệu ứng LED khi phát nhạc và nâng máy bay khỏi vị trí ban đầu được vẽ nét đứt. Chữ và đường nối vẫn hiện khi không chạy animation; trình xem hỗ trợ reduced-motion sẽ tắt hiệu ứng. GitHub README hiển thị SVG tĩnh; tải file và mở bằng trình duyệt để xem chuyển động. Sửa trực tiếp trong SVG. README giữ sơ đồ stack tĩnh ở dưới. Thời gian chỉ minh họa, không phải số đo.
+
 ## Kiến Trúc 3 Tầng
 
 ```
@@ -8,7 +16,7 @@ Agentic Runtime (AI/LLM) → OS Server (Go, :5000) → HAL (Python, :5001) → P
 
 | Tầng | Ngôn ngữ | Port | Vai trò |
 |------|----------|------|---------|
-| Agentic Runtime | Go | WS | Bộ não AI, LLM, SKILL.md, memory, channels |
+| Agentic Runtime | Go | WS / SSE | Bộ não AI, LLM, SKILL.md, memory, channels (Hermes và Hermes remote dùng HTTP+SSE; các runtime khác dùng WebSocket) |
 | OS Server | Go | 5000 | Hệ thống (mạng, OTA, MQTT, reset), sensing event routing, local intent |
 | HAL | Python | 5001 | Hardware drivers (servo, LED, camera, audio, display), FastAPI |
 
@@ -17,7 +25,7 @@ Agentic Runtime (AI/LLM) → OS Server (Go, :5000) → HAL (Python, :5001) → P
 - **[Harness](https://github.com/autonomous-ai/openharness):** `harness-use` giao việc lập trình và nghiên cứu cho agent trên máy tính đã ghép đôi qua kết nối LAN trực tiếp có xác thực. Câu hỏi và kết quả được trả về qua giọng nói hoặc chat. Chế độ Harness-only voice chuyển bản thu tap-to-record thủ công tới agent đang được chọn trong Harness. Xem [Harness](harness_vi.md).
 - **Thao tác Mac:** `computer-use` cho phép agent trên thiết bị quan sát, thao tác và kiểm tra kết quả qua Autonomous Buddy, sử dụng Cua Driver tích hợp cùng hỗ trợ ảnh chụp màn hình. Buddy thực thi thao tác desktop; agent trên thiết bị chịu trách nhiệm suy luận và hoàn thành công việc. Harness và Buddy có ghép đôi và kết nối riêng. Xem [Computer use](../../integrations/companions/autonomous-buddy/docs/vi/computer-use_vi.md).
 - **Jev:** plugin Hermes do OS quản lý chọn và nạp trước một skill đã cài trước lần gọi model đầu tiên; nếu không thành công thì dùng cơ chế tìm skill thông thường. Plugin này được bật trong bản build hiện tại; nhánh dự phòng cho voice intent tách biệt mặc định bật, còn endpoint gợi ý thao tác Buddy được bật nhưng vẫn thử nghiệm. Việc chọn không thực thi thao tác hay cấp quyền. Xem [Nạp trước skill Hermes](agentic/hermes_vi.md), [Intent fallback](os-server_vi.md), và [Gợi ý Buddy](os-server_vi.md).
-- **Realtime voice:** HAL hỗ trợ Gemini Live (model mặc định `gemini-3.8-live`), OpenAI Realtime, GPT-Live và Pipecat v1. Pipecat điều phối STT → LLM tương thích OpenAI (mặc định `qwen/qwen3.6-35b-a3b`) → HAL TTS trên thiết bị; các lời gọi model vẫn dùng dịch vụ từ xa. Giọng nói thông thường có thể trả lời trực tiếp hoặc giao việc cho runtime chính.
+- **Realtime voice:** HAL hỗ trợ Gemini Live (os-server seed `gemini-3.8-live-extended-thinking` vào `config.json` và seed lại cho các block `realtime` chưa pin; fallback riêng của HAL khi chưa cấu hình model là `gemini-3.8-live`), OpenAI Realtime, GPT-Live và Pipecat v1. Pipecat điều phối STT → LLM tương thích OpenAI (mặc định `qwen/qwen3.6-35b-a3b`) → HAL TTS trên thiết bị; các lời gọi model vẫn dùng dịch vụ từ xa. Giọng nói thông thường có thể trả lời trực tiếp hoặc giao việc cho runtime chính.
 - **Smart Turn:** suy luận ONNX cục bộ bổ sung cho phát hiện khoảng lặng ở đường thu âm rảnh tay non-Live dùng chung; Pipecat Live có pipeline Silero VAD + Smart Turn riêng. Cơ chế dự phòng theo khoảng lặng giới hạn thời gian chờ khi suy luận không khả dụng. Bản thu Harness thủ công kết thúc khi người dùng chạm. Extra `pipecat` được cài trong luồng thiết lập Lamp/Pi/OrangePi và không dùng trên Reachy do xung đột dependency ONNX. Xem [Realtime voice](realtime-voice_vi.md).
 
 ## Thư Mục Dự Án
@@ -163,6 +171,27 @@ ngày 2026-09-11, xác minh startup thành công. Chờ live test cử chỉ.
 Xem [điều khiển vật lý](../../robots/lamp/docs/vi/physical-controls_vi.md) để
 biết cấu hình và chi tiết cử chỉ.
 
+Ngưỡng quá tải servo cũng do device quản lý, trong `robots/lamp/servo_overload.json`
+(map `boards`: `load`, `hold_s`, `retry_s`, cùng `enabled`, `contact` và `torque_limit`
+tùy chọn), đọc bởi `hal/board/servo_overload.py`. Khớp được theo dõi ở mức sàn
+`contact.load` của nó trở lên trong `contact.hold_s` làm driver feetech dừng tại chỗ
+(torque vẫn bật), không phát âm thanh, và đứng yên trong `contact.pause_s` rồi mới chạy tiếp vào
+idle; vẫn bị giữ sau `contact.release_after_s` trong lúc dừng thì nhả torque như cut-off. Khớp nào ở mức `load` trở lên trong `hold_s` sẽ cắt torque mọi servo, phát ack chime và
+từ chối chuyển động trong `retry_s` rồi mới resume. `torque_limit` giới hạn lực đẩy tối đa
+của một khớp. Không có file, không có entry board hoặc `enabled: false` nghĩa là không có
+cơ chế nào trong số này, còn file sai định dạng bị từ chối khi startup. Trường mà HAL
+không biết thì không tính là sai định dạng: mọi config theo board (`servo_overload`,
+`gpio_button`, `mpr121`, `ttp223`, `privacy_button`, `sen55`, `sen63c`, `scd41`) ghi log
+rồi bỏ qua nó (`hal/board/config_fields.py`), vì gói device và HAL cập nhật riêng, gói
+mới hơn không được làm chết HAL cũ hơn (lamp-52e6 khởi động lỗi 6 lần vì
+`contact.release_after_s` với HAL 0.1.282). Lamp theo dõi
+`base_yaw` 55 %, `wrist_roll` 75 %, `wrist_pitch` 65 % trong 0.05 s với pause 3 s, và
+khi một recording chạy thì mọi khớp bị giữ trong envelope đã học theo từng frame + 12 %
+load hoặc + 3,5° lag (`contact.profile_margin`, `contact.lag_margin`, học riêng từng máy
+bằng `POST /servo/contact/learn`), quay nhìn theo gaze, tracking và giữ tư thế dùng sàn
+load/lag của `contact.off_playback`, giới hạn `base_yaw`, `base_pitch` và `elbow_pitch` ở
+60 % torque, và giữ cut-off ở 80 % / 1.5 s / 120 s (đo trên lamp-52e6). Xem phần fail-safe của [an toàn](safety_vi.md).
+
 ## Nguyên Tắc
 
 - **Hardware là plugin** — cắm vào thì play, không cắm thì skip
@@ -240,7 +269,8 @@ trên board — trỏ `OS_CONFIG_PATH` vào state dir của `make os-dev` là m�
 nuôi cả hai process. Riêng `llm_api_key` phủ cả LLM, `AutonomousSTT`, TTS
 ElevenLabs, mô tả ảnh, **và cả** Gemini Live (key fallback về nó, endpoint là
 `llm_base_url` + `/ws/gemini`); `deepgram_api_key` là tuỳ chọn, chỉ để đổi
-provider STT.
+provider STT. Khi đó HAL kết nối thẳng tới Deepgram và mỗi lần kết nối đều gửi
+`mip_opt_out=true`, nên audio không bị dùng để train model của Deepgram.
 
 Nhạc cũng phát được. `MusicService` stream yt-dlp → ffmpeg → **aplay** (ALSA),
 hoặc **paplay** khi có sink Bluetooth — macOS không có cái nào, nên cả hai đường
@@ -289,7 +319,7 @@ HAL sensing loop (mỗi 2s) → Đọc 1 frame camera, chạy tất cả detecto
 Event có ảnh? (large motion, face enter) → encode frame full-resolution JPEG q85
 Ảnh face enter: frame gốc được vẽ bounding box + nhãn friend/stranger
 
-POST /api/sensing/event {type, message, image?}
+POST /api/sensing/event {type, message, images?: []string}
     → OS server (Go):
         1. Voice event + local intent match? → thực thi trực tiếp (~50ms)
         2. Không match → forward OpenClaw:

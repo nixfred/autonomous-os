@@ -2,6 +2,7 @@ package http
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 	"time"
 
@@ -40,7 +41,7 @@ func TestHarnessProgressKeepsTheResponsePending(t *testing.T) {
 		t.Fatal("Harness progress was not delivered")
 	}
 	event := <-events
-	if event.Type != "assistant_delta" || event.RunID != "device-chat-42" || event.Summary != "Harness agent is working." {
+	if event.Type != "assistant_delta" || event.RunID != "device-chat-42" || event.Summary != "Harness agent is working.\n" {
 		t.Fatalf("event = %#v", event)
 	}
 }
@@ -55,7 +56,7 @@ func TestHarnessToolIsShownWhileResponseIsPending(t *testing.T) {
 		t.Fatal("Harness tool was not delivered")
 	}
 	event := <-events
-	if event.Type != "assistant_delta" || event.RunID != "device-chat-42" || event.Summary != "Harness is web_search." {
+	if event.Type != "assistant_delta" || event.RunID != "device-chat-42" || event.Summary != "Harness is web_search.\n" {
 		t.Fatalf("event = %#v", event)
 	}
 }
@@ -173,9 +174,7 @@ func TestHarnessResponsesKeepOriginalText(t *testing.T) {
 }
 
 func TestHarnessVoiceRunLosesSpeakerAfterClick(t *testing.T) {
-	// Harness ids have no creation stamp; registration must date the run so a
-	// click that follows mutes its reply even when that reply is the first
-	// time deliverTTS sees the id.
+	// Registration must date a Harness run so a later click mutes its reply.
 	h := &AgentHandler{monitorBus: monitor.ProvideBus()}
 	h.MarkHarnessResponseRun("device-harness-abc", false, false)
 	time.Sleep(2 * time.Millisecond)
@@ -183,8 +182,7 @@ func TestHarnessVoiceRunLosesSpeakerAfterClick(t *testing.T) {
 	if !h.isSpeechCancelled("device-harness-abc") {
 		t.Fatal("Harness run registered before the click still owns the speaker")
 	}
-	// The watermark is inclusive (<=) at millisecond resolution, so a run
-	// registered in the same ms as the click still counts as cancelled.
+	// The watermark is inclusive (<=) at ms resolution: a same-ms registration counts as cancelled.
 	time.Sleep(2 * time.Millisecond)
 	h.MarkHarnessResponseRun("device-harness-later", false, false)
 	if h.isSpeechCancelled("device-harness-later") {
@@ -203,5 +201,35 @@ func TestHarnessLocalNoticeDoesNotUseRemoteResultCue(t *testing.T) {
 	h.MarkHarnessResponseRun("real-result", false, false)
 	if h.harnessReplies["real-result"].localOnly {
 		t.Fatal("Harness-only result lost its cue")
+	}
+}
+
+func TestHarnessChatLinesDropRepeatsAndHideDeferredAgentText(t *testing.T) {
+	bus := monitor.ProvideBus()
+	events, unsubscribe := bus.Subscribe()
+	defer unsubscribe()
+	h := &AgentHandler{agentGateway: fillerEventGateway{}, monitorBus: bus, assistantBuf: make(map[string]*strings.Builder), streamStats: make(map[string]*runStreamStats)}
+	h.MarkHarnessResponseRun("device-chat-43", true, false)
+	h.DeliverHarnessProgress("device-chat-43", "The agent accepted the input.")
+	h.DeliverHarnessProgress("device-chat-43", "The agent accepted the input.")
+	// The device agent's deferred NO_REPLY must not stream into the chat.
+	payload, _ := json.Marshal(map[string]any{"runId": "device-chat-43", "stream": "assistant", "data": map[string]any{"delta": "NO_REPLY"}})
+	if err := h.handleAgentStreamEvent(domain.WSEvent{Payload: payload}); err != nil {
+		t.Fatal(err)
+	}
+	h.DeliverHarnessQuestion("device-chat-43", "q1", "Agent test needs permission.")
+	var got []string
+	for len(got) < 2 {
+		select {
+		case event := <-events:
+			if event.Type == "assistant_delta" {
+				got = append(got, event.Summary)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("chat lines = %q", got)
+		}
+	}
+	if got[0] != "The agent accepted the input.\n" || got[1] != "Agent test needs permission.\n" {
+		t.Fatalf("chat lines = %q", got)
 	}
 }

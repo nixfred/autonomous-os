@@ -42,7 +42,7 @@ tell "no servo by design" from "servo lib missing" from "servo broken."
 | `boards` | yes | Supported boards. At boot the runtime resolves the physical board (`hal/board`) and aborts if it is unknown or not in this list. |
 | `gateway` | yes | Default agentic gateway (`default`) + wire transport (`protocol`). The transport follows from the runtime (openclaw→websocket, hermes→sse); `protocol` is validated for consistency against `default` (a warning, not a driver). |
 | `capabilities` | yes | Map of capability group → declaration (below). |
-| `soul_ref` | no | Soul artifact for this body: a path read relative to the device folder (e.g. `SOUL.md`), or an `http(s)://` URL the runtime downloads. Absent → the gateway's default soul. |
+| `soul_ref` | no | Soul artifact for this body: a path read relative to the device folder (e.g. `SOUL.md`), or an `http(s)://` URL the runtime downloads. A unit whose config.json sets `soul_variant` (e.g. `wajo`) reads the sibling `SOUL.<variant>.md` from the same folder when it ships. Absent → the gateway's default soul. |
 | `urdf_ref` | no | The body's kinematic description (URDF): a path read relative to the device folder (e.g. `urdf/lamp.urdf`), or an `http(s)://` URL downloaded. Supplies the link offsets, joint axes and masses that geometric safety bounds are computed against — today `SAFETY.md` `motion.max_cog_offset_mm`. Absent → those bounds cannot be evaluated and pass through with a warning. Visual and collision meshes are optional and unused by the runtime. |
 | `safety_ref` | no | The device's safety document: a path read relative to the device folder (e.g. `SAFETY.md`), or an `http(s)://` URL downloaded. Resolved at boot by HAL into pure gate functions (`hal/safety/policy.py`, see `SAFETY-SPEC.md`); the per-capability anchor-consistency check is a warning. |
 | `manufacturer` | no | Informational, not parsed — who makes the body (`Pollen Robotics`, `Unitree`). |
@@ -144,8 +144,14 @@ them; a device with no file keeps the defaults verbatim. This is the same
 }
 ```
 
-- Every section (`led_count`, `emotion`, `scene`, `aim`, `status_led`, `button_led`) is optional.
-  `status_led` restyles the os-server system-status feedback (booting/error/ota/
+- Every section (`led_count`, `emotion`, `scene`, `aim`, `status_led`, `button_led`, `ambient_led`) is optional.
+- `ambient_led.resting` overrides the idle LED preset (`effect`, `color`, optional `speed`).
+  `solid` paints once without animation. Missing overrides keep the dark platform default;
+  Lamp declares solid `[1,1,1]`; intern-v2 keeps solid `[5,4,3]`. OS asks HAL to
+  restore this preset rather than maintaining a second ambient color. The owner can
+  replace it from the web UI (`PUT /led/resting`: default, off, or a custom solid);
+  HAL saves that choice in `/var/lib/hal/resting_led.json` and re-applies it on boot.
+- `status_led` restyles the os-server system-status feedback (booting/error/ota/
   connectivity/hal_down/agent_down/hardware/ready_flash + bootstrap OTA
   ota_progress/ota_error/ota_success + setup) — the OS owns the state machine,
   HAL owns the color/effect/speed. `setup` is a persistent solid; the rest are

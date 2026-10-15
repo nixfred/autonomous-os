@@ -62,7 +62,7 @@ Với event do `skills/sensing/SKILL.md` xử lý, prompt yêu cầu HW marker �
 
 ### Cơ chế hoạt động
 
-HAL bắn một sound event cho mỗi audio sample vượt ngưỡng `SOUND_RMS_THRESHOLD` — có thể nhiều lần mỗi giây. Python-side **sound tracker** (`hal/drivers/sensing/perceptions/sound.py`) áp dụng dedup và escalation trước khi forward lên Go. Go chỉ nhận các event đã pass và forward thẳng lên agent.
+HAL bắn một sound event cho mỗi audio sample vượt ngưỡng `SOUND_RMS_THRESHOLD` — có thể nhiều lần mỗi giây. Python-side **sound tracker** (`hal/drivers/sensing/perceptions/processors/sound.py`) áp dụng dedup và escalation trước khi forward lên Go. Go chỉ nhận các event đã pass và forward thẳng lên agent.
 
 ### Hành vi leo thang (Escalation)
 
@@ -73,12 +73,12 @@ Với event sound độc lập ngoài guard mode, `skills/sensing/SKILL.md` yêu
 | Lần 1 | `... — occurrence 1` | `/emotion curious` (0.6), im lặng |
 | Lần 2 | **không có gì** — chỉ đếm ở tracker, không forward | không tốn turn agent |
 | Lần 3+ | `... — persistent (occurrence 3)` | `/emotion shock` (0.9), nói 1 lần |
-| Sau khi nói | Python drop (suppress 3 phút) | Không có gì đến agent |
-| Im lặng 2 phút | Window reset | Trở về lần 1 |
+| Sau khi nói | Python drop (đã quen) | Không có gì đến agent chừng nào tiếng ồn còn |
+| Im lặng 2 phút | Reset quen + window | Trở về lần 1 |
 
 Các lần giữa (2 .. persistent−1) chỉ tăng counter chứ không forward: mỗi forward là một turn LLM đầy đủ, mà "vẫn còn ồn" giữa lúc chuyển trạng thái (lần 1) và lúc leo thang (persistent) không cho agent thông tin gì để hành động — khi ồn kéo dài, số turn mỗi chu kỳ giảm từ 3 xuống 2.
 
-Ví dụ: một con chó nghe tiếng động — nó nhìn lên (lần 1), tiếp tục theo dõi trong im lặng (lần 2, không báo), rồi sủa một lần nếu tiếng ồn kéo dài (lần 3+). Sau khi sủa thì không sủa tiếp.
+Ví dụ: một con chó nghe tiếng động — nó nhìn lên (lần 1), tiếp tục theo dõi trong im lặng (lần 2, không báo), rồi sủa một lần nếu tiếng ồn kéo dài (lần 3+). Sau khi sủa thì không sủa tiếp: nó quen với tiếng đó. Cơ chế quen (`_habituated` trong `sound.py`) drop mọi mẫu sau đó của cùng tiếng ồn cho tới khi im được `_WINDOW_DURATION_S`, nên máy hút bụi chạy 30 phút chỉ làm đèn giật mình một lần, không phải mỗi ~3,5 phút như khi chỉ có suppress 3 phút.
 
 ### Hằng số (`sound.py`)
 
@@ -86,7 +86,7 @@ Ví dụ: một con chó nghe tiếng động — nó nhìn lên (lần 1), ti�
 _DEDUPE_INTERVAL_S    = 15.0   # tối đa 1 event forwarded mỗi 15s
 _WINDOW_DURATION_S    = 120.0  # im lặng lâu hơn thế này thì reset counter
 _PERSISTENT_AFTER     = 3      # nói sau bao nhiêu lần
-_SUPPRESS_DURATION_S  = 180.0  # suppress sau khi đã nói (3 phút)
+_SUPPRESS_DURATION_S  = 180.0  # suppress sau khi đã nói (3 phút); cơ chế quen kéo dài nó khi tiếng ồn còn
 ```
 
 ### Điều chỉnh (Tuning)
@@ -126,17 +126,17 @@ HAL xử lý cooldown. Nếu event đã đến agent thì đủ thời gian rồ
 
 #### Nội dung event: ai mới tới, ai đã có mặt sẵn
 
-`presence.enter` nghĩa là **mới** xuất hiện, không phải đang xuất hiện: một người chỉ được coi là "mới" khi `last_seen` là `None` hoặc cũ hơn cửa sổ quên (`FACE_OWNER_FORGET_S` 3600 giây với chủ nhà, `FACE_STRANGER_FORGET_S` 1800 giây với người lạ). Text do `hal/drivers/sensing/perceptions/processors/faceid/enter_message.py` dựng, gồm ba đoạn ngăn bằng `; `:
+`presence.enter` nghĩa là **mới** xuất hiện, không phải đang xuất hiện: một người chỉ được coi là "mới" khi `last_seen` là `None` hoặc cũ hơn cửa sổ quên (`FACE_OWNER_FORGET_S` 3600 giây với chủ nhà, `FACE_STRANGER_FORGET_S` 1800 giây với người lạ). Người lạ mới không được báo ngay khi xuất hiện: chỉ được chào khi họ nhìn về phía đèn — nhìn thẳng vào đèn (theo cone, sàn kích thước và quy tắc mép của gaze wake trong `hal/drivers/tracking/gaze.py`, đo trên 5 điểm căn chỉnh, sinh ra từ mesh, theo thứ tự của SCRFD) trên `FACE_STRANGER_GAZE_MIN_FACING` (2) trong số `FACE_STRANGER_GAZE_TICKS` (3) nhịp face-ID gần nhất mà họ có mặt trong frame, chỉ tính các nhịp chưa cũ quá `FACE_STRANGER_GAZE_WINDOW_S` (10 giây) (#531). Face ID chạy mỗi 2 giây một nhịp, nên lượt bỏ phiếu tính theo nhịp, không phải cửa sổ 1.5 giây của gaze wake; giới hạn tuổi này ngăn hai cái liếc không liên quan cách nhau vài phút trong cùng một lượt ghé cộng lại thành một lời chào, trong khi vẫn chịu được một nhịp bị bỏ qua. Không bao giờ giữ lại hay hết hạn: người lạ không bao giờ nhìn về đèn thì không bao giờ được chào, nhưng vẫn xuất hiện ở `faces in frame:`, trong snapshot, thống kê người lạ và log. Người lạ tới cùng nhịp với một chủ nhà mới thì đi kèm enter của chủ nhà, không bị gate. Enter "có bạn" (`already present:`) vẫn là một enter người lạ và bị gate y hệt. Text do `hal/drivers/sensing/perceptions/processors/faceid/enter_message.py` dựng, gồm ba đoạn ngăn bằng `; `:
 
 ```
 Person detected — new: stranger (stranger_2); already present: momo (friend); faces in frame: 2 (momo, stranger_2)
 ```
 
 - `new:` — người vừa tới, phần chủ nhà đứng trước, id sắp xếp theo thứ tự. Nhãn `friend (<tên>)` / `stranger (<id>)` là một hợp đồng: cổng wake-focus mở khi thấy `friend (`, `sensing-track` grep theo chúng, `face-enroll` parse hint được nối vào sau chúng.
-- `already present:` — chủ nhà có box trong **cùng frame** nhưng không phải vừa tới, viết dạng `<tên> (friend)` để không bao giờ bị đọc nhầm thành người mới tới. Đây là tín hiệu đồng hiện diện mà `sensing/SKILL.md` dùng để nói với user ("Momo ơi, có bạn tới kìa") thay vì chào người lạ. Với enter chỉ có người lạ, đoạn này chỉ được ghi khi box chủ nhà và box không-phải-chủ-nhà đã cùng xuất hiện `FACE_COPRESENCE_MIN_TICKS` (2) nhịp sensing liên tiếp (box `unsure` cũng tính — đó chính là nhịp recognizer dùng để xác nhận người lạ mới trước khi cấp id); một tấm poster, một cái bóng phản chiếu hay một nhịp nhiễu cạnh user không được biến "xin chào" thành "có bạn tới". Chủ nhà mới tới khi một chủ nhà khác đang ngồi thì được liệt kê không cần gate đó. Đoạn này không bao giờ suy ra từ `current_user()` — đó là trạng thái cửa sổ hiện diện, đọc y hệt nhau dù user đang ngồi đó hay đã rời đi hai phút trước.
-- `faces in frame:` — số box trong frame mà **snapshot đính kèm** thể hiện và nhãn theo thứ tự phát hiện (`unsure` cho box chưa có danh tính), đúng nhãn được vẽ lên đó. Cả đoạn này lẫn `already present:` được chốt ngay ở nhịp frame được nhìn thấy và đi kèm frame đó (`FrameFacts` trong `enter_message.py`): chủ nhà mới tới thì frame hiện tại được gửi ngay nên dùng dữ kiện hiện tại; enter chỉ có người lạ thì gửi các snapshot đã buffer và dùng dữ kiện của frame buffer mới nhất — lần flush có thể rơi muộn tới `FACE_STRANGER_FLUSH_S`, khi user có thể đã bị nhoè khỏi frame trực tiếp (quan sát trên thiết bị: ảnh có hai box, text ghi `1 (unsure)`, trước khi có quy tắc này). Đây không phải số người tới: id người lạ được flush có thể đến từ nhiều frame buffer khác nhau.
+- `already present:` — chủ nhà có box trong **cùng frame** nhưng không phải vừa tới, viết dạng `<tên> (friend)` để không bao giờ bị đọc nhầm thành người mới tới. Đây là tín hiệu đồng hiện diện mà `sensing/SKILL.md` dùng để nói với user ("Momo ơi, có bạn tới kìa") thay vì chào người lạ. Đoạn này liệt kê mọi chủ nhà được face-ID nhận ra trong frame đó: người lạ đã được xác nhận trước khi cấp id (`FACE_STRANGER_MIN_TICKS`) và chủ nhà là kết quả khớp chắc chắn, nên không cần gate đếm nhịp nào thêm (#531 — gate `FACE_COPRESENCE_MIN_TICKS` cũ không bao giờ qua với người lạ đã biết được nhận lại ngay nhịp đầu). Đoạn này không bao giờ suy ra từ `current_user()` — đó là trạng thái cửa sổ hiện diện, đọc y hệt nhau dù user đang ngồi đó hay đã rời đi hai phút trước.
+- `faces in frame:` — số box trong frame mà **snapshot đính kèm** thể hiện và nhãn theo thứ tự phát hiện (`unsure` cho box chưa có danh tính), đúng nhãn được vẽ lên đó. Cả đoạn này lẫn `already present:` được chốt ngay ở nhịp frame được nhìn thấy và đi kèm frame đó (`FrameFacts` trong `enter_message.py`): chủ nhà mới tới thì frame hiện tại được gửi ngay nên dùng dữ kiện hiện tại; enter người lạ thì gửi các nhịp gaze đã buffer (tối đa 3, mới nhất ở cuối) và dùng dữ kiện của nhịp mới nhất — nhịp xác nhận gaze.
 
-Ưu tiên giữa những người tới không đổi: cả hai cùng mới trong một frame → một event, chủ nhà đứng trước, gửi ngay; người lạ được buffer trước rồi chủ nhà tới sau → frame chủ nhà gửi ngay và người lạ theo sau bằng event riêng sau `FACE_STRANGER_FLUSH_S` (10 giây), chịu `FACE_COOLDOWN_S` (10 giây) và `FACE_STRANGER_ENTER_FLOOR_S` (300 giây).
+Ưu tiên giữa những người tới: cả hai cùng mới trong một frame → một event, chủ nhà đứng trước, gửi ngay; người lạ đang chờ gaze khi chủ nhà tới → frame chủ nhà gửi ngay và người lạ theo sau bằng event riêng khi họ nhìn về phía đèn, chịu `FACE_COOLDOWN_S` (10 giây) và `FACE_STRANGER_ENTER_FLOOR_S` (300 giây; enter người lạ bị floor thì bỏ, không gửi lại).
 
 #### Quay lại sau khi vắng lâu (chỉ chủ nhà)
 
@@ -158,7 +158,11 @@ Agent gọi `/emotion idle` (0.4), fire `/servo/track/stop` để thả follow n
 
 Được gửi tự động bởi `PresenceService` của HAL khi **không phát hiện chuyển động lẫn hoạt động của user trong 15 phút** (sau khi đã dim đèn ở phút thứ 5). Lúc này đèn đã tắt — agent chỉ cần **thông báo đi ngủ** qua TTS và Telegram.
 
-Agent gọi `/emotion sleepy` (0.8), fire `/servo/track/stop` để thả follow cũ còn sót. HAL lập tức chuyển LED sang đen, mute mic và dừng nhạc đang phát; sau 1 giây `sleepy` liên tục, HAL release torque của servo và lock mọi lệnh motion. Riêng **speaker** được mute trễ — os-server bắn marker `sleepy` sớm hơn phần text tối đa 100ms (`fireHWCallsSync`), nên mute ngay tại chỗ sẽ đua với câu chào ngủ và thường thắng, khiến `/voice/speak-queue` trả về `suppressed -- speaker muted`. `_start_sleepy_speaker_drain` trong `hal/app_state.py` chờ `SLEEPY_SPEAKER_GRACE_S` (2s) xem có câu nào bắt đầu phát không, để nó phát hết, và mute chậm nhất tại `SLEEPY_SPEAKER_DRAIN_MAX_S` (15s); TTS đang phát không còn bị cắt ngang, trừ đúng mốc cap — ở đó nó bị dừng hẳn, vì cờ mute chỉ chặn lệnh phát chưa bắt đầu nên nếu không dừng thì cap không chặn được gì và máy đang ngủ vẫn nói tiếp. Một lần wake sẽ huỷ drain. **Scene có preset `speaker: off`** (reading, focus, movie, night) cũng drain theo cùng cách (`_start_scene_speaker_drain`, cùng grace và cap): marker `/scene` cũng tới trước phần text, nên mute ngay tại chỗ nuốt mất câu xác nhận của scene và — khi skill ghép `[HW:/scene:night][HW:/emotion:sleepy]` cho "goodnight" — nuốt luôn câu chào ngủ, đồng thời để sleep không sở hữu một mute nó không đặt, nên wake không trả loa lại được. Drain của scene nhường cho sleep: `sleepy` tới trong lúc drain còn treo sẽ huỷ nó và mở drain riêng, nên chỉ một chủ sở hữu commit mute và wake khôi phục được; scene bật khi đang ngủ hoặc khi drain của sleepy đang treo thì không mở drain. Bước commit kiểm tra lại dưới `privacy.lock` rằng scene vẫn active và thiết bị đang thức. Tắt scene, scene khác thay thế, scene có `speaker: on`, và `/speaker/unmute` tường minh đều huỷ drain. Nhạc vẫn bị dừng ngay — nhạc không bao giờ là câu xác nhận. Chỉ `greeting` hoặc `stretching` mới resume motion servo (`_SLEEP_GATE_ALLOWED` trong `hal/routes/emotion.py`) — emotion cảm xúc như `curious`/`happy` bị bỏ qua khi đang ngủ, nên task nền của agent không đánh thức được thiết bị; tap nút GPIO thì được, đồng thời chỉ unmute các trạng thái mic/speaker mà sleepy đã tự mute. os-server còn giữ một cổng chặn **thứ hai**, drop sensing thụ động khi đang ngủ (`SensingHandler`, mọi type trừ `presence.enter`, `fire_hazard.detected`, voice và chat text). `IsSleeping()` của nó hỏi HAL qua `/emotion/status`: mọi lần thức dậy không đi qua agent — tap nút, trang hardware trên web UI, POST thẳng vào HAL — đều không chạm tới `lastEmotion` của os-server, nên nếu chỉ suy từ biến đó thì cổng vẫn đóng trên một thiết bị đã thức và sensing bị vứt cho tới lượt voice/chat kế tiếp. `lastEmotion` giờ chỉ còn làm bộ lọc nhanh cho đường đang thức và làm phương án dự phòng khi không với tới HAL. Mute audio do sleepy đi kèm sidecar riêng của sleep (`_persist_sleep_state`) nên VẪN còn sau khi HAL restart, để một lần OTA không làm thiết bị đang ngủ quay lại với mic đang nghe; chúng vẫn được đánh dấu là sleep-owned nên khi thức dậy sẽ trả switch về đúng lựa chọn của user. Đây là hành động cuối cùng trước khi Lamp hoàn toàn idle.
+Agent gọi `/emotion sleepy` (0.8), fire `/servo/track/stop` để thả follow cũ còn sót. Ngay khi chấp nhận `sleepy`, HAL đồng bộ mute mic và speaker, dừng TTS đang phát, xoá lời nói đang chờ (kể cả phần đang tổng hợp chưa bắt đầu phát), và dừng nhạc trước khi dọn dẹp servo/camera. Sleep không còn chờ 2 giây cho lời thông báo bắt đầu hoặc tối đa 15 giây để TTS phát hết. Câu chào ngủ tới sau `sleepy` bị suppress; lời đang phát có thể bị cắt ngang. HAL chuyển LED sang đen; sau 1 giây `sleepy` liên tục, HAL release torque của servo và lock mọi lệnh motion. Việc đóng voice session có thể tiếp tục ở nền sau khi mic đã mute. Wake chỉ khôi phục các trạng thái audio do sleep mute, giữ nguyên mute thủ công có từ trước.
+
+**Scene có preset `speaker: off`** (reading, focus, movie, night) vẫn dùng `_start_scene_speaker_drain`: chờ 2 giây cho câu xác nhận bắt đầu, với giới hạn tổng 15 giây để phát xong trước khi mute và dừng playback. Drain của scene nhường cho sleep: `sleepy` huỷ scene drain đang chờ và sở hữu mute được đặt ngay; scene bật khi đang ngủ không mở drain. Bước commit kiểm tra lại dưới `privacy.lock` rằng scene vẫn active và thiết bị đang thức. Tắt scene, scene khác thay thế, scene có `speaker: on`, và `/speaker/unmute` tường minh đều huỷ drain. Nhạc vẫn bị dừng ngay. Khi ghép `[HW:/scene:night][HW:/emotion:sleepy]`, hệ thống giờ ưu tiên ngủ ngay thay vì phát câu xác nhận.
+
+Chỉ `greeting` hoặc `stretching` mới resume motion servo (`_SLEEP_GATE_ALLOWED` trong `hal/routes/emotion.py`) — emotion cảm xúc như `curious`/`happy` bị bỏ qua khi đang ngủ, nhưng `greeting` hoặc `stretching` đến muộn từ turn cũ vẫn có thể đánh thức thiết bị; tap nút GPIO thì được, đồng thời chỉ unmute các trạng thái mic/speaker mà sleepy đã tự mute. os-server còn giữ một cổng chặn **thứ hai**, drop sensing thụ động khi đang ngủ (`SensingHandler`, mọi type trừ `presence.enter`, `fire_hazard.detected`, voice và chat text). `IsSleeping()` của nó hỏi HAL qua `/emotion/status`: mọi lần thức dậy không đi qua agent — tap nút, trang hardware trên web UI, POST thẳng vào HAL — đều không chạm tới `lastEmotion` của os-server, nên nếu chỉ suy từ biến đó thì cổng vẫn đóng trên một thiết bị đã thức và sensing bị vứt cho tới lượt voice/chat kế tiếp. `lastEmotion` giờ chỉ còn làm bộ lọc nhanh cho đường đang thức và làm phương án dự phòng khi không với tới HAL. Mute audio do sleepy đi kèm sidecar riêng của sleep (`_persist_sleep_state`) nên VẪN còn sau khi HAL restart, để một lần OTA không làm thiết bị đang ngủ quay lại với mic đang nghe; chúng vẫn được đánh dấu là sleep-owned nên khi thức dậy sẽ trả switch về đúng lựa chọn của user. Đây là hành động cuối cùng trước khi Lamp hoàn toàn idle.
 
 Timeline tự động điều khiển presence:
 1. **5 phút không có chuyển động hay hoạt động** → đèn dim xuống 20% (tự động, không cần agent)
@@ -166,7 +170,7 @@ Timeline tự động điều khiển presence:
 
 HAL quản lý việc điều khiển đèn; agent chỉ xử lý thông báo bằng giọng nói. Nếu người dùng quay lại (phát hiện chuyển động), đèn tự phục hồi và event `presence.enter` được kích hoạt.
 
-Timer được reset bởi hai loại bằng chứng, không chỉ camera. **Chuyển động** là `on_motion()` từ các processor people-perception (face / motion / emotion). **Hoạt động của user** là `on_activity()`, gọi qua `app_state.note_user_activity()`: mọi voice turn HAL gửi lên os-server (`voice`, `voice_command`, `voice_followup`, `voice_agent_handled`, sau bộ lọc echo, trong `SensingSender.send`) và các cử chỉ chạm: single click (nút GPIO, touchpad, gạt privacy switch để unmute), head pat và double tap (bật/tắt mic). Trước đây, user nói chuyện với đèn khi camera tắt hoặc ngồi ngoài khung hình vẫn bị timeout sang AWAY và đèn thông báo đi ngủ giữa cuộc trò chuyện. Hoạt động trong lúc IDLE/AWAY đưa về PRESENT và phục hồi đèn giống chuyển động, trừ khi device đang ngủ: lúc đó bỏ qua việc phục hồi đèn (kể cả với chuyển động), để emotion wake quản lý LED. Chat gõ tay (`web_chat` / `mqtt_chat`) **không** được tính — nó có thể đến từ điện thoại khi user không ở nhà, và không được giữ đèn sáng trong phòng trống. Cử chỉ giữ nút (sleep / shutdown / reset) và vuốt (sleep) cũng không tính. Hoạt động chỉ làm mới state machine đang bật; nó không bao giờ bật state machine lên.
+Timer được reset bởi hai loại bằng chứng, không chỉ camera. **Chuyển động** là `on_motion()` từ các processor people-perception (face / motion / emotion). **Hoạt động của user** là `on_activity()`, gọi qua `app_state.note_user_activity()`: mọi voice turn HAL gửi lên os-server (`voice`, `voice_command`, `voice_followup`, `voice_agent_handled`, sau bộ lọc echo, trong `SensingSender.send`) và các cử chỉ chạm: single click (nút GPIO, touchpad, gạt privacy switch để unmute) và head pat (mọi cử chỉ trên headpad TTP223 — tap, double tap, vuốt, vuốt ve — đều quy về `head_pat_action`). Trước đây, user nói chuyện với đèn khi camera tắt hoặc ngồi ngoài khung hình vẫn bị timeout sang AWAY và đèn thông báo đi ngủ giữa cuộc trò chuyện. Hoạt động trong lúc IDLE/AWAY đưa về PRESENT và phục hồi đèn giống chuyển động, trừ khi device đang ngủ: lúc đó bỏ qua việc phục hồi đèn (kể cả với chuyển động), để emotion wake quản lý LED. Chat gõ tay (`web_chat` / `mqtt_chat`) **không** được tính — nó có thể đến từ điện thoại khi user không ở nhà, và không được giữ đèn sáng trong phòng trống. Cử chỉ giữ nút (sleep / shutdown / reset) và vuốt (sleep) cũng không tính. Hoạt động chỉ làm mới state machine đang bật; nó không bao giờ bật state machine lên.
 
 **Khi ngủ, timer dừng; khi thức, timer chạy lại từ đầu.** Trong lúc `_sleeping`, `tick()` return sớm: không dim, không tắt đèn, không gửi `presence.away`. Sleep đã quản lý LED, và camera tắt nên vốn không có gì reset được timer. Trước đây timer vẫn chạy, nên dim lại đèn đang ngủ lên 20% màu của user (`_dim_light` gọi thẳng `rgb_service`, không qua sleep lock của `/led`) và để state ở AWAY cho lần wake sau kế thừa. Mọi đường wake — nút bấm, pill emotion trên web UI, `POST /emotion` trực tiếp, agent trả `greeting`/`stretching` (ví dụ khi trả lời một tin chat) — đều đi qua `express_emotion` trong `hal/routes/emotion.py`, nơi gọi `app_state.note_presence_wake()` → `PresenceService.on_wake()`: timer chạy lại từ thời điểm thức và state về PRESENT mà không vẽ lại đèn (emotion wake quản lý LED). Trước đây chỉ camera thấy mặt mới reset timer, nên một lần wake không có ai đứng trước camera hoặc giữ mốc cũ trước khi ngủ và thông báo đi ngủ ngay sau khi vừa thức, hoặc kẹt ở AWAY và không bao giờ timeout nữa.
 
@@ -193,13 +197,158 @@ thiết bị đang chạy tốt. Việc nhận diện không hề bị ảnh hư
 ảnh đã enroll, không đụng tới các file này); cái giá phải trả là journald đầy
 traceback và chôn vùi các lỗi thật.
 
-**Xoá khuôn mặt lạ:** để làm rỗng card Unknown Faces trên monitor UI, xoá
-`<HAL_USERS_DIR>/.stranger_stats.json` và ĐỪNG đụng vào bank `.npy`. Lưu ý file
-stats và bank nằm ở hai thư mục khác nhau, nên "xoá người lạ" rất dễ làm thiếu.
-Hiện chưa có endpoint xoá cho face stranger — cụm *voice* lạ thì có, còn card
-Unknown Faces là read-only — nên xoá chúng là thao tác trên filesystem.
+**Xoá khuôn mặt lạ:** HAL giữ ba thứ cho mỗi người lạ, nằm ở hai thư mục khác
+nhau: dòng embedding trong bank (`<HAL_STRANGERS_DIR>/embeds.npy` + `labels.npy`),
+visit stats trong `<HAL_USERS_DIR>/.stranger_stats.json`, và ảnh familiar-stranger
+`<HAL_STRANGERS_DIR>/snapshots/<id>_<ts>.jpg`. `FacePerception.forget_strangers`
+xoá cả ba cùng lúc (dòng bank bị xoá cả trên đĩa, vì bank được đọc lại từ đĩa mỗi
+frame), cộng với entry presence trong bộ nhớ; `counter.npy` được giữ nguyên để id
+không bị cấp lại. Người đã bị quên mà quay lại sẽ được coi là người lạ mới. Card
+Unknown Faces trên monitor UI có nút ✕ ở mỗi dòng và nút **Clear all** ở header,
+cả hai đều hỏi xác nhận trước; chúng gọi `DELETE /face/strangers/{stranger_id}` và
+`DELETE /face/strangers` (xem
+[Theo dõi người lạ](#theo-dõi-người-lạ-stranger-visit-tracking)). Đừng xoá tay
+từng file — xoá thiếu một chỗ sẽ để lại dữ liệu mồ côi.
 
 ---
+
+## Nhận thức camera qua cloud mặc định tắt
+
+Bốn luồng nhận thức camera gửi dữ liệu ảnh, và hai luồng nhận thức giọng nói gửi
+audio, ra khỏi thiết bị tới DL backend (`DL_BACKEND_URL`, tức `llm_base_url`), nên cả
+sáu đều là **opt-in và mặc định tắt**. Chủ máy bật từng luồng trong web
+**Settings > Privacy** (hai luồng giọng nói nằm ở khối "Microphone"), lưu thành
+`cloud_perception` trong `config.json` và áp dụng live không cần restart HAL
+([os-server_vi.md](../../../../docs/vi/os-server_vi.md#nhận-thức-camera-qua-cloud)). Chỉ setting
+đã lưu đó mới bật được: thiếu key là tắt và không đọc cờ env, nên default cũ còn sót trong
+`.env` của máy không bao giờ được tính là đồng ý (`hal/config.py`
+`_cloud_perception_enabled`). Điều này áp dụng cả cho giọng nói: HAL không còn đọc
+`HAL_SPEAKER_RECOGNITION_ENABLED` / `HAL_SPEECH_EMOTION_ENABLED`. MQTT
+`cloud_perception.set` chỉ tắt được, không bật được. Nhận dạng hành động theo từng mặt (`HAL_MOTION_PER_FACE_ENABLED`)
+cũng upload và cần opt-in `motion`:
+
+| Key `cloud_perception` | Dữ liệu rời thiết bị | Khi nào sẽ gửi |
+|---|---|---|
+| `motion` | nguyên frame (WS nhận dạng hành động) | mỗi tick sensing trừ khi presence là `AWAY` |
+| `emotion` | ảnh mặt đã cắt | mỗi tick có mặt được phát hiện cục bộ |
+| `pose` | nguyên frame (WS pose/RULA) | một frame mỗi `HAL_POSE_SAMPLE_INTERVAL_S` (30 s) khi presence là `PRESENT`; vắng người thì không gửi |
+| `fire_hazard` | nguyên frame (OWLv2) | chỉ khi gate trên đèn thấy lửa hoặc khói, trong lúc escalation sau đó, hoặc mỗi lượt kiểm tra (khoảng 6 s một lần) khi model gate không dùng được; không kiểm tra presence ([Nguy cơ cháy](#fire-hazard)) |
+| `speaker_id` | clip mỗi câu nói, tối đa `HAL_SPEAKER_MAX_EMBED_AUDIO_S` (20 s) tiếng nói đã làm sạch, kể cả giọng người chưa đăng ký; cộng mẫu khi đăng ký giọng | mỗi câu nói VAD bắt được, và mỗi lần enroll / re-embed |
+| `speech_emotion` | audio của mỗi lượt hội thoại (session buffer) | cuối mỗi phiên mic đủ dài |
+
+Khi tắt, `motion.activity`, cảm xúc khuôn mặt, nhắc tư thế và `fire_hazard.detected`
+không được tạo ra. Tắt `speaker_id` thì không clip nào được upload, mọi người nói đều là
+`unknown`, danh tính cache không được dùng và đăng ký giọng thất bại (mọi lời gọi embedding
+— recognize, enroll, re-embed — bị chặn trong `SpeakerRecognizer._call_embedding_api`);
+profile đã đăng ký vẫn nằm trên đĩa. Tắt `speech_emotion` thì không upload SER
+(`SpeakerDecorator.submit_speech_emotion_from_session` và `Emotion2VecRecognizer.recognize`).
+HAL đọc `config.SPEAKER_RECOGNITION_ENABLED` / `config.SPEECH_EMOTION_ENABLED` mỗi lần dùng:
+tắt thì dừng từ lần upload kế tiếp, bật thì service khởi tạo lazy và có hiệu lực từ câu nói
+kế tiếp, không cần restart HAL. Nhận thức trên thiết bị (dò mặt và Face ID, presence, gaze, ánh
+sáng, mức âm thanh) không bị ảnh hưởng. Bật một cờ là lựa chọn privacy có chủ ý: nó
+gửi frame lên kể cả khi không ai trong phòng gọi đèn. Tắt một luồng thì processor của nó
+bị gỡ trước khi request trả về: lượt kiểm tra còn trong hàng đợi bị bỏ, upload đang chạy
+dở thì xong rồi kết nối mới đóng.
+
+<a id="fire-hazard"></a>
+## Nguy cơ cháy (Fire hazard)
+
+Chỉ chạy khi đã bật opt-in `fire_hazard` ở trên. Code:
+`hal/drivers/sensing/perceptions/processors/fire_hazard.py` (`FireHazardPerception`,
+`RemoteFireHazardDetector`) và `fire_gate.py` (`FireGate`). Mọi tham số và giá trị mặc định:
+[Tinh chỉnh sensing](sensing-tuning_vi.md#fire-hazard).
+
+**Nhịp kiểm tra.** Perception nhận một frame camera ở mỗi tick sensing 2 s và chạy một
+lượt kiểm tra khi đã qua `HAL_FIRE_HAZARD_CHECK_INTERVAL_S` (5 s) kể từ lượt trước, nên
+thực tế khoảng 6 s mới có một lượt (cứ ba tick một lần). Không kiểm tra presence: kiểm
+tra cháy vẫn chạy khi không có ai ở nhà. Khi camera tắt (ngủ, privacy) thì không có
+frame, nên không có lượt kiểm tra nào.
+
+**Gate trên đèn.** Mỗi lượt kiểm tra trước hết chạy một model nhỏ tại chỗ trên frame:
+YOLO26-S end-to-end 320×320, ONNX Runtime trên CPU với `HAL_FIRE_HAZARD_GATE_THREADS` (2)
+thread, ghim vào các core chậm. Tên class lấy từ metadata của ONNX. Gate "hit" khi điểm
+`fire` hoặc `smoke` cao nhất từ `HAL_FIRE_HAZARD_GATE_SCORE_THRESHOLD` (0.2) trở lên. Đo
+được khoảng 170 ms mỗi frame với 2 thread trên đèn đang chạy HAL. Model được tải ở lần
+dùng đầu tiên về `/root/local/models/yolo26s_fire_e2e_320.onnx`
+(`onnx_models/yolo26s_fire_e2e_320.onnx` trên CDN model). Việc nạp model chạy nền và
+không bao giờ chặn lượt kiểm tra. Đèn chỉ tải file khi chưa có, nên thay file trên CDN
+không cập nhật những đèn đã có file: xoá file trên đèn (lần nạp sau sẽ tải file mới) hoặc
+đổi tên file.
+
+| Kết quả gate | Lượt kiểm tra làm gì |
+|---|---|
+| hit | Gọi OWLv2 trên chính frame đó và mở một cửa sổ escalation |
+| miss | Không gọi cloud. Streak giữ nguyên: một lần miss không phải là quan sát OWLv2 |
+| unavailable (đang nạp, nạp lỗi, hoặc suy luận lỗi) | Fail-open: gọi OWLv2, như trước khi có gate. Sau một lần nạp lỗi, gate thử lại mỗi 10 phút |
+
+**Escalation.** Trong lúc escalation, mỗi lượt kiểm tra gọi thẳng OWLv2, bỏ qua gate.
+Cửa sổ đóng sau `HAL_FIRE_HAZARD_ESCALATION_HOLD_S` (10 s) kể từ reply OWLv2 cuối cùng có
+lửa hoặc khói; mỗi reply như vậy kéo dài nó thêm. Không có lời gọi backstop định kỳ: khi
+gate đã nạp và miss, không frame nào rời khỏi đèn.
+
+**Lời gọi OWLv2.** HAL gửi `{"image_b64": …, "preset": "fire_hazard_v1"}`
+(`HAL_FIRE_HAZARD_PRESET`). Server giữ 46 prompt của preset này dưới dạng đã encode trong
+bộ nhớ ([DL Backend](../../../../docs/vi/perception-service_vi.md#cung-cấp-những-gì)). Nếu
+server trả 400 (không biết preset), HAL gửi lại chính frame đó kèm 46 chuỗi class.
+`HAL_FIRE_HAZARD_PRESET` rỗng thì luôn gửi chuỗi class. Server cũ hơn preset sẽ bỏ qua
+field này và trả 200 với class mặc định của nó, nên HAL sẽ không thấy lửa; HAL ghi một
+cảnh báo duy nhất khi reply của preset không chứa prompt nào của nó. Vì vậy phải deploy
+server trước bản HAL gửi preset. Các file prompt của HAL
+(`resources/{fire,smoke,flammable,safe}_classes.txt`) phải chứa đúng 46 prompt như preset
+của server, thứ tự không quan trọng (`hal/test/test_fire_hazard_preset_parity.py`). Server
+không biết cách nhóm: OWLv2 trả về đúng chuỗi prompt khớp nhất và HAL tự xếp nhóm, nên
+chuyển một prompt giữa các file của HAL không cần đổi gì trên server.
+
+Lời gọi chạy trên worker thread riêng của perception, không chiếm pool camera dùng chung,
+với timeout `HAL_FIRE_HAZARD_API_TIMEOUT_S` (15 s). Tối đa một lời gọi đang chạy; lượt
+kiểm tra đến hạn trong lúc đó bị bỏ qua.
+
+Detection dưới `HAL_FIRE_HAZARD_CONFIDENCE_THRESHOLD` (0.3) bị bỏ. Mỗi box khói thành
+`smoke`. Box lửa là các prompt lửa: flame, bonfire, campfire và torch. OWLv2 hay gán nhãn
+`bonfire` cho một đám cháy lớn thật, nên các nhãn này được tính là chính ngọn lửa, không
+bao giờ là vật chứa an toàn. Vật an toàn chỉ là vật chứa lửa (lò sưởi, chậu lửa, hố lửa,
+nến, bếp gas, …).
+
+Với mỗi box lửa HAL tính hai điểm. **Điểm an toàn** là phần box lửa nằm trong một vật an
+toàn, nên một box nhỏ trên đám cháy lớn (một cây nến trên một cột lửa) không thể "bao
+che" cho cả đám cháy. **Điểm dễ cháy** là diện tích chung ÷ box nhỏ hơn giữa box lửa và vật
+dễ cháy. Vật an toàn chứa ít nhất `HAL_FIRE_HAZARD_SAFE_HOLDS_FLAMMABLE_RATIO` (0.8) của một
+box dễ cháy bị bỏ qua khi box dễ cháy đó chiếm ít nhất
+`HAL_FIRE_HAZARD_SAFE_HOLDS_FLAMMABLE_MIN_SIZE` (0.05) diện tích vật an toàn: một box "lò
+sưởi" bao quanh ghế sofa là cả căn phòng đang cháy, không phải lò sưởi, còn một cái gối trên
+bệ lò sưởi thì quá nhỏ để tính. Lửa thành `safe_fire` khi điểm an toàn lớn hơn điểm dễ cháy và trên
+`HAL_FIRE_HAZARD_OVERLAP_THRESHOLD` (0.2); thành `hazard_fire` khi điểm dễ cháy ít nhất ngang
+bằng và trên 0.2; còn lại là `unsure_fire`.
+
+**Lời gọi lỗi.** Timeout, lỗi mạng, reply khác 200, reply không đọc được, mã hóa không
+dùng được hoặc đang tạm dừng vì 429 đều là "không có quan sát": streak và escalation giữ
+nguyên. Sau HTTP 429, HAL tạm dừng gọi 5 s × 2^(n−1) cho lần 429 thứ n liên tiếp, tối đa
+60 s, jitter ±20 %. Mọi reply khác đặt lại bộ đếm.
+
+**Xác nhận.** Streak được giữ theo loại: flame (bất kỳ nhãn lửa nào trong ba nhãn) và
+smoke. Streak flame vẫn giữ khi nhãn đổi qua lại giữa `safe_fire`/`hazard_fire`/
+`unsure_fire`; loại cảnh báo lấy từ reply xác nhận. Một loại được xác nhận khi OWLv2 liên
+tục thấy nó trong `HAL_FIRE_HAZARD_CONFIRM_S` (10 s). Một reply thật không có loại đó sẽ
+kết thúc streak của nó. Streak có lần thấy cuối cũ hơn 30 s thì bắt đầu lại, nên một lần
+thấy rất lâu sau chuỗi lời gọi lỗi không thể xác nhận ngay. Với nhịp ~6 s, đám cháy ổn
+định thường được xác nhận ở reply OWLv2 thứ ba, khoảng 12 s sau lần gate hit đầu tiên.
+
+**Cảnh báo và nhắc lại.** Nguy cơ đã xác nhận cùng ảnh chụp có đánh dấu được buffer và
+gửi tối đa mỗi `HAL_FIRE_HAZARD_FLUSH_S` (10 s) thành một event `fire_hazard.detected`
+("Fire hazard detected: <types>", kèm ảnh chụp). Theo từng loại, `safe_fire` nhắc lại tối
+đa mỗi `HAL_FIRE_HAZARD_DEDUP_WINDOW_S` (30 phút), còn `hazard_fire`, `unsure_fire` và
+`smoke` nhắc lại mỗi `HAL_FIRE_HAZARD_REALERT_S` (60 s) chừng nào còn được xác nhận. Loại
+chưa gửi gần đây sẽ cảnh báo ở lần flush kế tiếp. `fire_hazard.detected` không bao giờ bị
+floor bởi cooldown event.
+
+**Telemetry.** `hal/telemetry/fire_hazard_metrics.py` gửi qua telemetry client của HAL
+([Device telemetry](../../../../docs/vi/telemetry_vi.md)). Chỉ có số đếm, thời lượng và giá
+trị enum, không bao giờ có frame:
+
+| Event | Khi nào | Params |
+|---|---|---|
+| `fire_hazard_stats` | Mỗi giờ một lần, cộng một dòng cuối với `observation_complete: false` khi processor bị gỡ | `window_s`, `observation_complete`, `owlv2_calls` (tổng của `owlv2_ok`, `owlv2_timeout`, `owlv2_error`, `owlv2_http_error`, `owlv2_rate_limited`, `owlv2_encryption_unavailable`), `owlv2_preset_fallback` (đếm thêm, ngoài kết quả của chính lời gọi fallback), `owlv2_backoff_skipped` (lượt rơi vào lúc tạm dừng vì 429, không gửi gì), `owlv2_other`, `owlv2_ms_p50` / `owlv2_ms_max` (chỉ lời gọi thành công; null khi không có mẫu), `gate_runs`, `gate_hits`, `gate_unavailable`, `gate_ms_p50`, `escalations`, `samples_dropped` (mẫu latency vượt 720 mỗi cửa sổ), `gate_state` (`loading`, `ready` hoặc `unavailable`) |
+| `fire_hazard_alert` | Mỗi lần gửi `fire_hazard.detected` | `types` (các loại nguy cơ đã sắp xếp), `first_seen_age_ms` (streak xác nhận đã chạy bao lâu khi cảnh báo được gửi; -1 khi không rõ), `gate_state` |
 
 ## Chuyển động (Motion)
 
@@ -282,7 +431,7 @@ Cả 2 marker đều bị strip trước khi message tới LLM (mirror `[snapsho
 
 ### `/dm` tự đính ảnh (Telegram)
 
-Khi agent quyết định nudge qua `/dm`, SSE handler của Lamp gọi `ConsumePoseBucketRun(runID)` (mirror `ConsumeGuardRun`). Nếu run có bucket stash, các `worst_snapshots` filenames được resolve thành path tuyệt đối dưới `/tmp/hal-sensing-snapshots/sensing_pose/buckets/<bid>/` rồi gửi Telegram qua `sendMediaGroup` — caption nằm trên photo đầu, còn lại hiển thị thành gallery. Agent không biết bất kỳ file path nào; việc đính ảnh hoàn toàn do Lamp quyết định dựa trên việc `motion.activity` gốc có mang bucket hay không.
+Khi agent quyết định nudge qua `/dm`, SSE handler của Lamp gọi `ConsumePoseBucketRun(runID)` (mirror `ConsumeGuardRun`). Nếu run có bucket stash, các `worst_snapshots` filenames được resolve thành path tuyệt đối dưới `/tmp/hal-sensing-snapshots/sensing_pose/buckets/<bid>/` rồi gửi Telegram qua `sendMediaGroup` — caption nằm trên photo đầu, còn lại hiển thị thành gallery. Agent không biết bất kỳ file path nào; việc đính ảnh hoàn toàn do Lamp quyết định dựa trên việc `motion.activity` gốc có mang bucket hay không. Ảnh chỉ gửi cho chủ máy: nếu người nhận DM không phải `telegram_user_id` (hoặc chưa đặt), chỉ gửi chữ, không kèm ảnh, và log ghi `dm pose images withheld`.
 
 ### Workaround sign góc (tạm thời)
 
@@ -357,6 +506,8 @@ HAL (port 5001) theo dõi số lần mỗi stranger đã xuất hiện:
 - Stats bao gồm `count`, `first_seen`, và `last_seen` timestamps cho mỗi stranger.
 - Lưu trữ tại thư mục data của HAL (giữ qua restart).
 - Truy vấn stats qua `GET http://127.0.0.1:5001/face/stranger-stats`.
+- **Tự hết hạn:** người lạ có `last_seen` cũ hơn `HAL_FACE_STRANGER_RETENTION_S` (mặc định 2592000 s = 30 ngày) bị quên hẳn — embedding, stats và ảnh. Việc này chạy trong cùng lượt quét mỗi giờ dọn ảnh snapshot (chạy theo tick camera), do `FacePerception.expire_strangers` thực hiện. Lượt quét cũng xoá các dòng bank không có bản ghi stats (vì web không bao giờ xoá được chúng). `last_seen` không parse được thì được giữ lại và ghi log.
+- **Xoá sớm hơn:** `DELETE http://127.0.0.1:5001/face/strangers` quên mọi người lạ và trả `{"status":"ok","forgotten":[ids]}`; `DELETE http://127.0.0.1:5001/face/strangers/{stranger_id}` quên một người (400 nếu id không có dạng `stranger_<n>`, 404 nếu id không có visit stats). Các route HAL chỉ nghe loopback; web gọi qua os-server `/api/hardware/*`, cần session/token của chủ máy. Card Unknown Faces trên monitor có nút ✕ mỗi dòng và **Clear all**, đều hỏi xác nhận; dưới header có dòng ghi rằng dữ liệu khuôn mặt người lạ được giữ trên máy để đếm lượt ghé và tự xoá sau 30 ngày không ghé.
 
 ### Prompt enroll khi quen mặt (familiar-stranger)
 
@@ -368,11 +519,13 @@ Khi visit count của một stranger lần đầu chạm ngưỡng (`_FAMILIAR_V
 
 Skill `face-enroll` (phía Lamp) parse hint đó và nói trực tiếp với người trước cam: "I've seen you 2 times now — mind if I remember you? What's your name?" (skill chạy bằng tiếng Anh, agent tự dịch nếu cần). Khi có tên trả về thì gọi `POST /face/enroll` với image path đã lưu. Nếu từ chối, skill chỉ ghi nhận rồi dừng; threshold là one-shot (`count == 2`), nên cùng `stranger_id` đó sẽ KHÔNG bị lelamp prompt lại lần nữa. Count vượt qua 2 không re-fire — lúc đó stranger hoặc đã được enroll (không còn là stranger) hoặc đã chủ động từ chối.
 
+Ảnh này chỉ dùng cho lượt hỏi tên đó. HAL xoá ảnh cũ hơn `HAL_STRANGER_SNAPSHOT_RETENTION_S` (mặc định 86400 s = 24 giờ): quét thư mục ở tick dò mặt đầu tiên sau khi HAL khởi động, sau đó tối đa mỗi giờ một lần khi camera đang chạy.
+
 ---
 
 ## Chăm sóc sức khỏe (Wellbeing — Nhắc uống nước + Nghỉ ngơi, AI-Driven)
 
-Lamp chủ động chăm sóc sức khỏe người dùng bằng cron jobs do AI agent tự quản lý qua OpenClaw. Thay vì timer cứng, agent tự quyết interval dựa trên khoa học và thói quen user.
+Lamp chủ động chăm sóc sức khỏe người dùng bằng lời nhắc do AI quyết định, chạy theo event. Không dùng cron job hay timer cứng: trên mỗi event `motion.activity`, agent tự quyết có nhắc hay không dựa vào ngưỡng của skill, history đã log và habit pattern của user.
 
 ### Cơ chế hoạt động (event-driven — không cron)
 
@@ -395,7 +548,7 @@ Wellbeing hoạt động **event-driven**. **KHÔNG còn cron wellbeing** nào. 
 
 **Dedup nằm ở 2 nơi.**
 
-*Activity dedup (window 5 phút).* `hal/drivers/sensing/perceptions/motion.py` giữ `_last_sent_key = (current_user, frozenset(labels))` và `_last_sent_ts`, trong đó `labels` khớp với outbound message (bucket names cho drink/break/celebrate, raw Kinetics labels cho sedentary). Trước khi gửi `motion.activity` **và trước khi POST các row tới `/api/wellbeing/log`**, nếu key không đổi **và** khoảng cách từ lần gửi cuối chưa vượt `MOTION_DEDUP_WINDOW_S = 300` giây (5 phút) → drop cả chu kỳ. Nên `eating burger → eating cake` gộp thành cùng key `break` và bị drop, còn `writing → drawing` lật key (sedentary giữ raw) nên pass qua.
+*Activity dedup (window 5 phút).* `hal/drivers/sensing/perceptions/processors/motion.py` giữ `_last_sent_key = (current_user, frozenset(labels))` và `_last_sent_ts`, trong đó `labels` khớp với outbound message (bucket names cho drink/break/celebrate, raw Kinetics labels cho sedentary). Trước khi gửi `motion.activity` **và trước khi POST các row tới `/api/wellbeing/log`**, nếu key không đổi **và** khoảng cách từ lần gửi cuối chưa vượt `MOTION_DEDUP_WINDOW_S = 300` giây (5 phút) → drop cả chu kỳ. Nên `eating burger → eating cake` gộp thành cùng key `break` và bị drop, còn `writing → drawing` lật key (sedentary giữ raw) nên pass qua.
 
 - Đổi user (owner→owner, owner→unknown, unknown→owner) lật key ngay → event pass qua.
 - Stranger khác nhau (`stranger_46` → `stranger_54`) đều collapse về `"unknown"` qua `FaceRecognizer.current_user()` → đổi stranger không phá dedup.
@@ -432,14 +585,17 @@ Reaction path được thêm vào để hành động tích cực không bị im
 
 ### Ngưỡng
 
-Hardcode trong `lamp/resources/openclaw-skills/wellbeing/SKILL.md`:
+Hardcode trong `skills/wellbeing/SKILL.md` (giá trị production):
 
-| Threshold | Giá trị test | Giá trị production |
-|---|---|---|
-| `HYDRATION_THRESHOLD_MIN` | **5** | 45 |
-| `BREAK_THRESHOLD_MIN` | **7** | 30 |
+| Threshold | Giá trị |
+|---|---|
+| `HYDRATION_THRESHOLD_MIN` | 45 |
+| `BREAK_THRESHOLD_MIN` | 30 |
+| `BREAK_THRESHOLD_TIRED` | 20 (thay cho `BREAK_THRESHOLD_MIN` khi labels có `yawning`) |
+| `YAWN_ACK_COOLDOWN_MIN` | 60 |
+| `TOILET_DRINK_THRESHOLD` | 2 (tính theo số lần — một lần mỗi N lần uống kể từ lần nhắc trước) |
 
-> ⚠ **Release checklist:** trước khi ship, đổi cả 2 ngưỡng về production (45 / 30). Hydration và break cố ý lệch nhau (5 vs 7) để test phân biệt nhánh nào fire.
+Để test nhanh trên device, tạm hạ các hằng số này trong skill rồi khôi phục giá trị production trước khi ship.
 
 **Cách chặn spam re-nudge.** Entry `nudge_hydration` / `nudge_break` mà agent log sau khi nhắc cũng tính là reset point cho threshold. Sau khi Lamp nhắc, delta về 0 → lần nhắc tiếp theo cùng loại chỉ fire sau một threshold window nữa (45 min cho hydration, 30 min cho break trong production).
 
@@ -501,31 +657,26 @@ AGENTS.md quy định thứ tự ưu tiên: **SKILL.md luôn override KNOWLEDGE.
 
 Backend ghi marker `leave` vào log. Không có gì khác để làm — **không có cron để cancel**. Directive yêu cầu agent im lặng (`NO_REPLY`).
 
-Agent dùng ảnh camera để đánh giá — KHÔNG phải lúc nào cũng nói. Tránh spam user khi họ trông ổn.
+### Hành vi Agent
+
+| Nhánh (theo `skills/wellbeing/SKILL.md`) | Khi nào | Output |
+|---|---|---|
+| Nhắc uống nước | `hydration_delta_min >= HYDRATION_THRESHOLD_MIN` | Nói câu nhắc uống nước + marker inline `nudge_hydration` |
+| Nhắc nghỉ | `break_delta_min >= BREAK_THRESHOLD_MIN` (hoặc `BREAK_THRESHOLD_TIRED` khi có `yawning`) | Nói câu nhắc nghỉ + marker inline `nudge_break` |
+| Còn lại | Chưa vượt ngưỡng nào | Phản ứng ngắn với hành động tích cực, hoặc `NO_REPLY` |
+
+Không có cron nhắc nhở: mọi lần nhắc được quyết định trên một event `motion.activity` đến, dựa vào `[wellbeing_context: ...]` đã tính sẵn. Agent KHÔNG phải lúc nào cũng nói — tránh spam user khi họ trông ổn.
 
 ### Gợi ý nhạc (AI-Driven)
 
-Gợi ý nhạc **không còn** được kích hoạt bởi timer cứng. Thay vào đó, AI agent **tự schedule** music check qua OpenClaw cron jobs và **tự học** thói quen user theo thời gian:
+Gợi ý nhạc **do AI quyết định và chạy theo event** — không cron job, không timer ở backend. Chỉ có một trigger:
 
-- **Tự schedule:** Khi phát hiện **hoạt động tĩnh đầu tiên** trong `motion.activity` (không phải `presence.enter`), AI tạo cron job (mặc định: mỗi 20 phút / 1200000ms, `sessionTarget: "current"`, `payload.kind: "systemEvent"`). AI tự điều chỉnh interval dựa trên phản hồi của user.
-- **Quyết định dựa trên dữ liệu:** Trước khi gợi ý, AI query:
-  - `GET /audio/status` — nhạc đang phát chưa?
-  - `GET /api/agent/mood-history` — mood mới nhất để chọn genre
-  - `GET /audio/history?person={name}` — lịch sử nghe nhạc per-user (genre ưa thích, thời lượng, mức độ hài lòng)
-- **Vòng lặp học:** AI so sánh thời điểm gợi ý với `music.play` events trong mood history. Gợi ý được chấp nhận → củng cố timing/genre; bị từ chối → điều chỉnh schedule.
-- **Cá nhân hóa:** Theo thời gian, AI học được khi nào user thích nghe nhạc, thể loại nào, nghe bao lâu — và điều chỉnh gợi ý cho phù hợp.
+- **Trigger theo mood:** `user-emotion-detection/SKILL.md` là router cho các event `emotion.detected` (camera) và `speech_emotion.detected` (giọng nói). Mỗi turn nó chọn một nhánh (`music` / `checkin` / `action` / `silent`); `music-suggestion/SKILL.md` chỉ nói khi router chọn `music`. Event `motion.activity` / `[activity]` (sedentary, drink/break, celebrate) chỉ route tới `wellbeing/SKILL.md` và không bao giờ kích hoạt gợi ý nhạc.
+- **Context lấy sẵn:** backend inject `[emotion_context: ...]` gồm `audio_playing`, `last_suggestion_age_min`, `prior_decision` / `is_decision_stale`, `audio_recent`, `music_pattern_for_hour`, `suggestion_worthy` và `mapped_mood`, nên agent không gọi read tool nào. Chỉ khi thiếu block này mới fallback sang `GET /audio/status`, lịch sử gợi ý nhạc (`GET /api/agent/music-suggestion-history`), mood history, `GET /audio/history?person={name}` và `patterns.json`.
+- **Điều kiện:** chỉ gợi ý khi mood đáng gợi ý (`sad`, `stressed`, `tired`, `excited`, `happy`, `bored`), không có audio đang phát, và `last_suggestion_age_min` nằm ngoài `[0, 7)` — cooldown 7 phút trong skill hiện tại (dự kiến 30 phút cho production), dùng chung với nhánh check-in.
+- **Vòng lặp học:** gợi ý được log bằng marker inline `[HW:/music-suggestion/log:{...}]` (→ `POST /api/music-suggestion/log`); chấp nhận / từ chối được POST sau vào `POST /api/music-suggestion/status`. Agent không bao giờ tự phát nhạc — chỉ phát sau khi user đồng ý.
 
-**Dữ liệu AI sử dụng để học thói quen:**
-
-| Câu hỏi | Nguồn dữ liệu |
-|----------|----------------|
-| User ngồi vào bàn mấy giờ? | `presence.enter` events → field `hour` |
-| Ngồi bao lâu thì muốn nghe nhạc? | Khoảng cách giữa `presence.enter` và `music.play` |
-| Nghe thể loại gì? | `audio/history` → fields `query`, `title` |
-| Nghe bao lâu thì tắt? | `audio/history` → field `duration_s` |
-| Thời điểm nào thích nghe nhạc nhất? | `music.play` events → field `hour` |
-
-Xem skill Music (`resources/openclaw-skills/music/SKILL.md`) để biết chi tiết implementation.
+Xem `skills/music-suggestion/SKILL.md` và `skills/user-emotion-detection/SKILL.md` để biết chi tiết implementation.
 
 ### Chăm sóc chủ động (piggyback trên sensing events)
 
@@ -539,7 +690,7 @@ Hai control marker cho turn channel-origin:
 
 | Marker | Tác dụng | Khi nào dùng |
 |---|---|---|
-| `[HW:/speak:{}]` | Force TTS trên loa. Không ảnh hưởng Telegram. | Proactive crons (wellbeing, music) chạy trong Telegram/channel session để nhắc phát qua loa. Thường kèm `[HW:/dm:{"telegram_id":"..."}]` để DM đúng 1 người. |
+| `[HW:/speak:{}]` | Force TTS trên loa. Không ảnh hưởng Telegram. | Proactive reply (wellbeing, music) chạy trong Telegram/channel session để nhắc phát qua loa. Thường kèm `[HW:/dm:{"telegram_id":"..."}]` để DM đúng 1 người. |
 | `[HW:/broadcast:{}]` | Force TTS **và** fan-out text tới tất cả Telegram chat. | Chỉ dành cho guard mode alert. Không dùng cho wellbeing/music — sẽ notify mọi chat, không phải chỉ người được nhắc. |
 
 Mặc định turn channel-origin (Telegram, webchat) suppress TTS loa vì reply đi qua channel message. `/speak` override suppression đó mà không kèm fan-out.
@@ -598,7 +749,7 @@ Agent liên kết tên face recognition với Telegram username bằng cách qua
 
 ## Phân tích Motion Activity (khi đang có mặt)
 
-Khi user đang ở trạng thái PRESENT và camera phát hiện chuyển động, hệ thống gửi event `motion.activity` thay vì `motion`. Hệ thống gửi tên action đã detect (không kèm ảnh — tên action đủ để agent suy luận).
+Khi user đang ở trạng thái PRESENT và camera phát hiện chuyển động, hệ thống gửi event `motion.activity` thay vì `motion`. Dùng chung cooldown (`MOTION_EVENT_COOLDOWN_S`, mặc định 900 s) — không có timer riêng. Hệ thống gửi tên action đã detect (không kèm ảnh — tên action đủ để agent suy luận).
 
 ### Cách hoạt động
 
@@ -637,22 +788,67 @@ Agent đọc dòng `Activity detected:`, split theo dấu phẩy, rồi POST t�
 
 Tùy chọn thay thế cho `MotionPerception` — chạy nhận diện hành động **riêng cho từng khuôn mặt** thay vì toàn bộ frame. Bật qua `HAL_MOTION_PER_FACE_ENABLED=true` (mặc định `false`).
 
-- Mở rộng bbox khuôn mặt (1x lên, 2x trái/phải/xuống) để lấy phần thân trên + tay.
-- Mỗi `face_id` có WS session riêng với backend action recognition.
-- Person detection luôn **tắt** trên các session này.
-- Dedup theo từng action riêng biệt cho mỗi face (mặc định 5 phút).
-- **Cooldown floor toàn cục chung cho MỌI face** — cùng semantics và cùng knobs với `MotionPerception`: cùng coarse class thì tối đa 1 `motion.activity` mỗi `MOTION_EVENT_COOLDOWN_S` (mặc định 15 phút); **transition** đổi coarse class bypass floor khi đã qua `MOTION_TRANSITION_MIN_GAP_S` (mặc định 60s); floor được xóa khi user thực sự đổi (`reset_dedup`), không xóa khi stranger chớp tắt. Không có floor này, N người trong frame = N event mỗi flush.
-- Session cần tối thiểu 4 frame trước khi gửi event đầu tiên.
-- Session bị xóa sau 30 giây không thấy face đó.
+#### Cách hoạt động
+
+1. Subscribe cập nhật `detected_faces` (giống emotion perception).
+2. Với mỗi face, **mở rộng bounding box** (1x chiều cao mặt lên trên, 2x chiều rộng mặt sang trái/phải/xuống) để lấy phần thân trên + tay — vùng diễn ra các hoạt động ở bàn làm việc.
+3. Crop vùng đã mở rộng từ frame.
+4. Gửi crop tới một **WS session riêng** trên backend action recognition. Mỗi `face_id` (vd. `gray`, `stranger_5`) có session riêng với frame buffer độc lập.
+5. Person detection luôn **tắt** trên các session này — việc mở rộng bbox mặt đã tách riêng người đó.
+
+#### Dedup theo từng action
+
+Mỗi face session giữ dedup per-action độc lập. Trong dedup window (mặc định 5 phút), label action lặp lại của cùng face bị chặn — nhưng các action khác vẫn fire.
+
+Ví dụ:
+```
+t=0:00  leo → {drinking, using computer}     → SEND both
+t=1:00  leo → {drinking, using computer}     → DROP both (within 5 min)
+t=2:00  leo → {drinking, writing}            → SEND writing only (drinking still in window)
+t=5:01  leo → {drinking}                     → SEND drinking (expired from window)
+```
+
+Ví dụ này chỉ minh họa riêng tầng per-face — cooldown floor toàn cục bên dưới áp dụng chồng lên nó.
+
+#### Cooldown floor toàn cục (chung cho mọi face)
+
+Một cooldown floor dùng chung cho TẤT CẢ face session, cùng semantics và cùng knobs với `MotionPerception`: cùng coarse activity class thì tối đa 1 `motion.activity` mỗi `MOTION_EVENT_COOLDOWN_S` (mặc định 15 phút); **transition** đổi coarse class bypass floor khi đã qua `MOTION_TRANSITION_MIN_GAP_S` (mặc định 60s) kể từ lần phát cuối; floor được xóa khi user thực sự đổi (`reset_dedup`), không xóa khi stranger chớp tắt.
+
+Không có floor này, riêng dedup per-face sẽ cho phép mỗi người một event mỗi flush — N người trong frame = N event, và mỗi face mới phát hiện sẽ fire ngay lập tức. Có floor, cảnh nhiều người vẫn chỉ tạo tối đa một event cùng class mỗi cooldown, bất kể đang track bao nhiêu face.
+
+#### Cổng số frame tối thiểu
+
+Face session mới phải nhận ít nhất `MOTION_PER_FACE_MIN_FRAMES` frame (mặc định 4) trước khi event đầu tiên fire. Tránh phân loại nhiễu từ một frame đơn lẻ khi face chỉ thoáng qua.
+
+#### Vòng đời session
+
+- **Tạo** khi lần đầu thấy một `face_id`.
+- **Xóa** sau `MOTION_PER_FACE_SESSION_TTL_S` (mặc định 30s) không thấy face đó.
+- Khi xóa, đóng kết nối WS tới backend và bỏ toàn bộ state đã buffer.
+
+#### Cấu hình
 
 | Config | Env var | Mặc định | Mô tả |
 |---|---|---|---|
 | `MOTION_PER_FACE_ENABLED` | `HAL_MOTION_PER_FACE_ENABLED` | `false` | Bật nhận diện hành động per-face |
-| `MOTION_PER_FACE_DEDUP_WINDOW_S` | `HAL_MOTION_PER_FACE_DEDUP_WINDOW_S` | `300` | Cửa sổ dedup per-action (5 phút) |
-| `MOTION_PER_FACE_SESSION_TTL_S` | `HAL_MOTION_PER_FACE_SESSION_TTL_S` | `30` | Xóa session sau bao lâu không thấy face |
-| `MOTION_PER_FACE_MIN_FRAMES` | `HAL_MOTION_PER_FACE_MIN_FRAMES` | `4` | Số frame tối thiểu trước khi gửi event |
+| `MOTION_PER_FACE_DEDUP_WINDOW_S` | `HAL_MOTION_PER_FACE_DEDUP_WINDOW_S` | `300` (5 phút) | Cửa sổ dedup per-action cho mỗi face |
+| `MOTION_PER_FACE_SESSION_TTL_S` | `HAL_MOTION_PER_FACE_SESSION_TTL_S` | `30` | Xóa WS session sau bao lâu không thấy face |
+| `MOTION_PER_FACE_MIN_FRAMES` | `HAL_MOTION_PER_FACE_MIN_FRAMES` | `4` | Số frame tối thiểu trước khi event đầu tiên fire |
 
-Định dạng message: `Activity detected (gray): using computer, writing.`
+#### Định dạng message
+
+```
+Activity detected (gray): using computer, writing.
+Activity detected (stranger_5): drinking.
+```
+
+Có `face_id` trong ngoặc để agent biết hoạt động thuộc về người nào. Dùng cùng event type `motion.activity` với `MotionPerception`.
+
+#### Khi nào nên dùng
+
+- **Cảnh nhiều người** — mỗi người được phân loại hành động độc lập.
+- **Camera tự chuyển động** — crop neo theo mặt ổn định hơn cả frame khi servo đang quay.
+- **Đánh đổi**: mở một kết nối WS cho mỗi face được track. Với một người ngồi bàn, `MotionPerception` chuẩn đơn giản hơn.
 
 ---
 
@@ -764,7 +960,7 @@ Các sensing event có kèm camera frame (`motion`, `presence.enter`, `presence.
 | **Tmp buffer** | `/tmp/hal-sensing-snapshots/sensing_<prefix>/` | Theo số lượng (tối đa 50 file) | Không |
 | **Persistent** | `/var/lib/hal/snapshots/sensing_<prefix>/` | TTL (72h) + dung lượng (tối đa 50 MB) | Có |
 
-Mỗi loại event ghi vào subdir riêng (`sensing_<prefix>`, ví dụ `sensing_presence/`, `sensing_motion_activity/`, `sensing_emotion/`). Tên file là `<ms>.jpg`. Snapshot được lưu vào tmp trước, rồi copy sang persistent dir. Đường dẫn persistent được ghi trong event message (`[snapshot: /var/lib/hal/snapshots/sensing_<prefix>/<ms>.jpg]`) để agent có thể xem lại — kể cả sau khi thiết bị reboot. Monitor phục vụ ảnh qua `GET /api/sensing/snapshot/<category>/<name>`.
+Mỗi loại event ghi vào subdir riêng (`sensing_<prefix>`, ví dụ `sensing_presence/`, `sensing_motion_activity/`, `sensing_emotion/`). Tên file là `<ms>.jpg`. Snapshot được lưu vào tmp trước, rồi copy sang persistent dir. Đường dẫn persistent được ghi trong event message (`[snapshot: /var/lib/hal/snapshots/sensing_<prefix>/<ms>.jpg]`) để agent có thể xem lại — kể cả sau khi thiết bị reboot. Monitor phục vụ ảnh qua `GET /api/sensing/snapshot/<category>/<name>`, route này cần admin auth (phiên web hoặc token của chủ máy); tên file là timestamp nên không được để máy khác trong LAN tải về.
 
 Các hằng số cấu hình nằm trong `hal/config.py`:
 - `SNAPSHOT_TMP_MAX_COUNT` — số file tối đa trong tmp (mặc định 50)
@@ -778,7 +974,7 @@ Các hằng số cấu hình nằm trong `hal/config.py`:
 - **Passive sensing events** (`[sensing:*]`) bị drop nếu agent đang bận xử lý turn khác.
 - **Replay chờ loa, không chỉ chờ agent**: runtime báo idle khi text trả lời được đẩy vào TTS queue, chứ không phải khi loa đọc xong — câu trả lời dài còn phát thêm hàng chục giây. Drain ngay lúc đó sinh ra turn mới giữa chừng, và vì HAL trao loa cho turn mới nhất (`turn_seq`), câu trả lời user thật sự hỏi bị cắt ngang (quan sát trên máy 28/8: câu trả lời hunting-season bị lời chào từ `presence.enter` đang xếp hàng cắt mất). `drainPendingEvents` giờ hỏi `lib/speakergate` trước: khi `GET /voice/status` còn báo `tts_speaking`, cả batch được trả lại hàng đợi và drain lại trong vòng 500 ms sau khi loa im. Hai loại event không bao giờ chờ — lời nói và chat (`voice`, `voice_command`, `voice_followup`, `voice_agent_handled`, `web_chat`, `mqtt_chat`), vì người nói đè lên máy chính là barge-in mà luật cướp loa sinh ra để phục vụ; và `fire_hazard.detected`, vì cảnh báo an toàn không được xếp hàng sau một câu trả lời. Một event được miễn sẽ giải phóng cả batch của nó, để hàng đợi không bị đảo thứ tự. Cờ `speaking` bị kẹt chỉ làm chậm replay chứ không huỷ: sau 90 s batch vẫn replay, và HAL không trả lời được coi là loa rảnh.
 - **Luật đó áp cả khi không có turn nào đang chạy**: runtime báo idle ngay khi text trả lời được xếp vào TTS, nên event có thể tới lúc agent rảnh mà loa vẫn đang đọc — và cửa sổ đó dài đúng bằng câu trả lời, tức đúng lúc dễ có người đứng trước mặt máy nhất. Vì vậy `PostEvent` coi "loa đang đọc" là bận với cùng nhóm event passive (`handler.go`), xếp event vào hàng đợi, rồi nhờ `speakergate` replay khi đọc xong. Thiếu vế cuối thì nó nằm lại vĩnh viễn: drain vốn bám vào lúc một turn kết thúc, mà ở đây không có turn nào chạy. `DrainPendingEvents()` nằm trên `domain.AgentGateway` chính vì lý do này.
-- **Voice events** luôn pass through — người dùng đang chủ động nói chuyện. Voice messages kèm mood scan nudge (`[MANDATORY: Follow Mood skill — log mood now.]`) để agent nhớ detect mood từ conversation flow. Pass event không có nghĩa bắt buộc phải trả lời: `SOUL.md` trả `NO_REPLY` cho filler, một từ đơn/lặp lại, mảnh câu bị cắt, transcript nhận dạng sai, hoặc input giọng nói không có nghĩa rõ ràng. Với turn đó không được hỏi làm rõ, phản ứng, hoặc log mood.
+- **Voice events** được chuyển tới agent, nhưng nhãn voice hay window đang mở chưa chứng minh câu nói dành cho Lamp. `SOUL.md` xét hội thoại gần nhất để nhận câu trả lời, sửa ý và xác nhận: "Yeah" sau câu hỏi có/không hoặc "So, that's Tiger" khi đang nhận diện con vật không bị loại chỉ vì ngắn. Lượt có nghĩa và rõ ràng dành cho Lamp được phản hồi ngắn; yêu cầu hiểu được nhưng còn mơ hồ có thể được hỏi làm rõ một ý cụ thể. Lời nói với người khác, chưa rõ người được nói tới, và filler/mảnh nhận dạng không có nghĩa ngay cả trong ngữ cảnh vẫn trả `NO_REPLY`, không hỏi lại, chuyển động hay log mood. `[HANDLED]`, yêu cầu im lặng và quy tắc giao kết quả đã delegate giữ hành vi im lặng. Mood scan nudge (`[MANDATORY: Follow Mood skill — log mood now.]`) không ghi đè các quy tắc này. Đây là policy prompt, không bảo đảm phân loại đúng người được nói tới; không thêm lượt gọi model hay TTS chữa cháy.
 - Prefix `[sensing:type]` trong message là cách agent biết đây là ambient event, không phải message từ người dùng.
 - **Pre-turn `thinking` emotion**: Hook `emotion-acknowledge` tự fire `POST /emotion {thinking, 0.7}` server-side ở event `message:preprocessed` cho mọi non-sensing message — agent không cần gọi. Hook skip sensing events vì mỗi type đã có emotion đầu tiên riêng.
 - **Image pruning echo**: OpenClaw strip image payload cũ khỏi conversation history để tiết kiệm token. Model nhỏ (Haiku) có thể echo marker dưới dạng `[image description removed]` trong response. `SOUL.md` hướng dẫn agent không được echo các marker này.
@@ -797,7 +993,7 @@ Khi không có gì diễn ra, `system/ambient/` (Go, thuộc os-server) làm thi
 - **Sleep mode**: khi event `hw_emotion` mang emotion `sleepy`, toàn bộ hành vi ambient bị suppress cho tới khi có tương tác thật tiếp theo (chat, wake word, sensing) đánh thức thiết bị.
 - Chuyển trạng thái pause/resume được log vào Flow Monitor dưới dạng `ambient_pause` / `ambient_resume`.
 
-**Hai đồng hồ, hai tầng** — 60 giây resume là *điều kiện đủ tư cách* ("ambient được phép hoạt động lại"), còn mỗi loop bên dưới có đồng hồ *nhịp riêng* chạy độc lập, không bị reset khi có tương tác; nếu đồng hồ của loop điểm giờ đúng lúc ambient đang paused thì lượt đó bị bỏ qua, không xếp hàng chờ. Ví dụ timeline: user ngừng nói chuyện → 60 giây sau ambient resume, LED bắt đầu thở gần như ngay (tick 2 giây) — còn câu tự lẩm bẩm kế tiếp rơi vào lúc đồng hồ 5–15 phút của mumble loop điểm giờ, có thể ngay sau đó hoặc nhiều phút sau.
+**Hai đồng hồ, hai tầng** — 60 giây resume là *điều kiện đủ tư cách* ("ambient được phép hoạt động lại"), còn mỗi loop bên dưới có đồng hồ *nhịp riêng* chạy độc lập, không bị reset khi có tương tác; nếu đồng hồ của loop điểm giờ đúng lúc ambient đang paused thì lượt đó bị bỏ qua, không xếp hàng chờ. Ví dụ timeline: user ngừng nói chuyện → 60 giây sau ambient resume, HAL khôi phục LED lúc nghỉ gần như ngay (tick 2 giây) — còn câu tự lẩm bẩm kế tiếp rơi vào lúc đồng hồ 5–15 phút của mumble loop điểm giờ, có thể ngay sau đó hoặc nhiều phút sau.
 
 ### Các behavior loop (gate theo capability)
 
@@ -805,9 +1001,9 @@ Toàn bộ suite là opt-in theo từng device: capability routeless `lifelike` 
 
 | Loop | Capability | Nhịp | Hoạt động |
 |------|-----------|------|-----------|
-| Breathing LED | `light` | liên tục (tick 2 giây) | Bật effect `breathing` có sẵn của HAL qua `/led/effect` (speed 0.3) với màu LED hiện tại đọc từ HAL; fallback về resting look (`ambientRestingColor`, hiện là `(0, 0, 0)`) khi LED đang tắt (đen) — resting look tối nghĩa là skip tick và strip ở yên không sáng. Xem [led-control_vi.md § Resting look](led-control_vi.md#resting-look-mặc-định-tắt). Dừng effect khi paused hoặc LED đang bị lock. |
+| LED lúc nghỉ | `light` | tick 2 giây; một lần khi resume | Gọi `/led/restore`; HAL khôi phục tùy chọn user hoặc `ambient_led.resting` riêng device. Lamp mặc định sáng đều [1,1,1]; user tắt thì giữ tắt. |
 | Micro-movements | `motion` | ngẫu nhiên 45–120 giây | Phát một servo recording an toàn trong bộ `idle`, `curious`, `nod`. Chỉ servo — không đụng vào LED. |
-| Mumble (tự lẩm bẩm) | `audio` | ngẫu nhiên 5–15 phút | Chọn trong sáu mục `PhraseMumble` dùng chung mỗi ngôn ngữ (`system/lib/i18n/phrases.go`, EN/VI/zh-CN/zh-TW): xen âm ngắn với lời tự nói có chút tinh nghịch, như “Cứ thong thả thôi.” và “Mình thích những lúc thế này.” Một mục dùng `[chuckle]`; không có tag thở dài hay thì thầm. Dùng `hal.SpeakCached` — lần render đầu của mỗi câu mới gọi TTS provider, các lần sau phát lại từ WAV cache của HAL, nên lẩm bẩm lúc idle không tốn API. |
+| Mumble (tự lẩm bẩm) | `audio` | tạm tắt | `mumbleLoop` return ngay, không gọi TTS hoặc phát audio cache. Giữ nguyên vòng lặp 5–15 phút và pool câu để bật lại. Chọn trong sáu mục `PhraseMumble` dùng chung mỗi ngôn ngữ (`system/lib/i18n/phrases.go`, EN/VI/zh-CN/zh-TW): xen âm ngắn với lời tự nói có chút tinh nghịch, như “Cứ thong thả thôi.” và “Mình thích những lúc thế này.” Một mục dùng `[chuckle]`; không có tag thở dài hay thì thầm. Dùng `hal.SpeakCached` — lần render đầu của mỗi câu mới gọi TTS provider, các lần sau phát lại từ WAV cache của HAL, nên lẩm bẩm lúc idle không tốn API. |
 
 Câu từ dùng chung, không phụ thuộc loại robot hay cơ thể. Pool idle không có
 ngữ cảnh sensor hay hội thoại, nên không nhận xét ánh sáng,

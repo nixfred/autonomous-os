@@ -108,6 +108,9 @@ func TestForceTargetAllowedIncludesDebugVersionTargets(t *testing.T) {
 	if !forceTargetAllowed[domain.OTAKeyDevice] {
 		t.Fatal("device must be a force-update target so the debug Versions card can update the installed profile")
 	}
+	if !forceTargetAllowed[domain.OTAKeyOpenClaw] {
+		t.Fatal("openclaw must be a force-update target so the Agent update button works on OpenClaw devices")
+	}
 }
 
 func TestOTAErrorLEDSchedulesRestore(t *testing.T) {
@@ -130,7 +133,7 @@ func TestOTAErrorLEDSchedulesRestore(t *testing.T) {
 		gotRestore = restore
 	}
 
-	(&Bootstrap{}).showOTAErrorLED()
+	(&Bootstrap{serviceStateDir: t.TempDir()}).showOTAErrorLED()
 
 	if gotDelay != otaErrorLEDDisplayDuration {
 		t.Fatalf("error LED restore delay = %v, want %v", gotDelay, otaErrorLEDDisplayDuration)
@@ -141,19 +144,18 @@ func TestOTAErrorLEDSchedulesRestore(t *testing.T) {
 	gotRestore()
 }
 
-// A component the device does not have must not read as "out of date". Before
-// this gate, an absent artifact made detectVersion return "" — which sorts below
-// every min_version floor — so the worker announced an update over the speaker,
-// lit the OTA LED and tried to install it on every poll, forever.
+// An absent component must not read as out of date.
 func TestReconcileSkipsUninstalledComponent(t *testing.T) {
 	devicesDir := t.TempDir() // no <type> subdir → the profile is not installed
 	t.Setenv("DEVICES_DIR", devicesDir)
 	t.Setenv("DEVICE_TYPE", "reachy-mini")
 
-	b := &Bootstrap{state: &state.State{Components: map[string]string{}}}
+	b := &Bootstrap{serviceStateDir: t.TempDir(),
+		state:              &state.State{Components: map[string]string{}},
+		rollbackConfigPath: filepath.Join(t.TempDir(), "bootstrap.json"),
+	}
 
-	// Without the gate this reaches applyUpdate, which execs software-update and
-	// returns an error — so a nil error is what proves the skip happened.
+	// A nil error proves the skip (applyUpdate would fail here).
 	updated, err := b.reconcile(context.Background(), domain.OTAKeyDevice,
 		domain.OTAComponent{Version: "9.9.9"})
 	if err != nil {
@@ -168,9 +170,10 @@ func TestReconcileSkipsUninstalledComponent(t *testing.T) {
 }
 
 func TestReconcileSkipsVersionBlockedByRollback(t *testing.T) {
-	b := &Bootstrap{
-		cfg:   &config.Config{RollbackVersions: map[string]string{domain.OTAKeyOSServer: "1.2.3"}},
-		state: &state.State{Components: map[string]string{}},
+	b := &Bootstrap{serviceStateDir: t.TempDir(),
+		cfg:                &config.Config{RollbackVersions: map[string]string{domain.OTAKeyOSServer: "1.2.3"}},
+		state:              &state.State{Components: map[string]string{}},
+		rollbackConfigPath: filepath.Join(t.TempDir(), "bootstrap.json"),
 	}
 	updated, err := b.reconcile(context.Background(), domain.OTAKeyOSServer, domain.OTAComponent{
 		Version:    "1.2.3",
@@ -188,7 +191,7 @@ func TestComponentInstalled(t *testing.T) {
 	devicesDir := t.TempDir()
 	t.Setenv("DEVICES_DIR", devicesDir)
 	t.Setenv("DEVICE_TYPE", "reachy-mini")
-	b := &Bootstrap{}
+	b := &Bootstrap{serviceStateDir: t.TempDir()}
 
 	if b.componentInstalled(domain.OTAKeyDevice) {
 		t.Error("device profile reported installed with no profile directory")
@@ -199,12 +202,9 @@ func TestComponentInstalled(t *testing.T) {
 	if !b.componentInstalled(domain.OTAKeyDevice) {
 		t.Error("device profile reported missing although its directory exists")
 	}
-	// The worker is the bootstrap component: always installed, so it can always
-	// self-update.
 	if !b.componentInstalled(domain.OTAKeyBootstrap) {
 		t.Error("bootstrap must always count as installed")
 	}
-	// An unresolvable device type must not resolve to some other device's dir.
 	t.Setenv("DEVICE_TYPE", "")
 	if b.componentInstalled(domain.OTAKeyDevice) {
 		t.Error("device profile reported installed with an unresolved device type")
@@ -229,14 +229,11 @@ func TestCLISemver(t *testing.T) {
 }
 
 func TestComponentInstalledAgentCLIsFollowRuntime(t *testing.T) {
-	// The agent CLIs are gated on the configured runtime, not on the binary
-	// being present — every lamp/intern-v2 image bakes all of them. With no
-	// resolvable config (this test host), every CLI must report NOT installed so
-	// the worker never pushes a runtime the device does not run.
+	// With no resolvable config, every agent CLI must report not installed.
 	if _, err := os.Stat("/root/config/config.json"); err == nil {
 		t.Skip("host has a real /root/config/config.json; runtime gate not isolatable")
 	}
-	b := &Bootstrap{}
+	b := &Bootstrap{serviceStateDir: t.TempDir()}
 	for _, key := range []string{domain.OTAKeyCodex, domain.OTAKeyClaudeCode, domain.OTAKeyOpenCode, domain.OTAKeyPicoClaw} {
 		if b.componentInstalled(key) {
 			t.Errorf("%s reported installed with an unresolvable agent_runtime", key)
@@ -262,22 +259,17 @@ fi
 	if !updaterSupports(domain.OTAKeyCodex) {
 		t.Error("codex branch present but reported unsupported")
 	}
-	// picoclaw appears in the usage line only — a loose substring search would
-	// wrongly report support for an updater that cannot apply it.
+	// picoclaw appears only in the usage line; that must not count as support.
 	if updaterSupports(domain.OTAKeyPicoClaw) {
 		t.Error("picoclaw reported supported from its usage-string mention alone")
 	}
-	// An updater that is not on PATH at all must report no support, not panic.
 	t.Setenv("PATH", t.TempDir())
 	if updaterSupports(domain.OTAKeyCodex) {
 		t.Error("missing software-update reported as supporting codex")
 	}
 }
 
-// Hermes is applied only through a PINNING updater (one that reads
-// .hermes.commit): the older HEAD-following hermes branch must not count, or a
-// pinned entry would be applied via `hermes update`, land on HEAD, and
-// re-trigger every poll — the failure hermes used to be excluded for.
+// Hermes needs a pinning updater that reads .hermes.commit.
 func TestUpdaterSupportsHermesPinRequiresCommitField(t *testing.T) {
 	dir := t.TempDir()
 	write := func(script string) {
@@ -296,8 +288,7 @@ func TestUpdaterSupportsHermesPinRequiresCommitField(t *testing.T) {
 	}
 }
 
-// An unpinned hermes metadata entry (no commit) is neither applied nor
-// advertised; every other component, and a pinned hermes entry, passes.
+// An unpinned hermes entry is neither applied nor advertised.
 func TestHermesPinnedGate(t *testing.T) {
 	if hermesPinned(domain.OTAKeyHermes, domain.OTAComponent{Version: "0.21.1"}) {
 		t.Fatal("unpinned hermes entry passed the gate")
@@ -307,5 +298,19 @@ func TestHermesPinnedGate(t *testing.T) {
 	}
 	if !hermesPinned(domain.OTAKeyCodex, domain.OTAComponent{Version: "0.142.5"}) {
 		t.Fatal("non-hermes component blocked by the hermes gate")
+	}
+}
+
+func TestFloorVersionPerDevice(t *testing.T) {
+	c := domain.OTAComponent{Version: "0.1.285", MinVersion: "0.0.867", MinVersionByDevice: map[string]string{"lamp": "0.1.285"}}
+	for deviceType, want := range map[string]string{"lamp": "0.1.285", "intern-v2": "0.0.867", "": "0.0.867"} {
+		t.Setenv("DEVICE_TYPE", deviceType)
+		if got := floorVersion(c); got != want {
+			t.Errorf("device %q: floor %q, want %q", deviceType, got, want)
+		}
+	}
+	t.Setenv("DEVICE_TYPE", "lamp")
+	if got := floorVersion(domain.OTAComponent{Version: "1.0.0"}); got != "1.0.0" {
+		t.Errorf("no floors: got %q, want version", got)
 	}
 }

@@ -2,13 +2,13 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { S } from "./styles";
 import { HW } from "./types";
 import type { ServoState } from "./types";
-import { StatusDot } from "./components";
+import { ConfirmDialog, StatusDot } from "./components";
 import { usePolling } from "../../hooks/usePolling";
+import "./servo.css";
 
-// Minimum gap between live-drag writes, in ms. The servo bus is a 6.4 Mbit
-// serial line shared with the animation loop, and a range input fires far
-// faster than it can answer; ~12 writes/s is smooth to the eye and leaves the
-// bus room to breathe.
+const cardTitle = { ...S.cardLabel, fontSize: 15, letterSpacing: "normal", textTransform: "none" as const, marginBottom: 10 };
+
+// Minimum gap between live-drag writes (shared 6.4 Mbit servo bus).
 const LIVE_THROTTLE_MS = 80;
 
 interface ServoDetail {
@@ -18,6 +18,33 @@ interface ServoDetail {
   error?: string | null;
 }
 
+// GET /health servo_overload.contact.profile: this lamp's learned contact envelope.
+interface ContactProfileState {
+  margin: number;
+  recordings: number;
+  learning: string | null;
+}
+
+// What is still on before a learn run: a live mic turns the lamp toward voices and a
+// live camera toward faces, and either move cuts the animation being learned.
+interface LearnSensors {
+  mic: boolean;
+  camera: boolean;
+}
+
+// A learn run that has not shown up in /health this long after it started has already
+// ended (it failed or was stopped between two polls).
+const LEARN_UNSEEN_MS = 15000;
+
+// Turn back on what the learn dialog turned off; true when every request succeeded.
+async function restoreSensors(sensors: LearnSensors): Promise<boolean> {
+  const results = await Promise.all([
+    sensors.mic ? fetch(`${HW}/voice/unmute`, { method: "POST" }).then((r) => r.ok).catch(() => false) : true,
+    sensors.camera ? fetch(`${HW}/camera/enable`, { method: "POST" }).then((r) => r.ok).catch(() => false) : true,
+  ]);
+  return results.every(Boolean);
+}
+
 export function ServoSection() {
   const [servo, setServo] = useState<ServoState | null>(null);
   const [servos, setServos] = useState<Record<string, ServoDetail> | null>(null);
@@ -25,19 +52,17 @@ export function ServoSection() {
   const [actionMsg, setActionMsg] = useState<string | null>(null);
   const [uploading, setUploading] = useState(false);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
-  // Manual move target — populated to 0 for each known joint, editable via sliders.
-  // `Sync from current` reads live angles into this map.
   const [moveTargets, setMoveTargets] = useState<Record<string, number>>({});
   const [moveDuration, setMoveDuration] = useState<number>(2.0);
   const [moving, setMoving] = useState(false);
-  // Live drag: send each slider change straight to the servo instead of waiting
-  // for the Move button. Aiming the head is a "look at it and stop when it's
-  // right" job, and a 2s interpolated move per attempt makes that unusable.
   const [liveDrag, setLiveDrag] = useState(false);
-  // Throttle state for live drag. A range input fires on every pixel, which is
-  // far more than the serial bus can absorb; without this the queue backs up and
-  // the head keeps moving after the mouse stops. Trailing send guarantees the
-  // final resting value lands even if it arrived inside a throttle window.
+  const [touch, setTouch] = useState<ContactProfileState | null>(null);
+  const [learnSensors, setLearnSensors] = useState<LearnSensors | null>(null);
+  const [learnBusy, setLearnBusy] = useState(false);
+  // What the learn dialog turned off, restored once that run ends (finished or aborted).
+  // Only this page knows it: closing the tab before the run ends leaves them off.
+  const learnRestore = useRef<{ sensors: LearnSensors; startedAt: number; seen: boolean } | null>(null);
+  // Throttle live drag; a trailing send guarantees the final value lands.
   const liveLastSent = useRef(0);
   const liveTrailing = useRef<ReturnType<typeof setTimeout> | null>(null);
   const liveInFlight = useRef(false);
@@ -51,8 +76,7 @@ export function ServoSection() {
       if (sr) setServo(sr);
       if (st?.servos) setServos(st.servos);
     } catch {
-      // Best-effort refresh: keep the last known servo readout rather than
-      // clearing the panel when HAL is mid-restart.
+      // Keep the last readout while HAL restarts.
     }
   }, []);
 
@@ -63,12 +87,14 @@ export function ServoSection() {
   }, []);
 
   usePolling(async (signal) => {
-    const [sr, st] = await Promise.all([
+    const [sr, st, hl] = await Promise.all([
       fetch(`${HW}/servo`, { signal }).then((r) => r.json()).catch(() => null),
       fetch(`${HW}/servo/status`, { signal }).then((r) => r.json()).catch(() => null),
+      fetch(`${HW}/health`, { signal }).then((r) => r.json()).catch(() => null),
     ]);
     if (sr) setServo(sr);
     if (st?.servos) setServos(st.servos);
+    if (hl) setTouch(hl?.servo_overload?.contact?.profile ?? null);
   }, 3000);
 
   const flash = (msg: string) => {
@@ -145,14 +171,94 @@ export function ServoSection() {
     await fetch(`${HW}/servo/hold`, { method: "POST", headers: { accept: "application/json" } }).catch(() => {});
     setTimeout(refresh, 500);
   };
+  const startLearn = async (): Promise<boolean> => {
+    const resp = await fetch(`${HW}/servo/contact/learn`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", accept: "application/json" },
+      body: JSON.stringify({ runs: 2 }),
+    }).catch(() => null);
+    if (resp?.ok) {
+      flash("Learning — the lamp plays each animation twice");
+      return true;
+    }
+    const err = await resp?.json().catch(() => null);
+    flash(`Learn failed: ${err?.detail ?? "HAL unreachable"}`);
+    return false;
+  };
+  // Ask to turn the camera and mic off first when either is on; otherwise learn now.
+  const learnTouch = async () => {
+    setLearnBusy(true);
+    try {
+      const [voice, camera] = await Promise.all([
+        fetch(`${HW}/voice/status`).then((r) => (r.ok ? r.json() : null)).catch(() => null),
+        fetch(`${HW}/camera`).then((r) => (r.ok ? r.json() : null)).catch(() => null),
+      ]);
+      // A failed or missing status counts as off: there is nothing to turn off there.
+      const sensors = {
+        mic: voice != null && !voice.mic_muted,
+        camera: camera != null && !!camera.available && !camera.disabled,
+      };
+      if (sensors.mic || sensors.camera) {
+        setLearnSensors(sensors);
+        return;
+      }
+      await startLearn();
+    } finally {
+      setLearnBusy(false);
+    }
+  };
+  const learnAfterPrivacy = async () => {
+    const sensors = learnSensors;
+    setLearnSensors(null);
+    if (!sensors) return;
+    setLearnBusy(true);
+    try {
+      const [micOff, cameraOff] = await Promise.all([
+        sensors.mic ? fetch(`${HW}/voice/mute`, { method: "POST" }).then((r) => r.ok).catch(() => false) : false,
+        sensors.camera ? fetch(`${HW}/camera/disable`, { method: "POST" }).then((r) => r.ok).catch(() => false) : false,
+      ]);
+      const turnedOff = { mic: micOff, camera: cameraOff };
+      if (micOff !== sensors.mic || cameraOff !== sensors.camera) {
+        await restoreSensors(turnedOff);
+        flash("Could not turn off the camera or mic; learning not started");
+        return;
+      }
+      if (await startLearn()) {
+        learnRestore.current = { sensors: turnedOff, startedAt: Date.now(), seen: false };
+      } else {
+        await restoreSensors(turnedOff);
+      }
+    } finally {
+      setLearnBusy(false);
+    }
+  };
+  // Restore once the run is over: seen in /health and gone again, or never seen at all.
+  // Keyed on `touch`, a fresh object every poll, so the unseen timeout is re-checked.
+  useEffect(() => {
+    const pending = learnRestore.current;
+    if (!pending || !touch) return;
+    const learning = touch.learning;
+    if (learning) {
+      pending.seen = true;
+      return;
+    }
+    if (!pending.seen && Date.now() - pending.startedAt < LEARN_UNSEEN_MS) return;
+    learnRestore.current = null;
+    void restoreSensors(pending.sensors).then((ok) => {
+      setActionMsg(ok ? "Learning done — turned the camera/mic back on" : "Learning done — could not turn the camera or mic back on");
+      setTimeout(() => setActionMsg(null), 4000);
+    });
+  }, [touch]);
+  const learnAnyway = () => {
+    setLearnSensors(null);
+    void startLearn();
+  };
   const resumeServos = async () => {
     flash("Resuming animation");
     await fetch(`${HW}/servo/resume`, { method: "POST", headers: { accept: "application/json" } }).catch(() => {});
     setTimeout(refresh, 500);
   };
 
-  // Seed moveTargets the first time the servo list arrives so sliders render at 0
-  // for every known joint. After that, the user owns the values.
   useEffect(() => {
     if (!servos) return;
     setMoveTargets((prev) => {
@@ -173,9 +279,7 @@ export function ServoSection() {
     flash("Synced sliders to current pose");
   };
 
-  // One joint, duration 0. Zero duration is not just "fast": it takes the
-  // send_action path in move_and_hold instead of the interpolating one, so a
-  // drag lands as a single bus write and never queues a 2s tween behind itself.
+  // Duration 0 takes the send_action path: one bus write, no queued tween.
   const sendLive = useCallback((joint: string, value: number) => {
     const fire = async () => {
       if (liveInFlight.current) return;
@@ -188,8 +292,7 @@ export function ServoSection() {
           body: JSON.stringify({ positions: { [joint]: value }, duration: 0 }),
         });
       } catch {
-        // A dropped frame mid-drag is not worth a toast — the next one corrects
-        // it, and the trailing send below always delivers the final value.
+        // A dropped frame is corrected by the next one and the trailing send.
       } finally {
         liveInFlight.current = false;
       }
@@ -254,27 +357,25 @@ export function ServoSection() {
     : "var(--lm-amber)";
 
   return (
-    <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
+    <div className="servo-section">
 
-      {/* Row 1: Servos status + Aim + Motor Control + Animations — all 4 cards side-by-side */}
-      <div className="lm-grid-4">
+      <div className="servo-overview">
 
-        {/* Servos status — list collapses to a single column inside the 1/4 width slot */}
         <div style={S.card}>
           <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10, gap: 6 }}>
             <div style={{ display: "flex", alignItems: "center", gap: 8, minWidth: 0 }}>
-              <div style={S.cardLabel}>Servos</div>
+              <div style={cardTitle}>Servos</div>
               <span style={{
-                fontSize: 10, padding: "2px 7px", borderRadius: 4,
-                background: `${headerColor}22`, color: headerColor,
-                border: `1px solid ${headerColor}55`,
+                fontSize: 13, padding: "2px 7px", borderRadius: 4,
+                background: `color-mix(in srgb, ${headerColor} 12%, transparent)`, color: headerColor,
+                border: `1px solid color-mix(in srgb, ${headerColor} 35%, transparent)`,
                 fontWeight: 700, letterSpacing: "0.05em",
                 flexShrink: 0,
               }}>
-                {onlineCount}/{totalCount}
+                {onlineCount}/{totalCount} online
               </span>
             </div>
-            <div style={{ fontSize: 11, fontWeight: 600, color: "var(--lm-amber)", textAlign: "right", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+            <div style={{ fontSize: 13, fontWeight: 600, color: "var(--lm-amber)", textAlign: "right", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
               {servo?.current || "idle"}
             </div>
           </div>
@@ -285,15 +386,14 @@ export function ServoSection() {
               ))}
             </div>
           ) : (
-            <div style={{ fontSize: 12, color: "var(--lm-text-muted)" }}>Loading…</div>
+            <div style={{ fontSize: 12, color: "var(--lm-text-dim)" }}>Loading…</div>
           )}
         </div>
 
-        {/* Aim Direction */}
         <div style={{ ...S.card, alignSelf: "start" }}>
-          <div style={S.cardLabel}>Aim Direction</div>
-          <div style={{ fontSize: 11, color: "var(--lm-text-muted)", marginBottom: 10 }}>
-            Move head to a preset (2s).
+          <div style={cardTitle}>Aim Direction</div>
+          <div style={{ fontSize: 13, color: "var(--lm-text-dim)", marginBottom: 10 }}>
+            Choose a direction. Movement takes 2 seconds.
           </div>
           {aims.length > 0 ? (
             <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
@@ -301,15 +401,13 @@ export function ServoSection() {
                 <ChipButton key={dir} onClick={() => aimTo(dir)}>{dir}</ChipButton>
               ))}
             </div>
-          ) : <span style={{ fontSize: 11, color: "var(--lm-text-muted)" }}>No directions configured</span>}
+          ) : <span style={{ fontSize: 13, color: "var(--lm-text-dim)" }}>No directions configured</span>}
         </div>
 
-        {/* Motor Control — 2-col grid keeps button column at uniform width so all
-            4 buttons line up vertically, regardless of label length. */}
         <div style={{ ...S.card, alignSelf: "start" }}>
-          <div style={S.cardLabel}>Motor Control</div>
-          <div style={{ fontSize: 11, color: "var(--lm-text-muted)", marginBottom: 10 }}>
-            Emergency overrides.
+          <div style={cardTitle}>Motor Control</div>
+          <div style={{ fontSize: 13, color: "var(--lm-text-dim)", marginBottom: 10 }}>
+            Control motor position and torque.
           </div>
           <div style={{
             display: "grid",
@@ -324,10 +422,36 @@ export function ServoSection() {
           </div>
         </div>
 
-        {/* Animations: chips wrap inside the column; upload button moves to its own row */}
+        {touch && (
+          <div style={{ ...S.card, alignSelf: "start" }}>
+            <div style={cardTitle}>Touch Sensitivity</div>
+            <div style={{ fontSize: 13, color: "var(--lm-text-dim)", marginBottom: 10, lineHeight: 1.4 }}>
+              {touch.learning
+                ? `Learning… now playing ${touch.learning}. Keep hands and objects away.`
+                : touch.recordings > 0
+                  ? `Learned on this lamp: ${touch.recordings} animations. Relearn after a servo is replaced.`
+                  : "Not learned yet: only hard pushes stop the arm during animations."}
+            </div>
+            <div style={{
+              display: "grid",
+              gridTemplateColumns: "minmax(96px, max-content) 1fr",
+              rowGap: 8, columnGap: 10,
+              alignItems: "center",
+            }}>
+              <ControlButton
+                onClick={() => { void learnTouch(); }}
+                disabled={!!touch.learning || learnBusy}
+                color="var(--lm-teal)"
+                title={touch.learning ? "Learning…" : "Learn"}
+                hint="Clear the space around the lamp first; it plays every animation twice (a few minutes)."
+              />
+            </div>
+          </div>
+        )}
+
         <div style={{ ...S.card, alignSelf: "start" }}>
           <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8, gap: 6 }}>
-            <div style={S.cardLabel}>Animations</div>
+            <div style={cardTitle}>Animations</div>
             <input
               type="file"
               accept=".csv,text/csv"
@@ -340,14 +464,14 @@ export function ServoSection() {
               disabled={uploading}
               title="Upload CSV — file name becomes recording name"
               style={{
-                fontSize: 10, padding: "3px 8px", borderRadius: 5, fontWeight: 600,
+                fontSize: 13, minHeight: 36, padding: "6px 10px", borderRadius: 5, fontWeight: 600,
                 background: "var(--lm-surface)", border: "1px solid var(--lm-border)",
                 color: uploading ? "var(--lm-text-muted)" : "var(--lm-amber)",
                 cursor: uploading ? "not-allowed" : "pointer",
                 flexShrink: 0,
               }}
             >
-              {uploading ? "…" : "↑ CSV"}
+              {uploading ? "…" : "Upload CSV"}
             </button>
           </div>
           {(servo?.available_recordings ?? []).length > 0 ? (
@@ -358,46 +482,47 @@ export function ServoSection() {
                 </ChipButton>
               ))}
             </div>
-          ) : <span style={{ fontSize: 11, color: "var(--lm-text-muted)" }}>No recordings available</span>}
+          ) : <span style={{ fontSize: 13, color: "var(--lm-text-dim)" }}>No recordings available</span>}
         </div>
       </div>
 
-      {/* Manual Move — direct /servo/move call with per-joint sliders + smooth duration. */}
       <div style={S.card}>
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10, gap: 10, flexWrap: "wrap" }}>
-          <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-            <div style={S.cardLabel}>Manual Move</div>
-            <span style={{ fontSize: 11, color: "var(--lm-text-muted)" }}>
-              direct /servo/move — clamped to ±90°
-            </span>
+          <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
+            <div>
+              <div style={cardTitle}>Manual Move</div>
+              <div style={{ fontSize: 13, color: "var(--lm-text-dim)" }}>
+                Set each joint target between −90° and +90°.
+              </div>
+            </div>
             <label
               title="Send each slider change straight to the servo (duration 0), instead of waiting for the Move button."
               style={{
-                fontSize: 11, display: "flex", alignItems: "center", gap: 5, cursor: "pointer",
-                color: liveDrag ? "var(--lm-green)" : "var(--lm-text-muted)", fontWeight: 600,
+                fontSize: 13, display: "flex", alignItems: "center", gap: 5, cursor: "pointer", whiteSpace: "nowrap", flexShrink: 0,
+                color: liveDrag ? "var(--lm-green)" : "var(--lm-text-dim)", fontWeight: 600,
               }}
             >
               <input
                 type="checkbox"
                 checked={liveDrag}
                 onChange={(e) => setLiveDrag(e.target.checked)}
-                style={{ accentColor: "var(--lm-green)", cursor: "pointer" }}
+                style={{ accentColor: "var(--lm-green)", cursor: "pointer", flexShrink: 0 }}
               />
               Live drag
             </label>
           </div>
-          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+          <div className="servo-move-actions">
             <button
               onClick={syncMoveFromCurrent}
               disabled={!servos}
               style={{
-                fontSize: 11, padding: "5px 14px", borderRadius: 6, fontWeight: 600,
+                fontSize: 13, padding: "10px 14px", borderRadius: 8, minHeight: 40, maxWidth: "100%", overflowWrap: "anywhere", fontWeight: 600,
                 background: "var(--lm-surface)", border: "1px solid var(--lm-border)",
                 color: "var(--lm-text-dim)", cursor: servos ? "pointer" : "not-allowed",
               }}
             >Sync from current</button>
-            <label style={{ fontSize: 11, color: "var(--lm-text-muted)", display: "flex", alignItems: "center", gap: 4 }}>
-              duration
+            <label style={{ fontSize: 13, color: "var(--lm-text-dim)", display: "flex", alignItems: "center", gap: 4 }}>
+              Duration
               <input
                 type="number"
                 min={0}
@@ -406,7 +531,7 @@ export function ServoSection() {
                 value={moveDuration}
                 onChange={(e) => setMoveDuration(Math.max(0, Math.min(10, Number(e.target.value))))}
                 style={{
-                  width: 60, padding: "4px 6px", borderRadius: 4, fontSize: 11,
+                  width: 60, padding: "4px 6px", borderRadius: 4, fontSize: 13,
                   background: "var(--lm-surface)", border: "1px solid var(--lm-border)",
                   color: "var(--lm-text)", fontFamily: "monospace",
                 }}
@@ -417,7 +542,7 @@ export function ServoSection() {
               onClick={moveServo}
               disabled={moving || !servos}
               style={{
-                fontSize: 12, padding: "6px 16px", borderRadius: 6, fontWeight: 600,
+                fontSize: 13, minHeight: 40, padding: "8px 16px", borderRadius: 6, fontWeight: 600,
                 background: "rgba(52,211,153,0.1)", border: "1px solid rgba(52,211,153,0.3)",
                 color: "var(--lm-green)",
                 cursor: moving ? "wait" : (servos ? "pointer" : "not-allowed"),
@@ -438,10 +563,9 @@ export function ServoSection() {
               />
             ))}
           </div>
-        ) : <span style={{ fontSize: 11, color: "var(--lm-text-muted)" }}>Loading joints…</span>}
+        ) : <span style={{ fontSize: 13, color: "var(--lm-text-dim)" }}>Loading joints…</span>}
       </div>
 
-      {/* Toast — pinned bottom-right so action feedback doesn't shift the page. */}
       {actionMsg && (
         <div style={{
           position: "fixed",
@@ -456,37 +580,51 @@ export function ServoSection() {
           fontSize: 12,
           fontWeight: 600,
           boxShadow: "0 4px 16px rgba(0,0,0,0.3)",
-          maxWidth: 360,
+          maxWidth: "min(360px, calc(100vw - 40px))",
         }}>{actionMsg}</div>
+      )}
+
+      {learnSensors && (
+        <ConfirmDialog
+          title={`Turn off the ${learnSensors.mic && learnSensors.camera ? "camera and mic" : learnSensors.mic ? "mic" : "camera"} while learning?`}
+          message={
+            "While the mic or camera is on, the lamp turns toward voices and faces, which cuts the animation "
+            + "being learned and leaves gaps in what it learns. Turning them off keeps the run clean. "
+            + "They turn back on when learning ends, as long as this page stays open."
+          }
+          confirmLabel="Turn off and learn"
+          extraLabel="Learn anyway"
+          onConfirm={() => { void learnAfterPrivacy(); }}
+          onExtra={learnAnyway}
+          onCancel={() => setLearnSensors(null)}
+        />
       )}
     </div>
   );
 }
 
-// Per-servo row — flat single-row grid so every joint name, ID, bar, and
-// angle value lines up vertically across all servos.
+// Per-servo row on a flat grid so columns align across servos.
 function ServoCard({ joint, info }: { joint: string; info: ServoDetail }) {
   return (
-    <div style={{
+    <div className="servo-readout" style={{
       display: "grid",
-      gridTemplateColumns: "10px minmax(72px, max-content) 28px 1fr 50px",
       alignItems: "center",
       gap: 8,
-      padding: "6px 10px",
+      padding: "10px 12px",
       borderRadius: 6,
       background: "var(--lm-surface)",
       border: `1px solid ${info.online ? "var(--lm-border)" : "rgba(239,68,68,0.4)"}`,
     }}>
       <StatusDot ok={info.online} />
-      <span style={{ fontSize: 11, fontWeight: 600, color: "var(--lm-text-dim)", fontFamily: "monospace" }}>
+      <span style={{ fontSize: 13, fontWeight: 600, color: "var(--lm-text)", fontFamily: "monospace", overflowWrap: "anywhere" }}>
         {joint.replace(".pos", "")}
       </span>
-      <span style={{ fontSize: 10, color: "var(--lm-text-muted)", textAlign: "right" }}>
+      <span style={{ fontSize: 13, color: "var(--lm-text-dim)", textAlign: "right" }}>
         #{info.id}
       </span>
       {info.online && info.angle != null ? (
         <>
-          <div style={{ height: 6, borderRadius: 3, background: "var(--lm-border)", overflow: "hidden" }}>
+          <div className="servo-angle-bar" aria-hidden="true" style={{ height: 6, borderRadius: 3, background: "var(--lm-border)", overflow: "hidden" }}>
             <div style={{
               width: `${Math.min(100, Math.max(0, ((info.angle + 180) / 360) * 100))}%`,
               height: "100%", borderRadius: 3,
@@ -494,19 +632,16 @@ function ServoCard({ joint, info }: { joint: string; info: ServoDetail }) {
             }} />
           </div>
           <span style={{
-            fontSize: 11, fontWeight: 600, color: "var(--lm-teal)",
+            fontSize: 13, fontWeight: 600, color: "var(--lm-teal)",
             textAlign: "right", fontFamily: "monospace",
           }}>
             {info.angle.toFixed(1)}°
           </span>
         </>
       ) : (
-        // Error / offline — let the message span both bar and value columns
-        // and wrap fully so things like "read fail Goal_Velocity (timeout 50ms)"
-        // stay readable instead of being truncated to "read fa…".
-        <span style={{
-          gridColumn: "span 2",
-          fontSize: 10.5, fontWeight: 500,
+        <span className="servo-readout-error" style={{
+          gridColumn: "4 / -1",
+          fontSize: 13, fontWeight: 500,
           color: "var(--lm-red)",
           fontFamily: "monospace",
           lineHeight: 1.35,
@@ -520,7 +655,7 @@ function ServoCard({ joint, info }: { joint: string; info: ServoDetail }) {
   );
 }
 
-// JointSlider: one row for /servo/move target — slider + numeric input + delta vs actual.
+// One /servo/move target row: slider, numeric input and delta vs actual.
 function JointSlider({ joint, value, actual, onChange }: {
   joint: string;
   value: number;
@@ -529,20 +664,13 @@ function JointSlider({ joint, value, actual, onChange }: {
 }) {
   const delta = actual != null ? value - actual : null;
   return (
-    <div style={{
-      display: "grid",
-      gridTemplateColumns: "140px 1fr 70px 80px",
-      alignItems: "center",
-      gap: 10,
-      padding: "5px 10px",
-      background: "var(--lm-surface)",
-      borderRadius: 6,
-      border: "1px solid var(--lm-border)",
-    }}>
-      <span style={{ fontSize: 11, color: "var(--lm-text-dim)", fontWeight: 600, fontFamily: "monospace" }}>
+    <div className="servo-joint">
+      <span className="servo-joint-name" style={{ fontSize: 13, color: "var(--lm-text)", fontWeight: 600, fontFamily: "monospace" }}>
         {joint.replace(".pos", "")}
       </span>
       <input
+        className="servo-joint-range"
+        aria-label={`${joint.replace(".pos", "")} target angle`}
         type="range"
         min={-90}
         max={90}
@@ -552,6 +680,8 @@ function JointSlider({ joint, value, actual, onChange }: {
         style={{ width: "100%", accentColor: "var(--lm-teal)" }}
       />
       <input
+        className="servo-joint-input"
+        aria-label={`${joint.replace(".pos", "")} target angle in degrees`}
         type="number"
         min={-90}
         max={90}
@@ -562,18 +692,17 @@ function JointSlider({ joint, value, actual, onChange }: {
           if (!isNaN(n)) onChange(Math.max(-90, Math.min(90, n)));
         }}
         style={{
-          width: "100%", padding: "3px 6px", borderRadius: 4, fontSize: 11,
+          width: "100%", padding: "3px 6px", borderRadius: 4, fontSize: 13,
           background: "var(--lm-bg)", border: "1px solid var(--lm-border)",
           color: "var(--lm-text)", fontFamily: "monospace", textAlign: "right",
         }}
       />
-      <span style={{
-        fontSize: 10,
-        color: delta == null ? "var(--lm-text-muted)" : Math.abs(delta) < 1 ? "var(--lm-green)" : "var(--lm-amber)",
+      <span className="servo-joint-current" style={{
+        fontSize: 13,
+        color: delta == null ? "var(--lm-text-dim)" : Math.abs(delta) < 1 ? "var(--lm-green)" : "var(--lm-amber)",
         fontFamily: "monospace",
-        textAlign: "right",
       }}>
-        {actual != null ? `cur ${actual.toFixed(0)}°` : "—"}
+        {actual != null ? `Current ${actual.toFixed(0)}°` : "—"}
       </span>
     </div>
   );
@@ -587,10 +716,10 @@ function ChipButton({ children, onClick, active }: {
 }) {
   return (
     <button onClick={onClick} style={{
-      fontSize: 11, padding: "5px 14px", borderRadius: 6,
+      fontSize: 13, padding: "10px 14px", borderRadius: 8, minHeight: 40, maxWidth: "100%", overflowWrap: "anywhere",
       background: active ? "rgba(245,158,11,0.12)" : "var(--lm-surface)",
       border: `1px solid ${active ? "var(--lm-amber)" : "var(--lm-border)"}`,
-      color: active ? "var(--lm-amber)" : "var(--lm-text-dim)",
+      color: active ? "var(--lm-amber)" : "var(--lm-text)",
       cursor: "pointer",
       fontWeight: active ? 600 : 500,
       transition: "all 0.15s",
@@ -598,27 +727,26 @@ function ChipButton({ children, onClick, active }: {
   );
 }
 
-// ControlButton: rendered as two grid cells (button + hint) so a parent
-// 2-column grid can keep all buttons vertically aligned regardless of label.
-function ControlButton({ onClick, color, title, hint }: {
+// Renders two grid cells (button + hint) so buttons align in a 2-column grid.
+function ControlButton({ onClick, color, title, hint, disabled = false }: {
   onClick: () => void;
   color: string;
   title: string;
   hint: string;
+  disabled?: boolean;
 }) {
   return (
     <>
       <button
         onClick={onClick}
-        // Stronger bg + border than before so this clearly reads as a button,
-        // not a label. The previous 0.08/0.33 alpha pair was nearly invisible
-        // in light theme.
+        disabled={disabled}
         style={{
-          fontSize: 12, padding: "8px 14px", borderRadius: 6, width: "100%",
+          opacity: disabled ? 0.5 : 1,
+          fontSize: 13, minHeight: 40, padding: "8px 14px", borderRadius: 6, width: "100%",
           background: `color-mix(in srgb, ${color} 18%, transparent)`,
           border: `1.5px solid color-mix(in srgb, ${color} 70%, transparent)`,
           color,
-          cursor: "pointer", fontWeight: 700,
+          cursor: disabled ? "not-allowed" : "pointer", fontWeight: 700,
           whiteSpace: "nowrap",
           transition: "background 0.15s, transform 0.05s",
           boxShadow: `0 1px 0 color-mix(in srgb, ${color} 30%, transparent) inset`,
@@ -632,7 +760,7 @@ function ControlButton({ onClick, color, title, hint }: {
         onMouseDown={(e) => { e.currentTarget.style.transform = "translateY(1px)"; }}
         onMouseUp={(e) => { e.currentTarget.style.transform = "translateY(0)"; }}
       >{title}</button>
-      <span style={{ fontSize: 10, color: "var(--lm-text-muted)", lineHeight: 1.35 }}>{hint}</span>
+      <span style={{ fontSize: 13, color: "var(--lm-text-dim)", lineHeight: 1.35 }}>{hint}</span>
     </>
   );
 }

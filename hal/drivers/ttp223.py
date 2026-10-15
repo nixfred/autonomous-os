@@ -1,55 +1,7 @@
 """TTP223 capacitive touchpad handler (dog-head touch surface).
 
-Pad wiring is supplied by the device configuration loader from ttp223.json,
-with legacy board defaults when absent. The driver owns gesture detection;
-device declarations own chip, lines and optional spatial order.
-
-Destructive gestures (reboot / shutdown) are intentionally OFF on TTP223
-because the IC on this board runs in FastMode: output drops LOW within
-~50ms of touch even with finger still on the pad, so a true "hold 5s"
-is impossible without rewiring the FM pin. GPIO button still owns those.
-
-LAYER 1 — SESSION. Any edge, either direction, any pad, restarts a 200ms timer.
-When it lapses the "contact" ends. This coalesces the burst of cross-talk and
-FastMode auto-release edges that one finger produces. A contact is one touch of
-the surface — but NOT one gesture: a continuous stroke never lets the timer
-lapse, so a whole 1s pet arrives as a single contact, and two fast taps arrive
-as one contact too. Everything below was written after learning that on device.
-
-LAYER 2 — GESTURE. On by default (SWIPE_ENABLED); HAL_TOUCH_SWIPE=false makes the driver
-resolve only tap and count-based pet, exactly as it always did.
-
-The signal is WHEN pads fire, not which. Device-measured on orange-lamp
-2026-08-27, inter-pad gaps inside one contact:
-
-    fingers landing together    1 .. 23 ms
-    a finger travelling        53 .. 322 ms
-
-Nothing in between, and SWIPE_MIN_GAP_MS sits in the gap. From that one
-threshold everything else follows:
-
-  SWIPE       one contact, every pad, monotonic along the axis, gaps above the
-              floor. One contact only — each leg of a back-and-forth stroke is
-              itself a clean pass, so allowing any leg to carry the verdict
-              turns every pet into a swipe.
-  DOUBLE TAP  two or more tight multi-pad BURSTS overlapping in place. Fast taps
-              share a contact; slow taps arrive as separate contacts. Checked
-              before pet, because the second tap re-touches the same pads.
-  PET         the finger revisited a pad it had left (more steps than distinct
-              pads), or contacts landed in different places. A stroke's steps are
-              evenly spread, so it has no bursts to be mistaken for taps.
-  TAP         anything else, including several fingers landing at once — that
-              lights every pad but within ~20ms, which is not movement.
-
-Two parts of the tap action escape the decision wait, both at the FIRST contact
-end of a burst (~0.2s after the finger lifts): in-flight TTS is stopped
-immediately, and a short ack chime plays — stop latency and "did it hear me"
-feedback are the parts of the gesture users actually feel. Deliberate semantic
-change that comes with it: petting her head while she talks now cuts her off
-(the pet giggle follows) — touch means "attention here" either way. Only TTS is
-cut early; music keeps playing until the burst actually resolves as a tap, so
-petting during music never kills the playlist. Unmute + the listening cue also
-still wait for resolution.
+Destructive gestures are OFF: the IC runs in FastMode (output drops ~50ms after touch),
+so a true hold is impossible without rewiring the FM pin.
 """
 
 import logging
@@ -57,136 +9,54 @@ import os
 import threading
 import time
 
-import hal.app_state as state
 from hal.board.board import TouchConfig
 from hal.drivers import touch_debug
 from hal.drivers.button_actions import (
     head_pat_action,
-    mic_toggle_action,
-    play_ack_chime,
-    single_click_action,
-    swipe_action,
+    play_pet_chime,
 )
 
 logger = logging.getLogger(__name__)
 
 # TTP223 wiring is injected from hal/board/ttp223.py at startup.
 
-# Session gap: edges within this window of the previous edge belong to
-# the same session. 200ms comfortably exceeds the observed burst length
-# (~30-100ms across the pads a single touch reaches) while staying below a
-# natural inter-tap gap. That figure was measured on green-lamp; HAL_TOUCH_DEBUG
-# re-measures it per unit (see hal/drivers/touch_debug.py).
 SESSION_GAP_S = 0.2
 
-# Decision window: after a session ends, wait this long for more
-# sessions before classifying as a single tap. Field-measured stroke
-# pace on this hardware is 0.8-1.2s per beat (FastMode forces a
-# tap-tap-tap rhythm rather than continuous motion). 1.2s catches the
-# slowest natural stroke. Cost: single tap responds 1.2s after release
-# — the price of preventing a spurious "single click" at the start of
-# every pet motion.
+# Decision window: after a session ends, wait this long for more sessions before
+# classifying as a single tap.
 DECISION_WINDOW_S = 1.2
 
-# Contacts needed before the COUNT-based rules apply — the pet fallback for a
-# stroke with no readable traversal, and the slow double tap. With SWIPE_ENABLED
-# the spatial rules resolve most gestures before these are reached; with it off
-# this is the whole of pet detection, and two taps under ~0.9s apart fire pet
-# rather than two singles (users who want two stops space them 1s+).
 PET_SESSION_THRESHOLD = 2
 
-# After head_pat fires, swallow further sessions for this long so a
-# continuous stroke doesn't produce stuttering "single click" interjections
-# between pet responses. Every session inside the window extends the
-# window — petting is finished only when the user stops touching for
-# PET_COOLDOWN_S consecutively.
 PET_COOLDOWN_S = 1.5
 
-# Settle window after claiming the lines. lgpio reports each line's current
-# level as an initial edge the moment the alert callback is registered. The
-# pads rest HIGH, so without this guard those startup reports are read as a
-# real touch and fire a phantom single_click ~DECISION_WINDOW after every HAL
-# start (Restart=always makes it recur). Ignore all edges for this long after
-# claim so the startup transient never starts a session.
+# Settle window after claiming the lines. Ignore all edges for this long after claim so
+# the startup transient never starts a session.
 SETTLE_S = 0.5
 
-# --- Gesture classification (swipe / double tap / spatial pet) --------------
-#
-# DEFAULT ON since 2026-08-27, after hands-on validation on orange-lamp across
-# tap, fast and slow double tap, pet and swipe. Setting HAL_TOUCH_SWIPE=false
-# restores the two-gesture behaviour this driver shipped with, in one step and
-# without a redeploy — that is the rollback if a field unit misbehaves.
-#
-# Note what turning this on means: a double tap now toggles the MICROPHONE, and
-# a swipe puts the device to sleep. Both are reversible (double tap again; one
-# tap wakes), and nothing destructive is reachable from this surface — FastMode
-# cannot measure a hold, so reboot / shutdown / factory-reset stay on the
-# mechanical button.
 SWIPE_ENABLED = os.environ.get("HAL_TOUCH_SWIPE", "true").lower() in ("1", "true", "yes")
 
-# Absolute floor on how many pads a swipe must span. The real requirement is
-# EVERY wired pad (checked against the board profile in _classify); this only
-# guards a hypothetical 1-pad board, where "end to end" is meaningless.
-#
-# 2 since 2026-08-28, when the lamp dropped its middle pad and runs 96/100 only.
-# Note what that costs. With three pads a swipe needed TWO independent things:
-# spatial (all three, none twice) and temporal (a gap above the floor). With two
-# pads "touched both pads once" is also what a single press does through
-# cross-talk, so the spatial half is gone and SWIPE_MIN_GAP_MS decides alone.
-# Measured on the two-pad lamp the same day the populations are still far apart
-# — landings 2-27 ms, journeys 69-80 ms — but nothing is left to catch a slow
-# firm press if they ever converge.
+# Absolute floor on how many pads a swipe must span.
 SWIPE_MIN_PADS = 2
 
-# The movement floor, and the one number every rule derives from: gaps at or
-# above it mean the hand travelled between pads, below it mean several fingers
-# arrived together.
-#
-# 35, lowered from 40 on 2026-08-28. The first measurement (orange-lamp,
-# 2026-08-27) read fingers-together at 1-23 ms and travelling at 53-322 ms, and
-# 40 sat in that empty band. A later session swiped faster and landed in it:
-# real swipes at 35.7 and 38.9 ms were read as three-finger taps, one of them
-# missing by 1.1 ms. Re-measured over every 3-pad single-pass contact, the gap
-# in the distribution is between 16.6 and 35.7, not 23 and 53 — so the floor
-# belongs below 35.7, and 35 keeps clear air on both sides.
-#
-# The band narrows as the user swipes faster; it is a property of THEM, not just
-# the hardware. Raise it if firm taps start sleeping the device, lower it if
-# real swipes are missed. HAL_TOUCH_DEBUG records the gaps it is measured
-# against, and a TAP trace now names this number when it is what declined.
+# The movement floor, and the one number every rule derives from: gaps at or above it
+# mean the hand travelled between pads, below it mean several fingers arrived together.
 SWIPE_MIN_GAP_MS = float(os.environ.get("HAL_TOUCH_SWIPE_MIN_GAP_MS", "35"))
 
-# The other end of the travel band. A gap this long is not a journey across the
-# surface, it is the hand lifting and coming back — the rhythm of a second tap.
-#
-# Without a ceiling, two deliberate taps landing on DIFFERENT pads produce
-# exactly the shape of a swipe (each pad once, no revisit, a gap above the
-# floor) and resolve as one. Device trace 120736 (2026-08-28) was a double tap
-# read as a swipe on a single 196.7 ms gap.
-#
-# Measured over labelled gestures the same day, the three bands are distinct:
-#     landing   6.4  7.6  27.2 ms      two pads lit together
-#     travel    69.7  80.6 ms          finger crossing the surface
-#     lift     196.7  273.7  291.6  291.8 ms
-# 150 sits in the empty space between travel and lift. It rests on 6 labelled
-# gestures, so treat it as provisional: a very slow deliberate drag would exceed
-# it and read as a tap. Raise it if real swipes are missed.
 SWIPE_MAX_GAP_MS = float(os.environ.get("HAL_TOUCH_SWIPE_MAX_GAP_MS", "150"))
 
-# How long the surface must stay empty before a new touch counts as the hand
-# ARRIVING again rather than sliding between pads.
-#
-# Without it, the handoff mid-swipe counts as a second press: the finger leaves
-# the near pad microseconds after reaching the far one, the surface is briefly
-# empty, and the gesture is read as two taps. Device trace 135217
-# (2026-08-28) was a swipe with a textbook 105.8 ms travel gap that lost on the
-# press count alone — L100 released at 105.8 ms, L96 touched at 106.5 ms, a
-# 0.7 ms hole.
-#
-# Measured across every captured trace, real lifts leave the surface empty for
-# 23.8 ms at minimum and usually 90-180 ms; that 0.7 ms is the only value below
-# 20. 15 sits in wide clearance on both sides.
+# How long the surface must stay empty before a new touch counts as the hand ARRIVING
+# again rather than sliding between pads.
 PRESS_MIN_EMPTY_MS = float(os.environ.get("HAL_TOUCH_PRESS_MIN_EMPTY_MS", "15"))
+
+# Pull-down hold before reading a candidate line in the detect probe. A wired TTP223
+# drives its idle-HIGH output through the weak pull-down; a bare header pin falls to 0.
+PROBE_SETTLE_S = 0.01
+
+# How long an undetected candidate line must stay LOW before its release admits it as a
+# pad, measured between the two edges' kernel timestamps. Device traces show a touch
+# holding the output LOW for 73-135 ms; a transient on a bare pulled-up pin lasts far less.
+LEARN_MIN_LOW_MS = 20.0
 
 
 class TTP223Handler:
@@ -197,41 +67,25 @@ class TTP223Handler:
         self._callbacks = []
         self._chip = 0
         self._lines = []
-        # Physical pad order along the swipe axis; None until measured (2.2).
         self._axis = None
-        # Per-contact first-touch order for the current gesture cycle:
-        # [[(line, ts), ...], ...], one inner list per contact. NOT flattened —
-        # device-measured 2026-08-27: several fingers landing in one place spread
-        # across pads exactly like one finger moving, so a flat cross-contact
-        # sequence cannot tell a 3-finger double tap from a stroke. The two
-        # questions need different layers: whether a single contact TRAVERSED
-        # (swipe), and whether successive contacts stayed in the same PLACE
-        # (double tap).
+        # Lines with a pad actually wired. None = every configured line (no detect).
+        self._active = None
+        # Undetected candidate lines currently LOW: line -> lgpio tick (ns) of the fall.
+        self._candidate_low = {}
+        # Per-contact first-touch order for the current gesture cycle: [[(line, ts),
+        # ...], ...], one inner list per contact. NOT flattened — device-measured
+        # 2026-08-27.
         self._contacts = []
         self._contact = []
-        # Pads released since their last touch. A re-touch of a released pad is
-        # a real second contact; without this the repeat-collapse eats it.
         self._released = set()
-        # Pads currently held, and how many times the hand has arrived on the
-        # surface this cycle. See the PRESS note in _on_edge.
         self._held = set()
         self._presses = 0
-        # When the surface last went empty, so a re-touch can be told from a
-        # slide between pads. None = it has not been empty yet this cycle.
         self._emptied_at_ms = None
         self._lock = threading.Lock()
-        # Session-end timer: fires SESSION_GAP_S after the last edge.
         self._session_end_timer = None
-        # Decision timer: fires DECISION_WINDOW_S after the last session
-        # ended, resolving how many sessions accumulated → tap vs pet.
         self._decision_timer = None
         self._session_count = 0
-        # monotonic deadline before which incoming sessions are silently
-        # eaten (cooldown after pet to avoid stuttering single_clicks
-        # during a continuous stroke).
         self._pet_cooldown_until = 0.0
-        # monotonic deadline before which edges are ignored (startup transient
-        # from claiming the lines — see SETTLE_S).
         self._ignore_edges_until = 0.0
 
     def start(self):
@@ -247,8 +101,6 @@ class TTP223Handler:
         self._axis = list(config.axis) if config.axis is not None else None
         self._lgpio = lgpio
 
-        # Arm the settle window now, before claiming: the callback registration
-        # below emits an initial edge per line (the current resting level).
         self._ignore_edges_until = time.monotonic() + SETTLE_S
 
         try:
@@ -256,6 +108,15 @@ class TTP223Handler:
         except Exception as e:
             logger.warning("TTP223 gpiochip_open(%d) failed: %s", self._chip, e)
             return
+
+        if config.detect:
+            self._active = self._probe_wired()
+            logger.info(
+                "TTP223 detect: wired pads %s of candidates %s (others learned on first touch)",
+                sorted(self._active), self._lines,
+            )
+            # The probe flips bias on every line; restart the settle window after it.
+            self._ignore_edges_until = time.monotonic() + SETTLE_S
 
         for line in self._lines:
             try:
@@ -282,44 +143,88 @@ class TTP223Handler:
             PET_SESSION_THRESHOLD,
         )
 
+    def _probe_wired(self):
+        """Return the candidate lines with a TTP223 driving them.
+
+        A pad touched during the probe reads LOW and is missed; its first sustained
+        touch adds it back (see _confirm_candidate), so a miss only delays that pad.
+        """
+        lgpio = self._lgpio
+        wired = set()
+        for line in self._lines:
+            try:
+                lgpio.gpio_claim_input(self._handle, line, lgpio.SET_PULL_DOWN)
+                time.sleep(PROBE_SETTLE_S)
+                if lgpio.gpio_read(self._handle, line) == 1:
+                    wired.add(line)
+            except Exception as e:
+                logger.warning("TTP223 probe line %d failed: %s", line, e)
+            finally:
+                try:
+                    lgpio.gpio_free(self._handle, line)
+                except Exception:
+                    pass
+        return wired
+
+    def _wired(self):
+        """Pads a swipe must cover: the detected set, or every configured line."""
+        with self._lock:
+            return set(self._active) if self._active else set(self._lines)
+
+    def _confirm_candidate(self, gpio, level, tick):
+        """Decide whether an edge on an undetected line proves a pad is wired there.
+
+        True exactly once per line: on the release that ends a LOW of at least
+        LEARN_MIN_LOW_MS. Anything shorter is a transient and is dropped without
+        reaching the gesture state.
+
+        The LOW is timed from the edges' own timestamps (lgpio tick, ns), not from when
+        each callback runs: a delayed or batched callback must neither stretch a
+        transient into a touch nor shrink a touch into a transient.
+        """
+        with self._lock:
+            if level == 0:
+                self._candidate_low[gpio] = tick
+                return False
+            fell_at = self._candidate_low.pop(gpio, None)
+            if fell_at is None:
+                return False
+            low_ms = (tick - fell_at) / 1e6
+            if low_ms < LEARN_MIN_LOW_MS:
+                logger.debug(
+                    "TTP223 line %d: %.1fms LOW ignored (undetected pad, needs %.0fms)",
+                    gpio, low_ms, LEARN_MIN_LOW_MS,
+                )
+                return False
+            self._active.add(gpio)
+            wired = sorted(self._active)
+        logger.info("TTP223 pad on line %d learned from a %.0fms touch; wired %s",
+                    gpio, low_ms, wired)
+        return True
+
     def _on_edge(self, chip, gpio, level, tick):
-        # Drop the startup transient: lgpio reports each line's initial level
-        # as an edge when the callback is registered. The resting-HIGH pads
-        # would otherwise fire a phantom gesture on every HAL start.
         if time.monotonic() < self._ignore_edges_until:
             # Traced anyway, flagged: a suppressed edge and a pad that never
             # fired look identical in a trace that omits them.
             touch_debug.start_cycle(self._chip, self._lines)
             touch_debug.note_edge(gpio, level, suppressed=True)
             return
+        if self._active is not None and gpio not in self._active:
+            if not self._confirm_candidate(gpio, level, tick):
+                return
+            # Deliver the touch that proved the pad; its release follows below.
+            self._handle_edge(gpio, 0)
+        self._handle_edge(gpio, level)
+
+    def _handle_edge(self, gpio, level):
         touch_debug.start_cycle(self._chip, self._lines, self._axis)
         touch_debug.note_edge(gpio, level)
-        # Pads rest HIGH (pull-up), so level 0 is the TOUCH edge; level 1 is
-        # FastMode's auto-release and says nothing about where the finger is.
-        # Recorded unconditionally, not just when SWIPE_ENABLED: it costs one
-        # list append and it means HAL_TOUCH_DEBUG measures the same sequence
-        # the classifier would see, which is the point of the instrument.
-        # A repeat of the last pad is collapsed ONLY if the pad was not released
-        # in between. A line cannot produce two falling edges without a rising
-        # edge between them, so a touch following a release is a genuine second
-        # contact with that pad — collapsing it threw away the evidence that the
-        # hand came back. Device trace 120736: tap L100, release, tap L100
-        # again, cross-talk lights L96 14 ms later; the second L100 was dropped
-        # so the trace read as one long journey. What the collapse still catches
-        # is a duplicate falling edge with no release, which is a driver
-        # artefact rather than a touch.
         with self._lock:
             if level == 0:
-                # A PRESS is the surface going from nothing-held to held: the
-                # hand arriving. During a swipe the finger reaches the far pad
-                # before the near one auto-releases, so the surface never
-                # empties and the whole gesture is ONE press. Two taps always
-                # empty it in between. Device-measured 2026-08-28 over every
-                # labelled gesture: swipes 1 press, double taps 2, no overlap.
-                #
-                # ...but only if it was empty long enough to be a lift. A slide
-                # between pads leaves a hole of well under a millisecond, and
-                # counting that turns a swipe into two taps.
+                # A PRESS is the surface going from nothing-held to held: the hand
+                # arriving. During a swipe the finger reaches the far pad before the
+                # near one auto-releases, so the surface never empties and the whole
+                # gesture is ONE press.
                 now_ms = time.monotonic() * 1000.0
                 if not self._held:
                     empty_for = (
@@ -340,9 +245,6 @@ class TTP223Handler:
                 self._held.discard(gpio)
                 if not self._held:
                     self._emptied_at_ms = time.monotonic() * 1000.0
-        # Any edge keeps the current session alive — cross-talk and
-        # FastMode auto-LOW produce flurries of edges per physical
-        # touch; coalesce them by resetting the session-end timer.
         with self._lock:
             if self._session_end_timer is not None:
                 self._session_end_timer.cancel()
@@ -360,32 +262,7 @@ class TTP223Handler:
             self._contact = []
 
     def _classify(self):
-        """Read the cycle as (is_swipe, moved, gaps, n_contacts, revisited, landed, presses).
-
-        The discriminator is WHEN pads fire, not which. Device-measured on
-        orange-lamp 2026-08-27, per-contact inter-pad deltas:
-
-            fingers landing together   1, 2, 6, 17, 18, 18, 23 ms
-            a finger moving           53 .. 322 ms
-
-        Nothing between 23 and 53 — the two are cleanly separable, and
-        SWIPE_MIN_GAP_MS sits in the gap. So a contact whose pads fired far
-        apart in time is a hand that MOVED across the surface; a contact whose
-        pads fired together is several fingers landing at once, however many
-        pads that lights up.
-
-        Two rules that both fall out of it:
-
-        * **swipe** — one contact that moved, monotonically, across every pad.
-        * **moved** — any contact that moved internally, or contacts that landed
-          in disjoint places. Its negation is "the hand stayed put", which is
-          what makes repeated contact a double tap rather than a stroke.
-
-        An earlier version asked only whether a pad was common to every contact.
-        That failed on this hardware because cross-talk makes almost every
-        contact touch all three pads, so it could essentially never report
-        movement — a full left-right-left stroke came back as a double tap.
-        """
+        """Read the cycle as (is_swipe, moved, gaps, n_contacts, revisited, landed, presses)."""
         with self._lock:
             contacts = [list(c) for c in self._contacts]
             if self._contact:
@@ -396,31 +273,10 @@ class TTP223Handler:
         def gaps_of(c):
             return [(b - a) * 1000.0 for (_, a), (_, b) in zip(c, c[1:])]
 
-        # Reported on every trace, not only when a swipe was found — the whole
-        # point of recording it is to see how near the floor a gesture landed.
-        # Both ends: reporting only the minimum hid the asymmetric-landing bug
-        # for a full round of testing, because the gap that mattered was the max.
+        # Reported on every trace, not only when a swipe was found — the whole point of
+        # recording it is to see how near the floor a gesture landed.
         all_gaps = [x for c in contacts for x in gaps_of(c)]
 
-        # Every pad-to-pad gap is one of two things, and that is the whole
-        # classifier:
-        #
-        #   below the floor  the two pads lit at the same moment -- the hand
-        #                    LANDED, covering both at once
-        #   above the floor  the finger TRAVELLED from one pad to the other
-        #
-        # A stroke is one finger moving the whole time, so it contains no
-        # landing. A double tap is land-lift-land, so it must contain at least
-        # one. That is what separates them, and it does not care how many pads
-        # each tap happened to light.
-        #
-        # This replaced a burst-clustering rule that grouped the steps and
-        # required EVERY cluster to be multi-pad. It broke when the lamp went to
-        # two pads: with the pads further apart one tap often lights only one of
-        # them, so a cluster of size 1 appeared and the rule fell through to pet.
-        # Device-measured 2026-08-28, three double taps in a row read as PET:
-        #   L100@1 | L96@293 L100@300   -- first tap lit one pad, second lit two
-        # Counting landings instead of clustering pads is geometry-independent.
         landed = any(
             (b - a) * 1000.0 < SWIPE_MIN_GAP_MS
             for c in contacts
@@ -430,57 +286,30 @@ class TTP223Handler:
         sets_nonempty = [c for c in contacts if c]
         is_swipe = False
         moved_within = False
-        # A stroke goes back over ground it already covered: more steps than
-        # distinct pads means the finger returned to a pad it had left. A tap
-        # and a swipe each touch a pad at most once. Device-measured on
-        # orange-lamp 2026-08-27 — pets ran 5-8 steps over 3 pads, taps and
-        # swipes exactly 3 over 3.
+        # A stroke goes back over ground it already covered: more steps than distinct
+        # pads means the finger returned to a pad it had left.
         revisited = any(len(c) > len({l for l, _ in c}) for c in contacts)
         for c in contacts:
             g = gaps_of(c)
-            # Any pad-to-pad step slower than the floor means the hand travelled
-            # between them rather than several fingers arriving at once.
             if any(x >= SWIPE_MIN_GAP_MS for x in g):
                 moved_within = True
             positions = [pos_of[l] for l, _ in c if l in pos_of]
             pads = {l for l, _ in c}
-            # EVERY wired pad, not a fixed count. A fixed floor of 2 would let
-            # two of three pads pass on a 3-pad board, which is a partial move,
-            # not a crossing — reaching both ends is the whole evidence that the
-            # hand went end to end. Compared against the board's own line list
-            # so the rule follows the hardware instead of a constant.
-            if len(pads) < SWIPE_MIN_PADS or pads != set(self._lines):
+            # EVERY wired pad, not a fixed count. Compared against the detected pads
+            # (or the board's own line list) so the rule follows the hardware.
+            if len(pads) < SWIPE_MIN_PADS or pads != self._wired():
                 continue
             if len(positions) < SWIPE_MIN_PADS:
                 continue
             deltas = [b - a for a, b in zip(positions, positions[1:]) if b != a]
             if not deltas or any((a > 0) != (b > 0) for a, b in zip(deltas, deltas[1:])):
-                continue  # turned around — a stroke, not a single pass
-            # A swipe is the WHOLE gesture, not a leg of one. A left-right-left
-            # stroke contains a clean one-direction pass in nearly every
-            # contact — device trace 160546 — so allowing any contact to carry
-            # the verdict turns every pet into a swipe. One contact, one pass.
-            #
-            # ANY gap above the floor, not every gap. The surface is not
-            # symmetric: starting a swipe from the right lands on L100 and L98
-            # together (they are adjacent and cross-talk bridges them, 5-28ms)
-            # and only then travels to L96 over 65-104ms. Requiring every gap to
-            # clear the floor made right-to-left swipes impossible while
-            # left-to-right worked — device traces 164757/164804/164807/164810.
-            # "Did the hand travel at all" is also exactly what `moved` means
-            # everywhere else in this classifier.
-            # A gap inside the travel band, not merely above the floor. Below
-            # the floor the pads lit together (a landing); above the ceiling the
-            # hand lifted and came back (a second tap). Only the middle band is
-            # a finger crossing the surface.
+                continue
             if len(sets_nonempty) == 1 and self._presses <= 1 and any(
                 SWIPE_MIN_GAP_MS <= x <= SWIPE_MAX_GAP_MS for x in g
             ):
                 is_swipe = True
 
         sets = [{l for l, _ in c} for c in contacts if c]
-        # Disjoint contacts are movement too, even when each one was a single
-        # instantaneous touch — that is a hand hopping from pad to pad.
         disjoint = len(sets) >= 2 and not set.intersection(*sets)
         with self._lock:
             presses = self._presses
@@ -503,16 +332,6 @@ class TTP223Handler:
             self._emptied_at_ms = None
 
     def _on_session_end(self):
-        # One physical touch ended.
-        #
-        # 1) If we're still inside the pet cooldown (user is mid-stroke,
-        #    a head_pat fired recently), extend the cooldown and bail —
-        #    don't count, don't fire. This prevents single_clicks from
-        #    interleaving between pets during one continuous stroke.
-        # 2) Otherwise increment the count. If it hits PET threshold,
-        #    fire head_pat immediately and arm the cooldown.
-        # 3) Else schedule the decision timer to classify accumulated
-        #    sessions as a single tap when the user stops touching.
         fire_pet = False
         grab_floor = False
         swallowed = False
@@ -526,11 +345,7 @@ class TTP223Handler:
             self._session_end_timer = None
             now = time.monotonic()
             if now < self._pet_cooldown_until:
-                # Still petting — swallow this session, extend cooldown.
                 self._pet_cooldown_until = now + PET_COOLDOWN_S
-                # Also cancel any pending decision_timer left over from
-                # the pre-pet count: that count was already consumed
-                # when pet fired, so no single_click should fire.
                 if self._decision_timer is not None:
                     self._decision_timer.cancel()
                     self._decision_timer = None
@@ -540,32 +355,19 @@ class TTP223Handler:
             else:
                 self._session_count += 1
                 count = self._session_count
-                # Pet's fast path needs the hand to have MOVED between contacts,
-                # and at least two of them. Gated on the SESSION count rather
-                # than the number of contacts that recorded pads: a contact whose
-                # touch edge fell the other side of a session boundary records
-                # only a release and contributes nothing (device trace 154507).
-                # Gated on >=2 at all because a single press's cross-talk
-                # ordering can double back — device-measured, a one-contact trace
-                # fired PET off nothing but noise.
-                # A continuous stroke never lets the session lapse, so the whole
-                # ~1s pet arrives as ONE contact — device-measured, five pets in
-                # a row came back count=1 and fell through to TAP. A revisit is
-                # therefore enough on its own; the contact count is not a gate.
+                # Pet's fast path needs the hand to have MOVED between contacts, and at
+                # least two of them.
                 pet_now = SWIPE_ENABLED and not _landed and (
                     _revisited or (_moved and count >= PET_SESSION_THRESHOLD)
                 )
-                # First session of a burst: cut in-flight TTS NOW rather than
-                # after the decision window (see module docstring). Checked
-                # outside the lock — it does I/O.
+                # First session of a burst: play the acknowledgement chime.
+                # Checked outside the lock because it does I/O.
                 grab_floor = count == 1
                 logger.debug("TTP223 session ended (count=%d)", count)
                 if SWIPE_ENABLED:
-                    # Reversal is decidable the moment it happens and cannot
-                    # later become a swipe, so pet keeps its fast path. Every
-                    # other outcome (swipe, double tap, tap, count-fallback pet)
-                    # needs to see the whole gesture, so it waits for the
-                    # decision window. Checked outside the lock below.
+                    # Reversal is decidable the moment it happens and cannot later
+                    # become a swipe, so pet keeps its fast path. Checked outside the
+                    # lock below.
                     fire_pet = pet_now
                     if not fire_pet:
                         if self._decision_timer is not None:
@@ -600,10 +402,6 @@ class TTP223Handler:
         # session state above is already committed.
         touch_debug.note_session_end(count)
         if swallowed:
-            # Closed as its own cycle rather than folded into the pet that
-            # armed the cooldown: one file per resolved outcome, and a stroke
-            # that keeps extending the window would otherwise grow one file
-            # without bound.
             touch_debug.note_decision(
                 "IGNORED", "session inside pet cooldown; cooldown extended", count
             )
@@ -618,8 +416,6 @@ class TTP223Handler:
                 if pet_now
                 else f"session count reached {PET_SESSION_THRESHOLD}"
             )
-            # Same finish-before-dispatch rule as _dispatch: the trace closes
-            # before the action can block or raise.
             touch_debug.note_classifier(
                 revisited=_revisited, landed=_landed, presses=_presses, is_swipe=_is_swipe, moved=_moved,
                 gap_min_ms=round(_min_gap[0], 1), gap_max_ms=round(_min_gap[1], 1),
@@ -633,23 +429,11 @@ class TTP223Handler:
             head_pat_action(source="TTP223")
 
     def _ack_first_session(self):
-        """Instant ack for the first touch session of a burst: cut in-flight
-        TTS (barge-in), then sound the ack chime so the user gets sub-250ms
-        confirmation the touch registered. Chime is gesture-neutral, so it
-        fires for taps AND the first stroke of a pet; the spoken cue / pet
-        phrase still waits for tap-vs-pet resolution. TTS stop only — no
-        unmute, no music stop; those wait for resolution too. Off-thread
-        because stop_tts and the chime write do I/O and this is called from
-        a Timer thread that must go on to arm the decision timer promptly."""
+        """Acknowledge the first contact without interrupting speech."""
 
         def _run():
             try:
-                tts = state.tts_service
-                if False and tts is not None and tts.speaking:  # PARKED (no issue): only pet acts on TTP223
-                    logger.info("TTP223 first touch during TTS -- stopping speech early")
-                    from hal.routes.voice import stop_tts
-                    stop_tts()
-                play_ack_chime(source="TTP223")
+                play_pet_chime(source="TTP223")
             except Exception as e:
                 logger.warning("TTP223 first-session ack failed: %s", e)
 
@@ -667,49 +451,28 @@ class TTP223Handler:
          landed, presses) = self._classify()
 
         if count < 1:
-            # The decision timer outlived its count (pet consumed it inline).
             touch_debug.note_decision("NONE", "decision timer fired at count=0", count)
             touch_debug.finish("IGNORED-no_sessions")
             self._reset_cycle()
             return
 
         if SWIPE_ENABLED:
-            # 1) SWIPE — one contact that ran cleanly across every pad in order.
-            #    Checked first so a resolved swipe never also fires a tap.
             if is_swipe:
-                self._reset_cycle()
-                return  # PARKED (no issue): only pet acts on TTP223
                 self._dispatch(
                     "SWIPE", f"one contact traversed all pads, gaps {gaps[0]:.0f}-{gaps[1]:.0f}ms",
-                    count, "swipe_action", swipe_action,
+                    count, "head_pat_action", head_pat_action,
                 )
                 return
 
-            # 2) DOUBLE TAP — the hand was on the same ground twice AND at some
-            #    point two pads lit together, which only a landing produces. A
-            #    stroke is travel throughout and can never satisfy this, so the
-            #    check is safe to run before pet even though both revisit.
-            # Two ways the hand tapped twice. Either it came back to a pad it
-            # had left AND something landed (both taps on overlapping pads), or
-            # it simply arrived on the surface more than once — which is what
-            # two taps on DIFFERENT pads look like, with no revisit and no
-            # landing to show for it. Device traces 131615 / 131625: tap L96,
-            # lift, tap L100. Nothing but the press count separates that from a
-            # slow swipe.
             if (revisited and landed) or (presses >= 2 and not revisited):
-                self._reset_cycle()
-                return  # PARKED (no issue): only pet acts on TTP223
                 self._dispatch(
                     "DOUBLE_TAP",
                     ("revisited a pad, and two pads lit together" if revisited
                      else f"the hand arrived on the surface {presses} times"),
-                    count, "mic_toggle_action", mic_toggle_action,
+                    count, "head_pat_action", head_pat_action,
                 )
                 return
 
-            # 3) PET — went back over a pad it had left with NO landing on the
-            #    way: every step was travel, which is what a stroke is. No
-            #    contact-count gate: a continuous stroke is a single contact.
             if (revisited and not landed) or (
                 count >= PET_SESSION_THRESHOLD and moved and not landed
             ):
@@ -721,53 +484,21 @@ class TTP223Handler:
                 )
                 return
 
-            # 4) DOUBLE TAP, slow — separate contacts that never revisited a pad
-            #    and never moved: the hand stayed put. Deliberately NOT "only one pad
-            #    touched": several fingers land on several pads at once, and
-            #    requiring a single pad made this reachable only with a fingertip.
             if count >= PET_SESSION_THRESHOLD:
-                self._reset_cycle()
-                return  # PARKED (no issue): only pet acts on TTP223
                 self._dispatch(
                     "DOUBLE_TAP", f"{count} contacts, no revisit and no movement",
-                    count, "mic_toggle_action", mic_toggle_action,
+                    count, "head_pat_action", head_pat_action,
                 )
                 return
 
-        # 5) TAP. Also the whole classifier when SWIPE_ENABLED is off, in which
-        #    case count is 1 or 2 — 2 is tolerated because cross-talk
-        #    occasionally splits one physical touch into two close sessions and
-        #    treating both as one tap is friendlier than ignoring.
-        #
-        # The tap gesture IS live. A `Disabled:` comment and a bare `# pass`
-        # survived here from 01d8ac24, which commented the call out while
-        # phantom triggers were being chased; the call was restored but the
-        # comment was not, so the file claimed the opposite of what it did.
-        # chime=False: the ack chime already sounded at the first session end
-        # (_ack_first_session) — don't ping twice.
-        self._reset_cycle()
-        return  # PARKED (no issue): only pet acts on TTP223
         self._dispatch(
             "TAP", self._tap_reason(count),
-            count, "single_click_action",
-            lambda source: single_click_action(source=source, chime=False),
-            chime=False,
+            count, "head_pat_action", head_pat_action,
         )
 
     def _tap_reason(self, count):
         """Why this resolved to TAP — naming the rule that declined, not the
         branch that caught it.
-
-        TAP is the fall-through after swipe, double tap and pet all decline, so
-        a reason describing how it got here ("decision window expired at
-        count=1") is true and useless: it is the one verdict where the reader
-        most needs to know what was *nearly* matched. A swipe missing the
-        movement floor by 1.1 ms read exactly the same as a deliberate tap
-        (device traces 102922 / 102935, 2026-08-28), and the only way to tell
-        was to open the file and know what `moved: False` implied.
-
-        Names the nearest miss and the number to tune, so the answer is in the
-        trace rather than in someone's head.
         """
         try:
             with self._lock:
@@ -782,7 +513,7 @@ class TTP223Handler:
                 return f"{base}; {len(live)} contacts"
             c = live[0]
             pads = {l for l, _ in c}
-            wired = set(self._lines)
+            wired = self._wired()
             if len(pads) < len(wired):
                 return (
                     f"{base}; touched {len(pads)} of {len(wired)} pads -- "
@@ -807,14 +538,7 @@ class TTP223Handler:
             return f"decision window expired at count={count}"
 
     def _dispatch(self, gesture, reason, count, fn_name, fn, **trace_fields):
-        """Record the verdict, CLOSE THE TRACE, then run the action.
-
-        Finishing before dispatch is deliberate. `sleep_action` blocks ~5s
-        waiting out its TTS clip, which outlived the tracer's idle flush and
-        filed four correctly-classified swipes as `IGNORED-unresolved`
-        (device-observed 2026-08-27). Writing first also means the trace
-        survives an action that raises.
-        """
+        """Record the verdict, CLOSE THE TRACE, then run the action."""
         is_swipe, moved, gaps, n, revisited, landed, presses = self._classify()
         touch_debug.note_classifier(
             revisited=revisited, landed=landed, presses=presses,
@@ -827,4 +551,6 @@ class TTP223Handler:
         touch_debug.note_action(fn_name, "TTP223", **trace_fields)
         touch_debug.finish(gesture)
         self._reset_cycle()
+        with self._lock:
+            self._pet_cooldown_until = time.monotonic() + PET_COOLDOWN_S
         fn(source="TTP223")

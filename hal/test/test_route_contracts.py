@@ -1,9 +1,4 @@
-"""Public route declarations must retain their request/response contracts.
-
-Use the AST so CI can check declarations without importing hardware drivers.
-This catches the historical /emotion decorator landing on a zero-argument
-helper, which is valid Python and therefore passes a syntax-only gate.
-"""
+"""Public route declarations must retain their request/response contracts."""
 
 import ast
 from pathlib import Path
@@ -65,6 +60,28 @@ def express_emotion(req: EmotionRequest, source: str = "api"):
         compile(source, "misplaced-decorator", "exec")
         with self.assertRaisesRegex(AssertionError, "EmotionRequest body"):
             self.assert_emotion_contract(source)
+
+
+class DeviceInputManifestTests(unittest.TestCase):
+    def test_mpr121_reports_resolved_wiring_without_driver_health(self):
+        from types import SimpleNamespace
+        path = Path(__file__).resolve().parents[1] / "runtime.py"
+        node = next(n for n in ast.parse(path.read_text()).body
+                    if isinstance(n, ast.FunctionDef) and n.name == "device")
+        node.decorator_list = []
+        module = ast.fix_missing_locations(ast.Module(body=[node], type_ignores=[]))
+        profile = SimpleNamespace(id="test", name="Test", type="test", schema="v1",
+                                  boards=[], safety_ref=None, memory_backend=None,
+                                  capabilities={})
+        for configured in (None, object()):
+            with self.subTest(configured=configured is not None):
+                env = {"_profile": profile, "_board_id": "test",
+                       "_mpr121_config": configured, "_mpr121_handler": None,
+                       "_safety_view": lambda _: None, "_safety": None,
+                       "_plan": SimpleNamespace(mounted=[])}
+                exec(compile(module, str(path), "exec"), env)
+                self.assertEqual(env["device"]()["inputs"],
+                                 {"mpr121": configured is not None})
 
 
 if __name__ == "__main__":

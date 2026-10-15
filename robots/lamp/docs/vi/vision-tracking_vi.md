@@ -14,6 +14,22 @@ Toàn bộ code tracking nằm trong package `hal/drivers/tracking/`:
 | `filters.py` | `AlphaBetaFilter2D`, `PID`, `smooth_damp`, `soft_deadband` |
 | `frame_utils.py` | `downscale`, `scale_bbox` (map tọa độ) |
 
+### Quyền giữ freeze khi nhiều tác vụ camera chồng nhau
+
+Snapshot (`capture_still`), chụp sensing và khởi tạo tracker dùng chung lease
+freeze theo từng motion service (`hal/drivers/motors/freeze_lease.py`). Tác vụ đầu
+tiên freeze chuyển động; chỉ tác vụ cuối cùng kết thúc mới unfreeze. Exception
+và return sớm đều trả lease của chính tác vụ đó, kể cả lỗi đăng ký hoặc giải
+phóng camera consumer. Freeze thất bại không cấp lease; snapshot vẫn giữ cách
+chụp best-effort hiện có khi không freeze được.
+
+Chỉ thao tác nhận/trả quyền giữ bị khóa. Lấy frame, chờ ổn định và nhận diện vật
+thể vẫn chạy chồng nhau; không thêm timer, sleep hay network call. Các giá trị
+settle/timeout hiện có không đổi. Caller camera mới phải dùng lease chung thay vì
+gọi thẳng `freeze()` / `unfreeze()` của driver. Cơ chế này phối hợp freeze hiện
+có; không thay đổi chính sách chuyển động của driver và chưa phải bộ điều phối
+chuyển động toàn cục.
+
 ## Định tuyến intent giọng nói
 
 Yêu cầu voice không khớp rule local có thể qua nhánh Jev của OS để chọn
@@ -61,9 +77,10 @@ Camera chạy **1280×720**. Mọi thành phần vision nặng — ViT tracker v
 |------|----------|---------|---------------|
 | 0 | **YuNet** face detector (`face_detection_yunet_2023mar.onnx`) | target ∈ {`face`, `human face`, `khuôn mặt`, `mặt`} | ~30 ms |
 | 1 | **Local YOLOv8n** (COCO classes, `yolov8n.pt`, imgsz=448) | target map tới một COCO class | ~310–530 ms, trung vị ~360 ms (đo trên lamp-0c89, input 1280x720) |
-| 2 | **Remote YOLOWorld** open-vocab (`{DL_BACKEND_URL}/detect/yoloworld`) | target không thuộc COCO, hoặc local miss (fallback) | **~0.55 s trung vị** (min 334 ms, p90 1.1 s, max 2.0 s; n=49 trên lamp-0c89) |
+| 2 | **Remote YOLOWorld** open-vocab (`{DL_BACKEND_URL}/detect/yoloworld`) | target không thuộc COCO, hoặc local miss (fallback); không bao giờ dùng cho `person`/`people`/`human` hay alias khuôn mặt | **~0.55 s trung vị** (min 334 ms, p90 1.1 s, max 2.0 s; n=49 trên lamp-0c89) |
 
 - COCO không có class hand/face, nên `hand`/`face` cố ý rơi xuống YuNet/YOLOWorld thay vì map tới `person` (vốn khóa vào toàn thân).
+- **Người và khuôn mặt không bao giờ gửi lên remote.** `person`/`people`/`human` và các alias khuôn mặt chỉ dùng YuNet và YOLOv8n local; local miss (hoặc thiếu weights local) thì trả về không có box. Đèn tự tìm người (gaze nhìn quanh, bearing sample), nên fallback ở đây sẽ gửi ảnh căn phòng lên cloud mà không ai yêu cầu.
 - Khi local-YOLO miss, code fallback về remote YOLOWorld, **throttle** tối đa một lần mỗi `REMOTE_FALLBACK_MIN_INTERVAL` (2.0 s) để một target thật sự không thể thấy không gọi remote mỗi lần redetect.
 - **Fallback bị tắt cho redetect thường kỳ** (`allow_remote_fallback=False`, do background scan của loop truyền vào). Khi target COCO đã khoá được rồi thì một lần local miss là chuyện bình thường — vật xoay đi, một khung hình nhoè — mà thread detect chỉ chạy một luồng, nên một vòng gọi remote kéo chu kỳ confirm từ ~0.5 s lên ~3 s, vượt cổng trust và làm servo đứng im trong khi vật vẫn còn trong khung. Local là thẩm quyền cho class mà nó được huấn luyện; để lần redetect sau xác nhận. Lúc seed và lúc phục hồi sau khi mất lock (`_do_retry`) vẫn cho phép remote, còn target open-vocab thì không ảnh hưởng — không có đường local thì chẳng có gì để fallback.
 - Bộ lọc chất lượng detection: confidence ≥ `DETECT_MIN_CONFIDENCE` (0.15), diện tích nằm giữa `DETECT_MIN_AREA_RATIO` (0.3%) và `DETECT_MAX_AREA_RATIO` (80%) của frame.
@@ -88,12 +105,14 @@ Weights được check vào repo (`hal/drivers/tracking/models/`) nên deploy ch
 
 Tracking điều khiển 4 joint:
 
-- **base_yaw** (ID 1) — pan trái/phải (100 % của yaw)
-- **base_pitch** (ID 2) — tilt lên/xuống, 10 % của pitch
-- **elbow_pitch** (ID 3) — tilt lên/xuống, 90 % của pitch
-- **wrist_pitch** (ID 5) — tilt lên/xuống, 0 %
+- **base_yaw** (ID 1) — pan trái/phải (100 % của yaw khi object tracking; `ServoFollower.apply` chỉ ghi yaw vào `base_yaw`)
+- **base_pitch** (ID 2) — tilt lên/xuống, 20 % của pitch
+- **elbow_pitch** (ID 3) — tilt lên/xuống, 60 % của pitch
+- **wrist_pitch** (ID 5) — tilt lên/xuống, 20 % của pitch
 
-Pitch được dồn vào elbow (`PITCH_WEIGHT_ELBOW = 0.90`). Thực nghiệm cho thấy chỉ các joint xoay-thuần mới đưa vật thể về giữa; base/wrist chủ yếu tịnh tiến camera (kinematic coupling), nên weight của chúng thấp/bằng không. Chiều dương của motor elbow bị đảo ở phần cứng, nên đóng góp của nó mang `ELBOW_PITCH_SIGN = -1.0`.
+Pitch do elbow dẫn dắt (`PITCH_WEIGHT_BASE/ELBOW/WRIST = 0.20 / 0.60 / 0.20`). Đây là ưu tiên, không phải tỉ lệ cứng: `servo_follow.distribute_pitch` phân bổ theo weight trước, phần joint bão hòa không nhận được (theo `PITCH_TRAVEL_MIN/MAX` đo thực tế) được chuyển cho joint còn dư hành trình. Elbow không còn nhận 90 % vì khi elbow chập chờn không phản hồi, nó nuốt gần hết mọi lần hiệu chỉnh. Chiều dương của motor elbow bị đảo ở phần cứng, nên đóng góp của nó mang `ELBOW_PITCH_SIGN = -1.0`. Mọi hiệu chỉnh pitch (tracking, gaze, aim) còn bị chặn để đèn không bao giờ ngả ra sau: `distribute_pitch` tính tư thế đích bằng hình học `urdf_ref` và thu nhỏ bước cho tới khi trọng tâm toàn thân nằm sau trục đế không quá `MAX_LEAN_BACK_MM = 16` mm (idle/listening tới 15.1 mm). Tư thế đã vượt mức chỉ được tiến ra trước, mỗi lần cắt ghi log `[lean-back]`. Trước đây mặt nằm trên khung hình (user đứng lên) kéo cánh tay lùi 30–48 mm làm đèn bật ngửa; giờ camera ngẩng tới mức chặn rồi dừng. `base_pitch` cũng không xuống dưới 10° (không recording thiết kế nào dưới 9.3°), chặn này vẫn giữ cả khi thân không có hình học.
+
+Pan của gaze (không phải object tracking) chia yaw cho `base_yaw` và `wrist_roll` qua `servo_follow.distribute_yaw` với `YAW_WEIGHT_BASE/ROLL = 0.75 / 0.25` — xem phần pan của gaze bên dưới.
 
 ### Control law (vision loop → servo goal)
 
@@ -162,7 +181,8 @@ pitch_correction = clamp(PID(soft_deadband(dy)) + VFF·vy·deg_per_px·dt,  ±5�
 | `SERVO_COMMAND_MIN_DELTA` | 0.08 | Chỉ gộp các thay đổi normalized rất nhỏ; final target được gửi một lần |
 | `TRACKING_GOAL_VELOCITY` | 0 (unlimited) | Được ghi rõ khi session bắt đầu để xóa hardware cap cũ; các profile SmoothDamp sở hữu speed envelope (150 steps/s ≈ 13°/s đã làm mọi đường cong ease thành một chuyển động chậm đều) |
 | `TRACKING_ACCELERATION` | 30 | Ramp gia tốc phần cứng |
-| `PITCH_WEIGHT_BASE/ELBOW/WRIST` | 0.10 / 0.90 / 0.0 | Phân bổ pitch qua các joint |
+| `PITCH_WEIGHT_BASE/ELBOW/WRIST` | 0.20 / 0.60 / 0.20 | Phân bổ pitch ưu tiên qua các joint (phần tràn được `distribute_pitch` chuyển tiếp) |
+| `YAW_WEIGHT_BASE/ROLL` | 0.75 / 0.25 | Chia yaw cho `distribute_yaw` (pan của gaze; object tracking chỉ điều khiển `base_yaw`) |
 | `ELBOW_PITCH_SIGN` | -1.0 | Chiều elbow (phần cứng đảo) |
 | `YOLO_REDETECT_S` | 1.5 | Khoảng thời gian background re-detect |
 | `YOLO_AREA_GATE_MULT` | 4.0 | Loại re-detect có diện tích outlier |
@@ -179,7 +199,9 @@ pitch_correction = clamp(PID(soft_deadband(dy)) + VFF·vy·deg_per_px·dt,  ±5�
 
 Mọi knob nằm trong `hal/drivers/tracking/constants.py`. (Đường proportional chết `GIMBAL_*` / `EMA_ALPHA` đã bị xoá khi tách package.)
 
-Đặt `HAL_TRACKING_MAX_DURATION_S` trong `/opt/hal/.env` của Lamp để chọn giới hạn thời gian thực cho một session; mặc định Lamp đã cài là `10`. Khởi động lại service `hal` sau khi đổi.
+Đặt `HAL_TRACKING_MAX_DURATION_S` trong `/opt/hal/.env` của Lamp để chọn giới hạn thời gian thực cho một session; mặc định Lamp đã cài là `10`. Khởi động lại service `hal` sau khi đổi. Một lần gọi `/servo/track` có thể truyền `max_duration_s` để
+dừng sớm hơn (không bao giờ quá giới hạn này): cái nhìn khi chào trong sensing skill dùng `3`, vì đèn
+chào xong mà bám chặt một khuôn mặt 10 giây thì giống camera theo dõi, không giống một cái nhìn nhận ra.
 
 ### Giới hạn vị trí servo
 
@@ -200,7 +222,7 @@ Mọi knob nằm trong `hal/drivers/tracking/constants.py`. (Đường proportio
 | Không detector confirm trong `STOP_NO_YOLO_S` (20 s) | Dừng — ghost tracking |
 | CSRT miss `YOLO_MAX_MISS` (30) sau `MAX_TRACKING_RETRIES` (4) | Dừng — vật thể biến mất |
 | Thời lượng tracking > `HAL_TRACKING_MAX_DURATION_S` (mặc định 10 giây) | Dừng — timeout để tiết kiệm motor/CPU |
-| Single-click từ nút GPIO hoặc TTP223 | Dừng — user chủ động huỷ attention |
+| Single-click từ nút GPIO hoặc MPR121 (Harness OFF) | Dừng — user chủ động huỷ attention. Cử chỉ trên headpad TTP223 **không** dừng tracking; chỉ gọi `head_pat_action`. |
 
 Lưu ý: một bbox lớn (ví dụ một người lấp đầy frame) **không** phải điều kiện dừng — PID chạy theo centroid, không phải kích thước bbox, nên một vật thể ở gần vẫn track. Khi tracking kết thúc, idle nội suy từ pose hiện tại đo được của cánh tay thay vì đưa tay qua zero trước — xem [Tương tác với các hệ thống khác](#tương-tác-với-các-hệ-thống-khác).
 
@@ -212,13 +234,7 @@ Object tracking được điều khiển bởi các cập nhật vision từ xa 
 
 Tất cả nằm dưới `/servo/track`.
 
-### GET /servo/track/targets — Liệt kê target gợi ý
-
-```json
-{"targets": ["person", "cup", "bottle", "glass", "phone", "laptop", ...]}
-```
-
-Detection là open-vocabulary qua YOLOWorld (và YuNet cho khuôn mặt) — mọi text đều được, danh sách này chỉ là gợi ý.
+Không có endpoint liệt kê target. Detection là open-vocabulary qua YOLOWorld (và YuNet cho khuôn mặt) — mọi text đều dùng được làm `target` (ví dụ `person`, `cup`, `bottle`, `phone`, `laptop`).
 
 ### POST /servo/track — Bắt đầu tracking
 
@@ -365,7 +381,7 @@ là hãy nhìn vào một vật.
 
 **Thân máy được sở hữu trong suốt cả lượt look.** Từ lúc pha ngắm bắt đầu cho tới khi màn trập đóng,
 `servo_ownership()` giữ một suất đếm tham chiếu trong đúng cái khóa `_tracking_active` mà vision
-tracker vẫn dùng, khóa này chặn **toàn bộ** animation servo của emotion (`routes/emotion.py`) và
+tracker vẫn dùng, khóa này chặn **toàn bộ** animation servo của emotion (`hal/routes/emotion.py`) và
 khiến vòng animation bỏ luôn bản ghi đang phát dở.
 
 Đây không phải phần đánh bóng cho đẹp. Các preset emotion phát những tư thế **đã ghi sẵn**, tuyệt đối
@@ -523,7 +539,9 @@ trường hợp đèn tự quyết định. Pha quét được vào khi:
   pha quét thậm chí không hiện ra trong Monitor. Agent chờ body rồi trả lời dựa trên đó, đúng theo
   cách `/api/vision/look` vẫn đang làm.
 - họ đồng ý với đề nghị sau một lần nhìn thất bại — *"Tôi không thấy nó. Bạn có muốn tôi quay quanh tìm thử không?"*
-- **look-aim sắp bỏ cuộc** — trước khi `look_lost` tuyên bố *"Tôi không tìm thấy bạn"*, câu mà đến giờ
+- **look-aim sắp bỏ cuộc** — nhưng chỉ là một cái **liếc** (`glance=True`, 2 lần nhìn tại bearing,
+  không có `look_still_searching`), không phải pha quét đầy đủ: được nhờ nhìn mà không thấy ai thì
+  một sinh vật liếc quanh, không quét cả phòng. Trước khi `look_lost` tuyên bố *"Tôi không tìm thấy bạn"*, câu mà đến giờ
   nó vẫn nói sau khi mới chỉ quay về một bearing đã ghi nhớ. Bearing là phỏng đoán về nơi người ta
   *từng* ở, không phải một lần tìm, nên câu đó phải được xứng đáng. Hạn chót của pha ngắm **ngừng đếm**
   trong suốt thời gian quét (`t_end += time.monotonic() - swept_at` trong `aim_for_look`): hạn chót tồn
@@ -531,7 +549,7 @@ trường hợp đèn tự quyết định. Pha quét được vào khi:
   chuyện đó rồi, và tính pha quét vào một ngân sách nó không thể vừa nghĩa là không bao giờ được quét.
 - **watcher gaze ở một mình quá lâu** — `HAL_GAZE_SWEEP_AFTER_S` (30 s) không thấy ai, hoặc một lần
   repoint đã quay về bearing mà không thấy ai ở đó. Đường này không ai yêu cầu, nên nó là đường duy
-  nhất có cooldown — xem *Tự quay quanh tìm*.
+  nhất có cooldown và chỉ là một cái **liếc**, không phải pha quét này — xem *Tự quay quanh tìm*.
 
 `POST /servo/search` — quét tìm một đối tượng. Body (tất cả đều tuỳ chọn): `{"target": "cup", "exhaustive": true}`.
 
@@ -582,8 +600,10 @@ Response là một body có cấu trúc, không phải một chuỗi văn xuôi 
   bearing đã ghi nhớ; pha quét tìm thấy đồ vật cũng thường xuyên như tìm thấy người, và dạy cho
   estimator rằng bàn phím là nơi người dùng ngồi chính là cách bearing mục ruỗng một cách âm thầm.
 - `image_path` là frame trúng đích, được ghi vào `media/hal-snapshots` của runtime đang hoạt động —
-  đúng cái pool có giới hạn và xoay vòng mà `/camera/snapshot?save=true` đang dùng (`_SNAPSHOT_MAX`
-  = 20). Frame này có vẽ sẵn box của vật thể phát hiện được, qua
+  đúng cái pool có giới hạn và xoay vòng mà `/camera/snapshot?save=true` và frame `look` của
+  realtime đang dùng (`_SNAPSHOT_MAX` = 20). Sau mỗi lần ghi, `app_state.prune_snapshot_dir()` đếm các
+  file `.jpg` trên đĩa và xoá file cũ nhất theo mtime, nên frame có từ trước khi HAL restart cũng bị
+  xoá. Frame này có vẽ sẵn box của vật thể phát hiện được, qua
   `look_debug.encode_annotated(..., centre_lines=False)`: cái box mới là câu trả lời, còn hai đường
   dx cao hết khung màu xanh/đỏ là phần tính toán nội bộ của aim và sẽ nằm chồng lên nhau ngay giữa
   một frame đã canh giữa. Frame và box luôn đến từ **cùng một** lần chụp — vẽ box đo trước khi hiệu
@@ -598,6 +618,14 @@ chế độ exhaustive) vòng lên trên. Các góc chéo dùng **trọn** roll 
 cos(45) của mỗi trục, tức một hình vuông bo góc chứ không phải hình tròn: nhờ vậy mỗi góc nhìn được xa
 sang bên đúng bằng các lần nhìn trái/phải và xuống thấp đúng bằng lần nhìn đáy, tức thêm vùng đất mới
 thay vì phủ lại phần giữa.
+
+**Pha nhìn quanh tìm user thì vòng qua đỉnh (#545).** `search_for_subject(for_user=True)` (pha nhìn
+quanh của gaze watcher) đi theo `USER_LOOK_CIRCLE`: vẫn sáu lần nhìn đó nhưng pitch được lật ngược, tức
+tâm, trái, vòng qua **đỉnh**, ra phải. Khuôn mặt nằm ngang hoặc cao hơn góc nhìn lúc ngồi mà pha quét
+bắt đầu từ đó; các lần nhìn đáy chỉ vào bàn và bàn phím. Đo trên green-lamp 30/09/2026: một user đang
+đứng, đầu cao hơn mọi lần nhìn, đã bị bỏ sót qua cả 18 lần nhìn. Tìm đồ vật (`POST /servo/search`,
+"tìm đồ của tôi") vẫn giữ vòng nhìn xuống, nơi có đồ trên bàn. Các
+lần nhìn lên dùng chung giới hạn `WRIST_PITCH_MIN` mô tả bên dưới.
 
 **Chỉ `wrist_roll` và `wrist_pitch` di chuyển trong một lần nhìn.** Đế chỉ xoay một lần cho mỗi bearing
 và cánh tay không bao giờ tự đổi dáng. Một thiết kế trước đó rải độ nghiêng lên `base_pitch`,
@@ -625,6 +653,28 @@ tâm trông như bồn chồn khi đầu đèn cũng đang ngó quanh ở từng
 để ý tới tôi", mà tư thế một pha quét bị cắt ngang đóng băng lại không phải tư thế nghỉ — đầu có thể
 đang nghiêng 45°, mặt hướng vào tường. Tìm thấy → đầu được dựng thẳng lại bằng cách xoay ĐẾ đúng bằng
 góc đầu đang nghiêng, nên camera vẫn hướng vào đối tượng mà đầu thì ngay ngắn.
+
+**Khi gaze watcher tự quét, nó tìm user chứ không tìm bất kỳ ai (#545).** `gaze._maybe_sweep`
+gọi `search_for_subject(for_user=True, glance=True)`. Mọi nơi gọi khác giữ nguyên hành vi hiện tại:
+`POST /servo/search` (đồ vật, `exhaustive`); pha dự phòng của look-aim cũng chỉ là cái liếc, nhưng
+không có user check. Ở mỗi lần nhìn,
+nó quan sát các khuôn mặt trong khung khoảng 1.5 s (`user_check.observe_faces`, 6 frame; bỏ qua bước
+chờ này khi frame đầu không có mặt nào) và chỉ dừng ở một cái mặt qua được
+`user_check.adopts_bearing`: cao ít nhất `HAL_GAZE_BEARING_MIN_FACE_HEIGHT_FRAC` (15%) khung hình,
+nằm trong `HAL_BEARING_SAMPLE_MAX_DX_FRAC` (25%) quanh tâm khung, và nhìn về đèn (góc yaw của đầu trong
+`HAL_GAZE_BEARING_MAX_YAW_DEG`, 25°, không bao giờ nới rộng ở mép khung) trong
+`HAL_GAZE_BEARING_MIN_FACING_RATIO` (40%) số mẫu đo được. Ứng viên được xếp theo mức nhìn về đèn, rồi
+theo kích thước mặt. Face-ID không phải là một đường vào: nó cho biết ai vừa được thấy, không cho biết
+box này là của ai, nên một nhãn còn mới sẽ cho mọi mặt gần lọt qua khi user đang ở trong khung. Mỗi lần
+chấp nhận hay từ chối đều ghi yaw đầu, chiều cao mặt và độ lệch theo từng frame (`yaw=[…] h=[…]% dx=…`).
+Đo trên green-lamp 30/09/2026: một đồng nghiệp nghiêng mặt ở mép khung (`dx=+45%`, 58 px trên 720 =
+8.1%) lọt qua với "facing 100%", vì cone của gaze wake ở đó (`HAL_GAZE_MAX_YAW_DEG` 60 × hệ số nới ở mép
+≈ 103°) chấp nhận mọi hướng đầu. Một đồng nghiệp ngồi bàn bên cạnh đo được tới 13.6% và đã xác nhận
+một lần repoint trong lúc user đi vắng. User đo được 19.2–46% trong các frame trên cùng đèn đó. Chỉ có thân người thì không bao giờ kết thúc pha quét, và bước căn giữa bám theo
+cái mặt đó (`_user_face_probe`) chứ không bám box người gần nhất. Nếu không mặt nào qua được, pha quét
+báo không tìm thấy và đi theo lối thoát bình thường về tư thế lúc bắt đầu. Đo trên thiết bị
+29/09/2026: pha quét chọn "người gần nhất" trong 2–3 đồng nghiệp (`h=304px`) và phần framing sau đó
+bám theo một người lạ đang nghiêng mặt tới tận `base_yaw −97.4`.
 
 **Khi chưa có bearing** — máy mới, hoặc bearing vừa bị reset — pha quét trước hết đưa tay về đúng tư
 thế của bản ghi idle thay vì bắt đầu từ chỗ nó đang đứng. Một vòng lặp vừa dắt đầu đèn đi lòng vòng
@@ -687,16 +737,17 @@ os-server sở hữu các câu, phần phân giải ngôn ngữ và cache WAV (`
 |---|---|---|
 | `look_searching` | bước đầu tiên về phía bearing đã ghi nhớ | **bật** (`HAL_LOOK_AIM_SPEAK`) |
 | `look_found` | có người xuất hiện **sau khi** đã thông báo đang tìm | bật (cùng cờ) |
-| `look_still_searching` | điểm giữa của pha quét — điểm dừng 2/3, đầu ở giữa (`_say_at_the_midpoint`) | bật (`HAL_LOOK_AIM_SPEAK`) |
+| `look_still_searching` | điểm giữa của pha quét đầy đủ (`/servo/search`) — điểm dừng 2/3, đầu ở giữa (`_say_at_the_midpoint`). Không bao giờ phát trong cái liếc của look-aim | bật (`HAL_LOOK_AIM_SPEAK`) |
 | `look_capturing` | pha ngắm thực sự đã di chuyển trước khi bấm máy | bật (`HAL_LOOK_AIM_SPEAK_CAPTURE`) |
 
 Phần chặn quan trọng hơn bản thân các câu nói. **Không nói gì khi đối tượng đã nằm giữa sẵn** — lần chụp
 đó xong trong vài trăm mili giây, nên mọi câu ở đây đều có điều kiện là pha ngắm thực sự đã phải di
 chuyển. *"Bạn đây rồi"* chỉ phát ra như phần kết của một lần tìm đã được thông báo, không bao giờ đứng
 một mình. Trạng thái đang tìm chỉ thông báo **một lần** mỗi pha quét chứ không phải mỗi bước, cộng
-thêm đúng một câu `look_still_searching` ở điểm giữa — pha quét dài ~20 s, và không có câu đó thì câu
-mở đầu và câu kết luận nằm hai bên một khoảng lặng hai mươi giây, nghe như một cái đèn đã đứng máy chứ
-không phải một cái đèn đang tìm. Còn câu lúc chụp chỉ phát khi pha ngắm thực sự đã di chuyển
+thêm đúng một câu `look_still_searching` ở điểm giữa của pha quét đầy đủ — pha đó dài ~20 s, và không
+có câu đó thì câu mở đầu và câu kết luận nằm hai bên một khoảng lặng hai mươi giây, nghe như một cái đèn
+đã đứng máy chứ không phải một cái đèn đang tìm. Cái liếc của look-aim chỉ ~4 s và không nói gì ở giữa:
+kể lể một cái liếc ngắn là kiểu máy báo trạng thái. Còn câu lúc chụp chỉ phát khi pha ngắm thực sự đã di chuyển
 (`res.aimed and res.iterations > 0`): pha ngắm không động gì thì không nói gì, và — phần đã sai cho tới
 nhánh này — pha ngắm đã tìm rồi **thất bại** cũng không nói gì, trước đây nó nối ngay
 *"Tôi không tìm thấy bạn"* với *"Để tôi nhìn thử"*.
@@ -725,6 +776,16 @@ phân giải ra rỗng đơn giản là một cái đèn không nói gì.
 
 ## Canh khung gaze — giữ user trong khung hình
 
+Gaze tạm ngừng lấy mẫu khi chuyển vào idle và trong 350 ms sau frame playback
+idle đầu tiên. Sau đó gaze lấy mẫu ngay trong **vòng idle đầu tiên**, không chờ
+chạy hết recording. Trước đây `_idle_settled` chỉ thành true khi hết vòng đầu,
+nên các lệnh servo idle lặp lại có thể chặn gaze cả vòng dù tư thế không đổi.
+Timestamp playback riêng không đổi cờ tiếng ồn motor, ngưỡng chấp nhận gaze,
+hay điều kiện không xoay tìm lại khi đã thấy mặt. Với cấu hình 6 mẫu/s, gaze
+có thể lấy mẫu ở vòng watcher kế tiếp sau khoảng 350 ms; vẫn có thêm thời gian
+camera/xử lý thực tế. Ranh giới này đã có test playback xác định, chưa có số đo
+latency mới trên device.
+
 Mọi thứ ở trên đều là do được yêu cầu: một lệnh nhìn, một phiên track, một lần tìm. Phần này là
 watcher trong `hal/drivers/tracking/gaze.py` tự làm những việc đó mà không ai bảo, để đến lúc user
 thực sự cất tiếng thì camera đã hướng về chỗ có ích. Toàn bộ nằm dưới `HAL_GAZE_WAKE` (xem
@@ -751,6 +812,13 @@ Vì thế "thả ra" là miễn phí: ngừng hiệu chỉnh thì idle tự đò
 có pose nào phải khôi phục và không có quyền sở hữu nào phải nhả. Phép kiểm tra này **fail đóng** khi
 không có voice. Ngoại lệ duy nhất là một lần leo *được yêu cầu* (`prompt`), vốn do một repoint từ
 speech đòi, nếu từ chối thì đầu sẽ nằm chĩa vào ngực suốt cả câu nói.
+
+**Servo đang bị giữ thì không được đụng vào.** Pan, tilt, leo tìm mặt và bước quay về độ cao đã
+biết, repoint khi bắt đầu nói và nhìn quanh đều bỏ qua khi có bất kỳ servo hold nào (scene
+`reading`/`focus`, hoặc `/servo/hold` tường minh), và log lý do qua dòng throttle quen thuộc, ví dụ
+`[gaze] no pan: servo held by scene` hoặc `[gaze] not looking around: servo held by explicit`. Một
+lần nhìn quanh bị bỏ qua không bắt đầu cooldown. Tracking vốn đã giữ thân qua `_tracking_active`.
+Xem `led-control_vi.md`, mục "Chủ sở hữu của hold".
 
 ### Canh giữa theo chiều dọc, và vì sao nó đọc trung vị
 
@@ -879,16 +947,66 @@ bearing đúng có thể bị bào mòn bởi một cái ghế trống. Chỉ ch
 
 Ba hành vi nữa đáng nói ra vì cái nào cũng từng là một con bug:
 
-- **Thấy thân người cũng tính là tìm được user.** Bộ kiểm tra theo dõi mặt và thân trên hai đồng hồ
-  riêng; một cái thân ở đúng bearing nghĩa là bearing *đúng*. Chấm nó là trượt đã xoá mất những bearing
-  đúng trong khi user đang ngồi ngay trước đèn.
-- **Một lần repoint phải kết thúc trên một cái mặt.** Dừng ở thân người mới là nửa thành công, nên nó
-  kích hoạt phần leo tìm ở trên thay vì báo "đã thấy" — đó là lý do phần leo có `_PROMPT_MIN_SAMPLES`
-  bằng 2.
+- **Kết luận dựa trên một cái mặt, không bao giờ dựa trên thân người (#545).** Một cái mặt cao ít nhất
+  `HAL_GAZE_BEARING_MIN_FACE_HEIGHT_FRAC` (15%) khung hình là xác nhận bearing. Không cần nhìn về đèn, không
+  cần nhận ra danh tính, vì user hay vừa nói vừa nhìn màn hình của mình. Mặt nhỏ hơn không được tính là
+  mặt (xem "Mặt xa không phải là mặt" ở dưới), nên repoint chỉ thấy mặt như vậy là trượt:
+  trong văn phòng mở, lưng của một đồng nghiệp đã xác nhận bearing, và một khuôn mặt nghiêng 12–25 px ở
+  phía bên kia phòng đã trở thành "user". **Chỉ kích thước quyết định gần hay xa.** Vị trí thì không:
+  một bearing lệch vài độ so với chỗ ngồi của user sẽ đẩy họ ra mép khung, và một cổng ±15% quanh tâm
+  khung thử ngày 30/09/2026 đã xếp chính khuôn mặt 35% của user (dx +34%) vào loại "xa". Thay vào đó kích thước
+  tách hai người ra: trong các frame ngày 30/09/2026, người ngồi bàn bên cạnh chỉ đạt tối đa 13.6% còn
+  user không bao giờ dưới 19.2%, nên ngưỡng đặt ở 15%. Watcher
+  đóng dấu đồng hồ mặt-gần (`_note_face_size`) cho mỗi mặt nó nhận được, và phần kết luận đọc đồng hồ đó.
+- **Chỉ thân người có đầu nằm trên khung mới chờ phần leo tìm.** Một box người bị mép trên khung cắt
+  (phép kiểm tra của `_headroom_from_person`) đóng dấu `_last_headless_body_t`, và chỉ nó mới bắt đầu leo
+  tìm. Một thân người nằm trọn trong khung thì đã cho thấy khuôn mặt nếu có, nên được chấm theo các mặt:
+  mặt gần = trúng, còn lại thì **kích thước** quyết định (#567). Một box
+  người gần nhất chiếm ít nhất `HAL_GAZE_REPOINT_NEAR_BODY_MIN_AREA_FRAC` (20%) khung hình là một người
+  đang ngồi ở bàn mà detector bỏ sót mặt — ngồi nghiêng, cúi xuống — và lần repoint **không được chấm**
+  (không bị trừ, không quay quanh tìm), kể cả khi trong khung có mặt của một đồng nghiệp. Thân nhỏ hơn =
+  trượt (`found a body but no face`), không có ai cũng vậy. Chiều cao không phân biệt được: ngày 05/10/2026
+  một người không phải user đạt 73% chiều cao khung. Diện tích thì được: user ngồi đo được 26–73% khung
+  hình trên ba đèn, đồng nghiệp và người đi ngang tối đa 13%. Thân gần **không bao giờ xác nhận**
+  bearing. Cùng quy tắc đó áp dụng khi kết thúc leo tìm: leo tìm kết thúc với một thân gần thì không được
+  chấm. Mỗi kết luận repoint đều log box người lớn nhất đã thấy
+  (`largest body N% of frame`) để chỉnh ngưỡng từ log thiết bị. Đo trên thiết
+  bị 30/09/2026: cả người user nằm trong khung đã kích hoạt một lần "leo tìm" mà đầu không hề di chuyển.
+  Thân người mất đầu sẽ kích hoạt phần leo tìm ở trên và giữ
+  kết luận tối đa `HAL_GAZE_REPOINT_CLIMB_TIMEOUT_S` (20 s), tiếp tục kích hoạt leo tìm kể cả khi không có
+  cuộc hội thoại nào đang mở. Mặt gần = trúng; thân gần = **không chấm**; chỉ có thân người quá nhỏ để đang ngồi ở bàn =
+  **trượt** (một đồng nghiệp đứng bên kia phòng, bị mép trên khung cắt, mặt nhỏ của họ không được tính
+  là mặt); không có ai = **không chấm**. Phần thân bị cắt của chính user luôn là thân gần.
+  Chấm một lần repoint chỉ thấy thân là trượt đã từng xoá mất những bearing đúng trong khi user đang
+  ngồi ngay trước đèn.
+- **Mặt xa không phải là mặt (#567).** Bộ chọn mặt (`detect_face_with_landmarks`) chỉ trả về những mặt
+  cao ít nhất `HAL_GAZE_BEARING_MIN_FACE_HEIGHT_FRAC` (15%) khung hình, và không bao giờ nhỏ hơn
+  `HAL_GAZE_MIN_FACE_PX`; trong số đó mặt gần tâm nhất được chọn. Mặt nhỏ hơn bị bỏ, không có phương án
+  dự phòng lấy mặt to nhất. Trước đây nó vẫn được trả về làm "cái mặt" mỗi khi không tìm thấy mặt của
+  user, mà watcher chỉ tìm thân người khi không thấy mặt nào. Vì vậy khuôn mặt nhỏ của một đồng nghiệp
+  đã che mất một user đang đứng ngay trước đèn (green-lamp 30/09/2026: không có thân, không leo tìm,
+  thành trượt), kéo phần pan về phía đồng nghiệp, và lúc 16:33:42 ngày 05/10/2026 (green-lamp) đã che
+  mất gáy của user chiếm 30% khung hình, nên guard thân gần ở dưới không bao giờ kích hoạt. Giờ mẫu như
+  vậy đi theo đường không có mặt: phát hiện người chạy, thân user quyết định `dy` của phần leo tìm và
+  đồng hồ thân gần, và không có pan nào. Cái giá là một lượt YOLO tìm người trên các mẫu đó, giống như
+  mọi mẫu không có mặt.
+  Thân người mà gaze xét là box người **gần nhất** — box cao nhất trong số các box đủ gần để là người
+  đang nói, cùng quy tắc `_pick_nearest` mà look-aim và search dùng — chứ không phải box có độ tin cậy
+  cao nhất của `detect()`. Trên lamp-4ace (05/10/2026 13:48:51), box 30% của user với độ tin cậy 0.78
+  đã thua box 4% của một đồng nghiệp với 0.83, nên phần thân bị cắt của user không bao giờ kích hoạt
+  leo tìm. Các box ứng viên chỉ lấy từ YOLO cục bộ (`detect_candidates`), không bao giờ dùng phương án
+  dự phòng YOLO-World từ xa như `detect()`: với `HAL_TRACKING_DETECT_LOCAL=false` hoặc không có weights
+  cục bộ, gaze không thấy thân người nào — không leo tìm và không có bằng chứng thân gần.
 - **Nó sẽ không quay đi khỏi một cái mặt đang có trong khung.** Nếu vừa thấy mặt trong
   `HAL_GAZE_REPOINT_SKIP_IF_FACE_S`, một lần reacquire do speech kích hoạt sẽ từ chối: sau khi leo tìm
   đã thấy mặt user *cao hơn* bearing, nghe theo bearing nghĩa là quay ngược xuống nhìn vào chỗ không có
   ai.
+- **Cũng không quay đi khỏi một người đang ngồi trước nó (#567).** `blind` lúc bắt đầu nói nghĩa là có
+  ít hơn `HAL_GAZE_MIN_SAMPLES` mặt đo được trong `HAL_GAZE_WINDOW_S` vừa qua: không tìm thấy mặt, hoặc
+  bộ lấy mẫu không có mẫu mới. Nó không nói gì về thân người. Nếu box người gần nhất là thân gần (xem ở
+  trên) trong `HAL_GAZE_REPOINT_SKIP_IF_FACE_S`, lần reacquire sẽ từ chối (`no repoint: someone is
+  already in front of the lamp`): đèn đã hướng về user rồi, và quay đi chỉ có thể dẫn tới một kết luận
+  sai. User được đo là *đang nhìn đi chỗ khác* là một kết luận khác (`skip`) và không bao giờ repoint.
 - **Hold kết thúc cùng câu nói.** Reacquire do speech kích hoạt ngắm đèn bằng `move_and_hold`,
   hàm này bỏ recording đang phát và set `_idle_settled` — đúng cho lúc đang nói, sai sau khi nói
   xong, vì không ai bật lại idle nữa. Đèn đứng im luôn cho tới khi restart HAL (đo trên lamp-0c89
@@ -902,8 +1020,13 @@ ra mỗi phút một lần thay vì mỗi vòng một lần.
 
 ### Tự quay quanh tìm
 
-Nếu một lần repoint không ra ai, `_verify_repoint` gọi chính pha quét `/servo/search` mô tả ở trên với
-`confirmed_miss=True`. Vì repoint ở trên do speech kích hoạt, pha quét cũng vậy: đèn đi tìm vì có người
+Nếu một lần repoint bị chấm trượt (không có ai, hoặc chỉ có thân người quá nhỏ để đang ngồi ở bàn), `_verify_repoint` gọi `_maybe_sweep` với
+`confirmed_miss=True`, và nó chỉ **liếc** chứ không quét: `glance=True` giữ đế ở bearing gốc và chỉ đi
+qua `GLANCE_LOOKS` — đầu liếc trái 45°, rồi phải 45° — tức 2 lần nhìn, khoảng 4 s, không nói câu
+`look_still_searching`. Xong thì về lại tư thế ban đầu và thôi. Nguyên tắc là *một sinh vật có làm vậy
+không?*: quay về phía tiếng gọi mà không thấy ai thì liếc quanh một chút; không ai đi quét phòng
+3 hướng × 6 lần nhìn như camera an ninh — đó chính là cảm giác khi pha quét đủ 18 lần nhìn tự chạy
+mà không ai yêu cầu. Pha quét đầy đủ chỉ còn cho lúc có người yêu cầu tìm (`/servo/search`). Vì repoint ở trên do speech kích hoạt, pha quét cũng vậy: đèn đi tìm vì có người
 đã nói mà nó không tìm ra họ, chứ không bao giờ vì một căn phòng trông có vẻ trống. Cò kích hoạt theo
 vắng mặt (`HAL_GAZE_SWEEP_AFTER_S`) vẫn còn trong `_maybe_sweep` nhưng không còn gì với tới nó — vòng
 lặp watcher không còn gọi pha quét nữa. Các cooldown vẫn áp dụng, và có tới hai vì hai tình huống không
@@ -915,15 +1038,23 @@ thật: ba lần repoint hỏng đã xoá ước lượng, rồi đèn ngồi đ
 về) vừa không quét được (còn 11 phút cooldown) trong khi user đang nói chuyện với nó.
 
 `confirmed_miss` bỏ qua thời gian chờ vắng mặt một cách có chủ ý — một lần repoint đã di chuyển rồi
-trượt là bằng chứng mạnh nhất có thể có, nên không còn gì để chờ. Một pha quét thành công sẽ lấy mẫu
-một bearing mới ngay tại chỗ.
+trượt là bằng chứng mạnh nhất có thể có, nên không còn gì để chờ. Một pha quét thành công ghi lại
+bearing mà nó đang hướng tới, tức là cái mặt đã qua kiểm tra user (`_learn_from_user_sweep`), và chỉ
+khi căn giữa thành công. Nó không còn lấy mẫu lại bằng `bearing_sampler`, vì bộ lấy mẫu đó chọn bất kỳ
+mặt gần nào detector trả về, có khi là chính đồng nghiệp vừa bị xếp dưới user. Trong lúc phần leo tìm
+của một lần repoint chỉ thấy thân người vẫn đang chờ, một lần repoint mới sẽ bị từ chối (`a climb is
+still judging the last repoint`). Quay tiếp sẽ hạ cái đầu mà phần leo tìm vừa nâng lên và chấm một lần
+nhìn thấy hai lần. Mặt chỉ được tính là bằng chứng cho repoint nếu thấy sau khi đã quay.
 
 | Tham số | Mặc định | Ý nghĩa |
 |---|---|---|
-| `HAL_GAZE_SWEEP` | `true` | Bật/tắt tự quay quanh tìm. |
-| `HAL_GAZE_SWEEP_AFTER_S` | 30 | Không thấy ai trong bao lâu. Dài hơn `HAL_GAZE_REPOINT_AFTER_S` (12 s) để nước đi rẻ luôn được thử trước và pha quét ~20 s vẫn là bước leo thang chứ không phải phản xạ. |
+| `HAL_GAZE_SWEEP` | `true` | Bật/tắt tự liếc quanh tìm. |
+| `HAL_GAZE_SWEEP_AFTER_S` | 30 | Không thấy ai trong bao lâu. Dài hơn `HAL_GAZE_REPOINT_AFTER_S` (12 s) để nước đi rẻ luôn được thử trước và cái liếc ~4 s vẫn là bước leo thang chứ không phải phản xạ. |
 | `HAL_GAZE_SWEEP_COOLDOWN_S` | 900 | Giữa hai pha quét khi đã có bearing. |
 | `HAL_GAZE_SWEEP_COOLDOWN_LOST_S` | 120 | Giữa hai pha quét khi chưa có bearing nào. |
+| `HAL_GAZE_BEARING_MIN_FACING_RATIO` | 0.4 | Tỉ lệ mẫu nhìn về đèn cần có để nhận một bearing mới. Thấp hơn mức 0.6 của cổng wake: một user ngồi yên đo được 50%. Không phải 0.3: cửa sổ chỉ có 2–3 mẫu, nên 0.3 nghĩa là chỉ cần liếc một cái. |
+| `HAL_GAZE_BEARING_MAX_YAW_DEG` | 25 | Góc yaw của đầu được tính là nhìn về đèn khi nhận bearing mới. Giới hạn riêng, không bao giờ nới ở mép khung, nên việc chỉnh cổng wake không làm nó lỏng ra. |
+| `HAL_GAZE_BEARING_MIN_FACE_HEIGHT_FRAC` | 0.15 | Chiều cao mặt (so với chiều cao khung) được tính là đủ gần để đang ngồi ở bàn, cho mọi đường kiểm tra user. Bộ chọn mặt của gaze cũng bỏ hẳn mọi mặt nhỏ hơn (#567), nên nó cũng chặn phiếu bầu của gaze wake và các mẫu pan. Đo trong các frame: đồng nghiệp trong văn phòng 8.3–13.6%, user 19.2–46%. Đèn đặt xa user hơn có thể cần hạ giá trị này trong `.env`. |
 
 ### Bearing người dùng đã ghi nhớ
 
@@ -957,9 +1088,13 @@ chạy được, hoặc bị bỏ; nó không còn phai dần vào vùng xám v�
 
 Các lần nhìn thấy đi vào đây theo hai đường:
 
-- **Từ một lần look aim**, khi đối tượng kết thúc trong phạm vi **2%** quanh tâm khung — chặt hơn cả
-  dung sai căn khung của chính pha ngắm, và cố ý như vậy: ở tâm khung thì vị trí servo **chính là**
-  bearing, không có phép quy đổi pixel→góc nào và do đó không phụ thuộc vào hằng số FOV đang tranh cãi.
+- **Từ một lần look aim**, chỉ với một cái mặt qua được kiểm tra user chặt (#545): cao ít nhất 15%
+  khung hình, nằm trong 25% quanh tâm khung, và nhìn về đèn (yaw ≤ 25°) trong 40% số mẫu của khoảng
+  1.5 s. Bearing được
+  tính lại bằng `yaw + dx × scale` trong giới hạn `HAL_BEARING_SAMPLE_MAX_DX_FRAC` (0.25) của bộ lấy
+  mẫu, trên một thread nền (`_record_bearing_worker`) để việc chụp không bao giờ phải chờ, và bị bỏ nếu
+  đầu đã cử động trong lúc đó. Trước đây nó ghi lại bất kỳ box nào ở giữa khung, và thân của một đồng
+  nghiệp nằm giữa khung đã dạy sai bearing.
 - **Từ bộ lấy mẫu thụ động** (`bearing_sampler.py`), mỗi `HAL_BEARING_SAMPLE_INTERVAL_S` (300 s).
   Đường chỉ-qua-aim ghi được khoảng hai lần nhìn thấy một ngày, quá chậm để dựng nên một ước lượng mà
   pha ngắm chịu dùng — độ tin cậy lớn lên theo số lần nhìn thấy, và với nhịp đó một máy mới toanh mất
@@ -972,7 +1107,11 @@ Các lần nhìn thấy đi vào đây theo hai đường:
 Bộ lấy mẫu thà từ chối còn hơn đoán. Độ lệch ngang chỉ được chấp nhận tới
 `HAL_BEARING_SAMPLE_MAX_DX_FRAC` (0.25), vì phép hiệu chỉnh đó dựa vào đúng cái hằng số FOV mà aim
 sinh ra để khỏi phải tin. Nó cũng bỏ qua khi thân đang aim hoặc đang bám, khi camera bị tắt, và lấy
-khóa bộ phát hiện theo kiểu không chặn để câu hỏi của người dùng không bao giờ phải chờ nó.
+khóa bộ phát hiện theo kiểu không chặn để câu hỏi của người dùng không bao giờ phải chờ nó. Một cái
+mặt phải cao ít nhất `HAL_GAZE_BEARING_MIN_FACE_HEIGHT_FRAC` (15%) khung hình, cùng ngưỡng với mọi
+đường bearing khác (#545). Trước đây nó dùng `HAL_LOOK_AIM_MIN_FACE_HEIGHT_FRAC` (8%) của look-aim, nên
+một đồng nghiệp ở giữa khung với kích thước 8–15% có thể dạy sai bearing. Không có kiểm tra nhìn về
+đèn: nó chỉ lấy một frame, và user đang làm việc với màn hình của mình vẫn phải được học.
 
 **Nó chỉ học từ `face`, không bao giờ từ box `person`.** Box person cho biết một thân người ở đâu, mà
 thân người thì lấp đầy khung mỗi khi camera tình cờ chĩa thấp — nên học từ nó là ghi nhớ đúng cái tư
@@ -1035,7 +1174,8 @@ Không có gì trên thiết bị này quan sát được điều đó một cá
 
 Nên nó được **suy ra từ các dự đoán sai**: khi ưu tiên 3 của pha ngắm quay tới bearing đã ghi nhớ mà
 không thấy ai, đó là một lần trượt. `PREDICTION_MISS_LIMIT` lần trượt sẽ hủy ước lượng, và nó tự dựng
-lại từ các lần nhìn thấy mới.
+lại từ các lần nhìn thấy mới. Look-aim chấm một lần quay tới bearing là trúng chỉ khi thấy một mặt gần,
+là trượt khi không thấy gì, và không chấm khi chỉ thấy thân người (#545).
 
 Ba lớp bảo vệ giúp sinh hoạt bình thường không bị hiểu nhầm thành dời chỗ:
 
@@ -1078,3 +1218,16 @@ curl -X POST 127.0.0.1:5001/servo/bearing/reset
 Lệnh đặt lại cũng được nối với giọng nói qua `skills/servo-control` — *"tôi đã dời bạn đi"*, *"bạn
 đang ở chỗ mới"*. Việc phát hiện tự động cần vài lần thất bại mới hành động, điều đó đúng để tránh báo
 động giả nhưng chậm khi người dùng vốn đã BIẾT là lamp bị dời.
+
+## Trở lại idle từ hold qua servo-control
+
+Skill `servo-control` phân biệt trạng thái chuyển động với hướng nhìn. Trong ngữ
+cảnh tư thế/hold đã rõ, “back to normal” hoặc “turn to normal position” chọn
+`/servo/resume`: thoát hold và tiếp tục idle, vẫn giữ lực motor. “Look straight
+ahead” chỉ chọn `/servo/aim` với `center`, giữ trạng thái hold. Nếu yêu cầu rõ cả
+hai, phát aim center rồi resume. “Stay still” hoặc “don't resume” được ưu tiên;
+quay về giữa nhưng đứng yên thì phát aim center rồi hold. “Back to normal” trong
+tác vụ không liên quan không kích hoạt servo; nếu chưa rõ trạng thái thân máy,
+đọc `GET /servo` (`motion_mode`). `/servo/play` với `idle` không xóa hold, còn
+`/servo/release` tắt lực motor thay vì trở lại idle. Chỉ đổi hướng dẫn routing
+của skill, không đổi hành vi HAL.

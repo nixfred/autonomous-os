@@ -1,15 +1,11 @@
-"""Servo route handlers — all /servo/* endpoints.
-
-Thin delegates: each handler validates the HTTP request, then calls one method
-on state.animation_service (which satisfies the MotionService protocol from
-hal/drivers/motors/base.py). No driver internals (.robot, .bus, .bus_lock,
-raw encoder values) leak into this file.
-"""
+"""Servo route handlers (/servo/*): thin delegates to the MotionService on state.animation_service."""
 
 import csv
 import io
+import math
 import os
 import re
+import threading
 import time
 from pathlib import Path
 from typing import Optional
@@ -17,9 +13,13 @@ from typing import Optional
 from fastapi import APIRouter, HTTPException, File, Form, UploadFile
 
 import hal.app_state as state
+from hal.drivers.motors import hold
+from hal.drivers.motors.recording_stability import limit_lean_back
 from hal.safety.policy import min_move_duration
 from hal.models import (
     ServoAimRequest,
+    ServoContactLearnRequest,
+    ServoHoldOwnerRequest,
     ServoDemoResponse,
     ServoSearchRequest,
     ServoSearchResponse,
@@ -45,19 +45,9 @@ router = APIRouter(tags=["Servo"])
 
 
 def _sleep_servo_locked() -> bool:
-    """True for the whole sleep, not just after torque-off.
-
-    Gating on `_sleep_servo_released` alone left the window between the sleepy
-    emotion arriving and the auto-release timer firing wide open: a late
-    /servo/play from the agent would drive the bus while release() was ramping
-    to gravity-rest, so torque got cut mid-pose and the body slammed. Sleep is
-    a terminal state — nothing external touches the servos until a wake
-    emotion clears `_sleeping`. The wake path itself resumes the motion
-    service in-process (see routes/emotion.py), not through these routes, so
-    widening the gate cannot lock the device out of waking."""
+    """True for the whole sleep, not just after torque-off (a late play would slam the body mid-release)."""
     return state._sleeping
 
-# --- Constants ---
 
 _SERVO_JOINT_FIELD_RE = re.compile(r"^[A-Za-z0-9_]+\.pos$")
 _MAX_SERVO_RECORDING_UPLOAD_BYTES = 2 * 1024 * 1024  # 2MB
@@ -89,13 +79,11 @@ def _svc_connected():
     return svc
 
 
-# --- Endpoints ---
-
-
 @router.get("/servo", response_model=ServoStateResponse)
 def get_servo_state():
     """Get available recordings and current animation state."""
     svc = _svc()
+    hold.release_stale_scene_hold(svc)
     return {
         "available_recordings": svc.get_available_recordings(),
         "current": svc._current_recording,
@@ -201,18 +189,14 @@ async def upload_servo_recording(
 
 @router.post("/servo/play", response_model=ServoPlayResponse, response_model_exclude_none=True)
 def play_recording(req: ServoRequest):
-    """Play a pre-recorded servo animation by name.
-
-    Both refusals answer "ignored", not "ok": the caller must be able to tell a
-    body that moved from one that did not.
-    """
+    """Play a pre-recorded servo animation by name ("ignored" when refused)."""
     state.logger.debug("POST /servo/play recording=%s", req.recording)
     if _sleep_servo_locked():
         state.logger.info("servo/play ignored -- device is sleeping")
         return {"status": "ignored", "reason": "sleeping"}
     svc = _svc()
+    hold.release_stale_scene_hold(svc)
     if svc.is_suppressed:
-        # INFO, not DEBUG: at the default log level this refusal left no trace.
         state.logger.info("servo/play ignored -- %s mode active", svc.motion_mode)
         return {"status": "ignored", "reason": svc.motion_mode}
     svc.ensure_running()
@@ -227,7 +211,7 @@ def resume_servos():
     """Exit zero-hold mode and resume normal animation loop (plays idle)."""
     if _sleep_servo_locked():
         state.logger.info("servo/resume blocked -- device is sleeping")
-        return {"status": "ok"}
+        raise HTTPException(409, "Device is sleeping; motion was not started")
     svc = _svc()
     svc.resume()
     return {"status": "ok"}
@@ -237,7 +221,68 @@ def resume_servos():
 def hold_servos():
     """Hold current pose -- suppress idle/ambient animations, torque stays ON."""
     svc = _svc()
+    # Claim first: a claim on an unheld body drops owners left over from before a resume.
+    hold.claim(svc, hold.EXPLICIT)
     svc.hold(explicit=True)
+    return {"status": "ok"}
+
+
+# A look hold os-server never releases (it died mid-look) must not freeze the arm.
+LOOK_HOLD_MAX_S = 30.0
+_look_hold_timer: Optional[threading.Timer] = None
+
+
+def _release_look(svc) -> bool:
+    """Drop the look owner's hold and hand the arm back to idle. True if held.
+
+    Replays a still emotion's parked resume; otherwise covers a search/tracking hand-back
+    that skipped idle while look held. A listening-halted body stays still.
+    """
+    if not hold.release(svc, hold.LOOK):
+        return False
+    if not _sleep_servo_locked():
+        from hal.routes.emotion import resume_deferred_still_idle
+
+        if not resume_deferred_still_idle(svc):
+            halt = getattr(svc, "_halt", None)
+            if halt is None or not halt.is_set():
+                from hal.drivers.tracking import body
+
+                body.release_to_idle("look hold released")
+    return True
+
+
+def _expire_look_hold(svc) -> None:
+    if _release_look(svc):
+        state.logger.warning("servo hold: look hold expired after %.0fs without a release", LOOK_HOLD_MAX_S)
+
+
+@router.post("/servo/hold/claim", response_model=StatusResponse)
+def claim_hold(req: ServoHoldOwnerRequest):
+    """Hold the current pose for an internal owner (os-server's look). Agents use /servo/hold."""
+    global _look_hold_timer
+    svc = _svc()
+    hold.claim(svc, req.owner)
+    if _look_hold_timer is not None:
+        _look_hold_timer.cancel()
+    _look_hold_timer = threading.Timer(LOOK_HOLD_MAX_S, _expire_look_hold, args=(svc,))
+    _look_hold_timer.daemon = True
+    _look_hold_timer.start()
+    state.logger.info("servo hold claimed by %s", req.owner)
+    return {"status": "ok"}
+
+
+@router.post("/servo/hold/release", response_model=StatusResponse)
+def release_hold(req: ServoHoldOwnerRequest):
+    """Drop one internal owner's hold. Other owners (a user's explicit hold) keep the arm."""
+    global _look_hold_timer
+    if _look_hold_timer is not None:
+        _look_hold_timer.cancel()
+        _look_hold_timer = None
+    svc = _svc()
+    released = _release_look(svc)
+    state.logger.info("servo hold release by %s: released=%s, still held by %s",
+                      req.owner, released, hold.holder(svc))
     return {"status": "ok"}
 
 
@@ -246,7 +291,7 @@ def move_servo(req: ServoMoveRequest):
     """Send joint positions to servo motors with smooth interpolation."""
     if _sleep_servo_locked():
         state.logger.info("servo/move blocked -- device is sleeping")
-        return {"status": "ok", "requested": req.positions, "clamped": req.positions, "duration": req.duration}
+        raise HTTPException(409, "Device is sleeping; motion was not started")
     svc = _svc_connected()
     valid_joints = svc.get_joint_names()
     unknown = [j for j in req.positions if j not in valid_joints]
@@ -255,39 +300,60 @@ def move_servo(req: ServoMoveRequest):
             400, f"Unknown joints: {unknown}. Valid: {sorted(valid_joints)}"
         )
 
-    # Safety gate (SAFETY.md motion.max_speed) — stretch the duration so no
-    # joint exceeds the ceiling. Best-effort read of current pose.
+    # Safety gate (SAFETY.md motion.max_speed): stretch the duration so no joint exceeds the ceiling;
+    # a declared speed bound requires a known pose.
     current = {}
     try:
         current = svc.get_positions()
     except Exception as e:
         state.logger.warning("move: could not read current pose for speed clamp: %s", e)
-    eff_duration = min_move_duration(state.safety_policy, req.positions, current, req.duration)
+    policy = state.safety_policy
+    if policy and policy.motion and policy.motion.max_speed is not None:
+        try:
+            known_pose = all(math.isfinite(float(current[joint])) for joint in req.positions)
+        except (KeyError, TypeError, ValueError, OverflowError):
+            known_pose = False
+        if not known_pose:
+            raise HTTPException(503, "Cannot enforce motion speed limit without a valid current pose")
+    # Safety gate (SAFETY.md motion.max_cog_offset_mm): an absolute pose that would lean the
+    # lamp back further than recordings may is cut short, the same cap the tracker obeys.
+    target, clamped = req.positions, None
+    if policy and policy.motion and policy.motion.max_cog_offset_mm is not None:
+        target, fraction = limit_lean_back(current, req.positions, policy.motion.max_cog_offset_mm)
+        if fraction < 1.0:
+            clamped = target
+            state.logger.warning("move: cut to %.0f%% — would lean the lamp back past %s mm",
+                                 fraction * 100, policy.motion.max_cog_offset_mm)
+    eff_duration = min_move_duration(policy, target, current, req.duration)
 
     errors = {}
+    actual = {}
 
     try:
-        svc.move_and_hold(req.positions, duration=eff_duration)
+        svc.move_and_hold(target, duration=eff_duration)
     except Exception as e:
         errors["move"] = str(e)
 
     try:
         obs = svc.get_positions()
-        for joint, target in req.positions.items():
-            actual = obs.get(joint)
-            if actual is not None:
-                error = abs(actual - target)
-                if error > 5.0:
-                    errors[joint] = (
-                        f"position error {error:.1f} deg (target={target:.1f}, actual={actual:.1f})"
-                    )
+        for joint, goal in target.items():
+            measured = float(obs[joint])
+            if not math.isfinite(measured):
+                raise ValueError(f"Non-finite position for {joint}")
+            actual[joint] = measured
+            error = abs(measured - goal)
+            if error > 5.0:
+                errors[joint] = (
+                    f"position error {error:.1f} (target={goal:.1f}, actual={measured:.1f})"
+                )
     except Exception as e:
         errors["read_position"] = str(e)
 
     return {
         "status": "error" if "move" in errors else "ok",
         "requested": req.positions,
-        "clamped": req.positions,
+        "clamped": clamped,
+        "actual": actual,
         "duration": eff_duration,
         "errors": errors if errors else None,
     }
@@ -305,10 +371,8 @@ def zero_servos():
 def release_servos():
     """Move servos to idle position then disable torque (safe release)."""
     svc = _svc_connected()
-    # Stop the vision tracker FIRST — it drives the servo bus from its own
-    # worker thread, so if it's live when we cut torque the arm re-engages.
-    # TODO(reachy): tracker_service reaches into .robot/.bus_lock — port to
-    # MotionService accessors when vision tracking goes multi-device.
+    # Stop the tracker first: it drives the bus from its own thread and would re-engage torque.
+    # TODO(reachy): port tracker_service off .robot/.bus_lock to MotionService accessors.
     if state.tracker_service and state.tracker_service.is_tracking:
         try:
             state.logger.info("release: stopping vision tracker before torque-off")
@@ -323,34 +387,43 @@ def release_servos():
 
 @router.post("/servo/stop", response_model=StatusResponse)
 def stop_servos():
-    """Deterministic stop: abort motion in flight and HOLD. Torque stays ON.
-
-    Not /servo/release, which travels to a rest pose and then cuts torque — a
-    stop that moves first is wrong for anything with legs or wheels
-    (ROBOT-SPEC / COMPATIBILITY rule 6). Not safety-gated either: `motion.
-    stop_always` says a stop is never clamped, delayed or refused, so this
-    route reads no bound and takes no arguments.
-    """
-    # Policy execution is currently dry-run only, but the stop relationship is
-    # part of the interface now: the future executor must be cancelled before
-    # the hardware hold is requested.  This call never generates a target.
+    """Deterministic stop: abort motion in flight and hold with torque on (never safety-gated)."""
+    # The future policy executor must be cancelled before the hardware hold.
     if state.policy_service is not None:
         try:
             state.policy_service.stop()
         except Exception as e:
             state.logger.warning("stop: policy cancellation failed: %s", e)
 
-    svc = _svc_connected()
-    # The tracker drives the bus from its own worker thread. Stop it first or it
-    # keeps writing goals and the "stop" holds nothing — same ordering the
-    # release path needs, and for the same reason.
+    # Stop the tracker first, or it keeps writing goals and the stop holds nothing.
     if state.tracker_service and state.tracker_service.is_tracking:
         try:
             state.logger.info("stop: halting vision tracker")
             state.tracker_service.stop()
         except Exception as e:
             state.logger.warning(f"tracker stop during halt failed: {e}")
+    svc = _svc_connected()
     svc.halt()
+    return {"status": "ok"}
+
+
+@router.post("/servo/contact/learn", response_model=StatusResponse)
+def learn_contact_profile(req: ServoContactLearnRequest):
+    """Start the contact stop's learn run in the background; progress is on /health.
+
+    Clear the space around the arm first: whatever it touches is learned as normal.
+    """
+    svc = _svc_connected()
+    learn = getattr(svc, "learn_contact_profile", None)
+    if learn is None:
+        raise HTTPException(409, "This motion driver has no contact profile")
+    recordings = req.recordings or [
+        r for r in svc.get_available_recordings() if not r.startswith("music_")
+    ]
+    try:
+        learn(recordings, req.runs)
+    except RuntimeError as e:
+        raise HTTPException(409, str(e))
     return {"status": "ok"}
 
 
@@ -382,11 +455,30 @@ def list_aim_directions():
     return {"directions": list(AIM_PRESETS.keys())}
 
 
+def _pose_reply(svc, direction: str, requested: dict[str, float]) -> dict:
+    """Report driver positions separately from the requested command target."""
+    positions = {}
+    errors = {}
+    try:
+        observed = svc.get_positions()
+        for joint in requested:
+            value = float(observed[joint])
+            if not math.isfinite(value):
+                raise ValueError(f"Non-finite position for {joint}")
+            positions[joint] = value
+    except Exception as exc:
+        errors["read_position"] = str(exc)
+    return {"status": "ok", "direction": direction, "requested": requested,
+            "positions": positions, "errors": errors or None}
+
+
 @router.post("/servo/aim", response_model=ServoAimResponse)
 def aim_servo(req: ServoAimRequest):
     """Aim the device head to a named direction."""
     if _sleep_servo_locked():
-        return {"status": "ok", "direction": req.direction, "positions": {}}
+        raise HTTPException(409, "Device is sleeping; motion was not started")
+    # An aim owns the body: a still emotion's pending idle resume must not swing it back.
+    state.cancel_still_idle_timer()
     svc = _svc_connected()
     try:
         current = svc.get_positions()
@@ -394,7 +486,7 @@ def aim_servo(req: ServoAimRequest):
         raise HTTPException(500, f"Failed to read current position: {e}")
     try:
         positions = svc.aim(req.direction, req.duration, current, state.safety_policy)
-        return {"status": "ok", "direction": req.direction, "positions": positions}
+        return _pose_reply(svc, req.direction, positions)
     except ValueError as e:
         raise HTTPException(400, str(e))
     except Exception as e:
@@ -403,24 +495,9 @@ def aim_servo(req: ServoAimRequest):
 
 @router.post("/servo/search", response_model=ServoSearchResponse)
 def search_for_user(req: Optional[ServoSearchRequest] = None):
-    """Sweep for a subject and report what was found, with a frame to show.
-
-    Deliberately NOT what the look-aim does. The aim runs inside a live turn
-    under a deadline; this takes seconds, so it is only entered when the user
-    asked for it ("where are you?", "find my cup") or accepted an offer after a
-    failed look.
-
-    Seeded from the remembered bearing and expanding outward, so the likely
-    place is checked first.
-
-    Meant to be called with curl DURING a turn, not from a [HW:...] marker:
-    markers fire after the reply is already written, so a marker-driven search
-    can never speak its own result. The response body is the answer, and
-    `image_path` is what the user is shown.
-    """
+    """Sweep for a subject (seeded from the remembered bearing) and report it with a frame."""
     from hal.drivers.tracking.search import search_for_subject
 
-    # An empty body is the common case — every existing caller sends nothing.
     req = req or ServoSearchRequest()
     res = search_for_subject(target=req.target, exhaustive=req.exhaustive)
     where = (f" at yaw {res.found_at_yaw:+.0f}"
@@ -443,22 +520,13 @@ def search_for_user(req: Optional[ServoSearchRequest] = None):
 
 @router.post("/servo/demo", response_model=ServoDemoResponse)
 def range_demo_route():
-    """Perform a narrated tour of the movement range.
-
-    A DEMO, not a search: nothing is detected and nothing is reported. It exists
-    because "show me how far you can move" used to land on the `scan` emotion — a
-    54 deg canned recording narrated as a full turn — for want of anywhere else
-    to go.
-
-    Returns as soon as the demo starts. The performance runs on its own thread
-    and speaks for itself through the filler pools, so the agent's five-second
-    marker budget is never in play.
-    """
+    """Perform a narrated tour of the movement range (demo only; returns once started)."""
     if _sleep_servo_locked():
         state.logger.info("servo/demo ignored -- device is sleeping")
         return {"status": "ok", "started": False, "waypoints": 0,
                 "reason": "sleeping"}
     svc = _svc_connected()
+    hold.release_stale_scene_hold(svc)
     if svc.is_suppressed:
         state.logger.info("servo/demo ignored -- %s mode active", svc.motion_mode)
         return {"status": "ok", "started": False, "waypoints": 0,
@@ -471,18 +539,12 @@ def range_demo_route():
 
 @router.get("/servo/bearing")
 def get_user_bearing():
-    """Inspect the remembered user bearing.
-
-    Exists so the estimate can be checked without SSH-ing to the device. The
-    thing to look for is `bearing_deg` settling near where the user actually
-    sits — an estimate mirrored about zero means the yaw sign is inverted, which
-    is silent otherwise because this value is open-loop.
-    """
+    """Inspect the remembered user bearing."""
     from hal.drivers.tracking import user_bearing
 
     est = user_bearing.read_estimate()
     if est is None:
-        # None, not 0.0 — dead ahead is a real bearing, "unknown" must differ.
+        # None, not 0.0: dead ahead is a real bearing.
         return {"status": "ok", "known": False}
     return {
         "status": "ok",
@@ -491,21 +553,13 @@ def get_user_bearing():
         "confidence": est.confidence,
         "samples": est.samples,
         "age_s": round(est.age_s, 1),
-        # The full remembered posture. An empty pose on a known bearing means
-        # the estimate predates the pose schema and has not been re-sighted yet,
-        # so a search will restore direction but not head height.
         "pose": est.pose,
     }
 
 
 @router.post("/servo/bearing/reset", response_model=StatusResponse)
 def reset_user_bearing():
-    """Forget where the user usually is — "I moved you".
-
-    The escape hatch for a relocated lamp. Automatic detection needs several
-    failed predictions before it acts, which is right for avoiding false
-    positives but slow when the user already KNOWS the lamp moved.
-    """
+    """Forget where the user usually is ("I moved you")."""
     from hal.drivers.tracking import user_bearing
 
     user_bearing.clear()
@@ -516,12 +570,12 @@ def reset_user_bearing():
 def nudge_servo(req: ServoNudgeRequest):
     """Move servo by relative degrees from current position."""
     if _sleep_servo_locked():
-        return {"status": "ok", "direction": f"nudge yaw={req.yaw} pitch={req.pitch}", "positions": {}}
+        raise HTTPException(409, "Device is sleeping; motion was not started")
     svc = _svc_connected()
     try:
         current = svc.get_positions()
         positions = svc.nudge(req.yaw, req.pitch, req.duration, current, state.safety_policy)
-        return {"status": "ok", "direction": f"nudge yaw={req.yaw} pitch={req.pitch}", "positions": positions}
+        return _pose_reply(svc, f"nudge yaw={req.yaw} pitch={req.pitch}", positions)
     except Exception as e:
         raise HTTPException(500, f"Servo nudge failed: {e}")
 
@@ -531,7 +585,7 @@ def start_tracking(req: ServoTrackRequest):
     """Start tracking an object by bounding box. Servo follows the object in real-time."""
     if _sleep_servo_locked():
         state.logger.info("servo/track blocked -- device is sleeping")
-        return {"status": "ok", "tracking": False, "target": None, "bbox": None, "confidence": None}
+        raise HTTPException(409, "Device is sleeping; tracking was not started")
     if not state.tracker_service:
         raise HTTPException(503, "Tracker service not available")
     if not state.animation_service:
@@ -540,14 +594,13 @@ def start_tracking(req: ServoTrackRequest):
         raise HTTPException(503, "Camera not available")
 
     bbox = tuple(req.bbox) if req.bbox else None
-    # TODO(reachy): tracker_service receives animation_service and reaches into
-    # .robot/.bus_lock internally — port to MotionService accessors when vision
-    # tracking goes multi-device.
+    # TODO(reachy): port tracker_service off .robot/.bus_lock to MotionService accessors.
     ok = state.tracker_service.start(
         bbox=bbox,
         target_label=req.target,
         camera_capture=state.camera_capture,
         animation_service=state.animation_service,
+        max_duration_s=req.max_duration_s,
     )
     if not ok:
         raise HTTPException(400, state.tracker_service.last_error or "Failed to initialize tracker")

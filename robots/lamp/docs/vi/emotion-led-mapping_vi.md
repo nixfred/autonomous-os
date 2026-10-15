@@ -7,12 +7,12 @@ Nguồn: màu trong bảng là màu **lamp** thực sự hiển thị — `robot
 | `curious` | 0, 3, 3 | `#000303` cyan dịu | overlay | candle | 0.3 | curious |
 | `happy` | 3, 3, 0 | `#030300` vàng dịu | overlay | candle | 0.2 | happy_wiggle |
 | `sad` | 0, 1, 3 | `#000103` xanh dương dịu | overlay | breathing | 0.4 | sad |
-| `thinking` | 2, 0, 3 | `#020003` tím violet dịu | overlay | pulse | 0.3 | thinking_deep |
+| `thinking` | 2, 0, 3 | `#020003` tím violet dịu | overlay | pulse | 0.3 | — (xem ghi chú) |
 | `idle` | 1, 2, 3 | `#010203` xanh steel dịu | overlay | breathing | 0.2 | idle |
 | `excited` | 3, 1, 0 | `#030100` cam dịu | overlay | candle | 0.5 | excited |
 | `shy` | 3, 0, 1 | `#030001` hồng rose dịu | overlay | breathing | 0.3 | shy |
 | `shock` | 2, 2, 2 | `#020202` trắng dịu | overlay | notification_flash | 1.0 | shock |
-| `listening` | 0, 0, 3 | `#000003` xanh dương dịu | overlay | breathing_fine (mở ở đỉnh) | 1.2 | — (xem ghi chú) |
+| `listening` | 0, 0, 3 | `#000003` xanh dương dịu | overlay | breathing_fine (mở ở đỉnh) | 0.3 (base 1.2) | — (xem ghi chú) |
 | `laugh` | 2, 3, 0 | `#020300` xanh chanh dịu | overlay | candle | 0.2 | laugh |
 | `confused` | 3, 2, 0 | `#030200` amber dịu | overlay | candle | 0.2 | confused |
 | `sleepy` | 0, 0, 0 | `#000000` đen (tắt) | base | solid | — | sleepy |
@@ -87,7 +87,7 @@ Ghi chú kỹ thuật:
 
   `speaking_wave_rainbow` cũng tự sinh hue nên lấy đúng `brightness` của `music_strong`, envelope VU chạy dưới mức đó. Route nhạc không tự phát emotion `music_strong` — agent phát.
 - **Bảng này nằm trong `robots/lamp/presets.json`**, overlay riêng cho device, merge từng field lúc boot qua `hal/board/presets_overlay.py` — `hal/presets.py` *không* bị sửa. Nên các robot khác (reachy, intern) vẫn giữ palette gốc, và muốn trả lamp về palette gốc thì chỉ cần xoá section `emotion` trong file JSON đó.
-- **Đừng nhầm `EMO_IDLE` với `AMBIENT_RESTING_LED`.** Cái sau là `[0, 0, 0]` (quyết định sản phẩm 30/07/2026: strip lúc nghỉ thì tắt hẳn); `EMO_IDLE` là một emotion agent chủ động phát ra và vẫn có màu.
+- **Đừng nhầm `EMO_IDLE` với `AMBIENT_RESTING_LED`.** Cái sau lấy từ `presets.json` → `ambient_led.resting` (Lamp: sáng đều `[1, 1, 1]`); `EMO_IDLE` là một emotion agent chủ động phát ra và vẫn có màu.
 
 ### `listening` mở màn ở đỉnh nhịp thở
 
@@ -105,15 +105,18 @@ Mở màn ở đỉnh chữa được độ trễ nhưng lòi ra thứ nằm dư
 
 Nên `listening` chạy `breathing_fine` (`hal/drivers/rgb/effects.py`): nhịp thở đi giữa `color` và một nấc dưới nó, còn phần lẻ ở giữa được thể hiện bằng cách nâng MỘT SỐ trong 32 pixel, rải theo bước nguyên tố cùng nhau với số pixel để strip đọc thành một vòng ở mức trung gian chứ không thành một cung sáng. Mắt gộp cả ring lại nên cue có thêm ~32 nấc nhỏ mỗi đơn vị. Peak không đổi, hue không đổi (kênh đang 0 thì vẫn 0), và không pixel nào tối — độ phân giải lấy từ 32 pixel thay vì từ 8 bit màu.
 
-## `listening` không có servo
+## `thinking` và `listening` không có servo
 
-Đây là preset duy nhất để `"servo": None` — chỉ LED, đèn đứng yên. `listening` chạy đúng lúc user đang nói, tiếng servo cộng rung thân máy lọt thẳng vào mic và làm bẩn STT.
+Cả hai đều để `"servo": None` — chỉ LED, đèn đứng yên:
 
-`thinking` thì **có** servo (`thinking_deep`), nhưng vẫn là ca đặc biệt ở phía LED: hook emotion-ack bắn nó ở **mỗi** message preprocessed, nên LED của nó nằm sau `_BACKGROUND_EMOTIONS` guard trong `hal/app_state.py` để cả cuộc hội thoại không bị sơn xanh lá liên tục.
+- `listening` chạy đúng lúc user đang nói; tiếng servo cộng rung thân máy lọt thẳng vào mic và làm bẩn STT.
+- `thinking` được hook emotion-ack bắn ở **mỗi** message preprocessed, nên có servo nghĩa là thân máy cựa quậy suốt cả cuộc hội thoại. Nó còn làm camera di chuyển: `thinking_deep.csv` quét wrist_pitch 34° và wrist_roll 32°, mà camera nằm trong đầu — nên khi tool `look` của realtime bắn (nó bắn trong lượt của model, tức là lúc `thinking` đang hiển thị) user phải đuổi theo một camera vừa di chuyển vừa xoay để giữ vật trong khung. Cũng vì hook đó mà LED của nó nằm sau `_BACKGROUND_EMOTIONS` guard trong `hal/app_state.py`, để cả cuộc hội thoại không bị sơn xanh lá liên tục.
+
+Trên lamp, `thinking` nhận `"servo": null` từ `robots/lamp/presets.json`; preset base trong `hal/presets.py` vẫn map nó tới `thinking_deep` cho thân máy nào muốn dùng.
 
 Trên lamp, `stretching` nhận `"servo": "idle"` từ cùng overlay. Emotion vẫn thực hiện đầy đủ transition thức dậy (xoá trạng thái sleep và khôi phục camera/audio), nhưng cú tap đánh thức Lamp giờ bắt đầu recording idle thay vì chuyển động stretching. Các loại robot khác vẫn giữ recording `stretching` mặc định.
 
-`listening.csv` vẫn giữ trong `hal/recordings/` dù không emotion nào map tới: `/servo/play` vẫn gọi tay được, và Reachy vẫn map nó (`hal/drivers/motors/reachy_service.py`).
+`listening.csv` và `thinking_deep.csv` vẫn giữ trong `hal/recordings/` dù không emotion nào map tới: `/servo/play` vẫn gọi tay được, và Reachy vẫn map chúng (`hal/drivers/motors/reachy_service.py`).
 
 Đường code chịu `servo: None` bình thường — `hal/routes/emotion.py` bỏ qua nhánh play và `POST /emotion` trả `"servo": null`, còn `listening` không schedule LED restore nào cả.
 
@@ -126,7 +129,7 @@ Nên với emotion `servo: None` (hôm nay chỉ có `listening`), route gọi `
 Hai chốt chặn kèm theo:
 
 - **Music được miễn**: đang phát nhạc thì groove quan trọng hơn, cue listening không được dừng nhảy.
-- **Auto-resume idle sau 10s** (`STILL_IDLE_RESUME_SECONDS` trong `hal/routes/emotion.py`): nếu turn không sinh ra emotion nào (LLM lỗi, im lặng sau partial đầu), body tự trở lại idle thay vì đứng chết ở tư thế dở. Bất kỳ `POST /emotion` nào cũng huỷ timer này. Safety net 8s của `voice_service` chỉ dọn LED, không đụng servo — nên timer này là thứ duy nhất lo phần thân.
+- **Auto-resume idle sau 10s** (`STILL_IDLE_RESUME_SECONDS` trong `hal/routes/emotion.py`): nếu turn không sinh ra emotion nào (LLM lỗi, im lặng sau partial đầu), body tự trở lại idle thay vì đứng chết ở tư thế dở. Bất kỳ `POST /emotion` và `POST /servo/aim` nào cũng huỷ timer này. Khi timer chạy lúc có servo hold nào đang hoạt động (`explicit`, `scene`, `tracking`, `look`), nó không di chuyển body: nó ghi log `idle resume deferred -- servo held by <owner>` và hoãn việc resume, việc này sẽ chạy khi hold `look` được nhả, nhưng chỉ khi `look` là chủ sở hữu cuối cùng (resume bị hoãn dưới `explicit`, `scene` hoặc `tracking` sẽ bị bỏ ở lần nhả look kế tiếp; `/servo/resume` hoặc đường xử lý của chính owner đó sẽ khởi động lại idle) (xem `led-control.md`, "Hold ownership"). Nó không bao giờ nhả hold. Safety net 8s của `voice_service` chỉ dọn LED, không đụng servo — nên timer này là thứ duy nhất lo phần thân.
 - **Clear thinking khi câu trả lời nói xong** (`_clear_thinking_after_reply` trong `hal/app_state.py`, gọi từ `_on_tts_speak_end`): phần chờ kết thúc khi máy ngừng nói, nên đó là lúc tắt mặt `thinking` — không phải chờ agent nhả emotion marker. Có gate `tts_service.realtime_feedback` (cờ chỉ reply của runtime mới set), nên filler và system notice phát *trong lúc* chờ không kết thúc cue.
 - **Auto-reset thinking sau 25s** (`HAL_EMOTION_THINKING_RESET_S`, `0` = tắt) — lưới cho các turn không hề nói. `thinking` là mặt duy nhất không có ai tự tắt — nó được bật khi bắt đầu chờ và bị thay bởi emotion mà câu trả lời express, nên turn chết trước khi express (realtime exception, delegate mà agent trả lời không kèm marker) để nó cháy mãi, không có input người dùng thì không thoát ra được. Sau ngần ấy giây thinking LIÊN TỤC, route bỏ `_thinking_cue_active`, express `idle` và restore LED user state. Bất kỳ emotion nào khác huỷ timer; `thinking` mới arm lại. Con số này là đo, không phải đoán: trên máy, realtime clear cue trong 0.4-8.6s và turn delegate chạy 6-22s.
 

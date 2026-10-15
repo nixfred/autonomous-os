@@ -14,6 +14,22 @@ All tracking code lives in the `hal/drivers/tracking/` package:
 | `filters.py` | `AlphaBetaFilter2D`, `PID`, `smooth_damp`, `soft_deadband` |
 | `frame_utils.py` | `downscale`, `scale_bbox` (coordinate mapping) |
 
+### Overlapping camera freeze ownership
+
+Snapshots (`capture_still`), sensing captures and tracker initialization share a
+per-motion-service freeze lease (`hal/drivers/motors/freeze_lease.py`). The first
+consumer freezes motion; only the last consumer to exit unfreezes it. Exceptions
+and early returns release that caller's lease, including camera consumer setup
+or cleanup errors. A failed freeze acquires no lease; snapshots retain their
+existing best-effort capture behavior when freezing fails.
+
+Only ownership transitions are locked. Frame acquisition, settle waits and
+object detection can overlap; no extra timer, sleep or network call is added.
+Existing settle/timeout settings remain unchanged. New camera callers must use
+the shared lease instead of calling driver `freeze()` / `unfreeze()` directly.
+This coordinates the existing freeze mechanism; it does not change driver motion
+policies or introduce a global motion choreographer.
+
 ## Voice intent routing
 
 Unmatched voice requests can use the OS Jev fallback to select `servo_track`
@@ -61,9 +77,10 @@ The camera runs **1280×720**. Every heavy vision component — the ViT tracker 
 |------|----------|------|--------------|
 | 0 | **YuNet** face detector (`face_detection_yunet_2023mar.onnx`) | target ∈ {`face`, `human face`, `khuôn mặt`, `mặt`} | ~30 ms |
 | 1 | **Local YOLOv8n** (COCO classes, `yolov8n.pt`, imgsz=448) | target maps to a COCO class | ~310–530 ms, median ~360 ms (measured on lamp-0c89, 1280x720 input) |
-| 2 | **Remote YOLOWorld** open-vocab (`{DL_BACKEND_URL}/detect/yoloworld`) | non-COCO target, or local miss (fallback) | **~0.55 s median** (334 ms min, 1.1 s p90, 2.0 s max; n=49 on lamp-0c89) |
+| 2 | **Remote YOLOWorld** open-vocab (`{DL_BACKEND_URL}/detect/yoloworld`) | non-COCO target, or local miss (fallback); never `person`/`people`/`human` or a face alias | **~0.55 s median** (334 ms min, 1.1 s p90, 2.0 s max; n=49 on lamp-0c89) |
 
 - COCO has no hand/face class, so `hand`/`face` intentionally fall through to YuNet/YOLOWorld instead of mapping to `person` (which locked onto the whole body).
+- **People and faces never go remote.** `person`/`people`/`human` and the face aliases stay on YuNet and local YOLOv8n; a local miss (or missing local weights) returns no box. The lamp looks for people on its own (gaze look-around, bearing samples), so a fallback here would upload frames of the room nobody asked for.
 - On a local-YOLO miss the code falls back to remote YOLOWorld, **throttled** to at most one attempt per `REMOTE_FALLBACK_MIN_INTERVAL` (2.0 s) so a genuinely unseeable target doesn't hit remote every redetect.
 - **The fallback is off for routine redetects** (`allow_remote_fallback=False`, passed by the loop's background scan). Once a COCO target is locked, a local miss is ordinary — the object turned, one blurred frame — and the detect thread is single-flight, so a remote round-trip stretches a ~0.5 s confirm cycle to ~3 s, trips the trust gate and parks the servo with the object still in frame. Local is the authority for a class it was trained on; the next redetect confirms. Seeding and post-loss recovery (`_do_retry`) still allow remote, and an open-vocab target is unaffected — with no local path there is nothing to fall back from.
 - Detection quality filters: confidence ≥ `DETECT_MIN_CONFIDENCE` (0.15), area between `DETECT_MIN_AREA_RATIO` (0.3%) and `DETECT_MAX_AREA_RATIO` (80%) of frame.
@@ -88,12 +105,14 @@ Weights are checked into the repo (`hal/drivers/tracking/models/`) so deploy is 
 
 Tracking drives 4 joints:
 
-- **base_yaw** (ID 1) — left/right pan (100 % of yaw)
-- **base_pitch** (ID 2) — up/down tilt, 10 % of pitch
-- **elbow_pitch** (ID 3) — up/down tilt, 90 % of pitch
-- **wrist_pitch** (ID 5) — up/down tilt, 0 %
+- **base_yaw** (ID 1) — left/right pan (100 % of yaw in object tracking; `ServoFollower.apply` writes yaw to `base_yaw` only)
+- **base_pitch** (ID 2) — up/down tilt, 20 % of pitch
+- **elbow_pitch** (ID 3) — up/down tilt, 60 % of pitch
+- **wrist_pitch** (ID 5) — up/down tilt, 20 % of pitch
 
-Pitch is concentrated on the elbow (`PITCH_WEIGHT_ELBOW = 0.90`). Empirically only pure-rotation joints move the object toward center; base/wrist mostly translate the camera (kinematic coupling), so their weights are low/zero. The elbow motor's positive direction was reversed in hardware, so its contribution carries `ELBOW_PITCH_SIGN = -1.0`.
+Pitch leads with the elbow (`PITCH_WEIGHT_BASE/ELBOW/WRIST = 0.20 / 0.60 / 0.20`). These are preferences, not hard shares: `servo_follow.distribute_pitch` spends the weights first and hands whatever a saturated joint could not absorb (against the measured `PITCH_TRAVEL_MIN/MAX`) to a joint that still has room. The elbow no longer takes 90 %, because an intermittently unresponsive elbow then swallowed almost every correction. The elbow motor's positive direction was reversed in hardware, so its contribution carries `ELBOW_PITCH_SIGN = -1.0`. Every pitch correction (tracking, gaze, aim) is also capped so the lamp never leans back: `distribute_pitch` scores the target pose with the `urdf_ref` geometry and shrinks the step until the whole-body CoG sits no more than `MAX_LEAN_BACK_MM = 16` mm behind the base axis (idle/listening reach 15.1 mm). A pose already past it may only come forward, and each cut logs `[lean-back]`. A face above the frame (user standing up) used to drive the arm 30–48 mm back and tip the lamp over; now the camera tilts up until the cap and stops. `base_pitch` also never goes below 10° (no designed recording goes below 9.3°), which holds even on a body without geometry.
+
+Gaze panning (not object tracking) spreads yaw across `base_yaw` and `wrist_roll` via `servo_follow.distribute_yaw` with `YAW_WEIGHT_BASE/ROLL = 0.75 / 0.25` — see *Panning, and why it is lazier than pitch* below.
 
 ### Control law (vision loop → servo goal)
 
@@ -162,7 +181,8 @@ pitch_correction = clamp(PID(soft_deadband(dy)) + VFF·vy·deg_per_px·dt,  ±5�
 | `SERVO_COMMAND_MIN_DELTA` | 0.08 | Coalesce only tiny normalized setpoint changes; the final target is sent once |
 | `TRACKING_GOAL_VELOCITY` | 0 (unlimited) | Explicitly written at session start to clear a stale hardware cap; SmoothDamp profiles own the speed envelope (150 steps/s ≈ 13°/s flattened every ease curve into a robotic crawl) |
 | `TRACKING_ACCELERATION` | 30 | Hardware acceleration ramp |
-| `PITCH_WEIGHT_BASE/ELBOW/WRIST` | 0.10 / 0.90 / 0.0 | Pitch distribution across joints |
+| `PITCH_WEIGHT_BASE/ELBOW/WRIST` | 0.20 / 0.60 / 0.20 | Preferred pitch distribution across joints (overflow re-routed by `distribute_pitch`) |
+| `YAW_WEIGHT_BASE/ROLL` | 0.75 / 0.25 | Yaw split for `distribute_yaw` (gaze panning; object tracking drives `base_yaw` only) |
 | `ELBOW_PITCH_SIGN` | -1.0 | Elbow polarity (hardware reversed) |
 | `YOLO_REDETECT_S` | 1.5 | Background re-detect interval |
 | `YOLO_AREA_GATE_MULT` | 4.0 | Reject re-detect area outliers |
@@ -179,7 +199,10 @@ pitch_correction = clamp(PID(soft_deadband(dy)) + VFF·vy·deg_per_px·dt,  ±5�
 
 All knobs live in `hal/drivers/tracking/constants.py`. (The old dead `GIMBAL_*` / `EMA_ALPHA` proportional path was removed in the package split.)
 
-Set `HAL_TRACKING_MAX_DURATION_S` in the Lamp's `/opt/hal/.env` to choose the wall-clock session limit; the installed Lamp default is `10`. Restart the `hal` service after changing it.
+Set `HAL_TRACKING_MAX_DURATION_S` in the Lamp's `/opt/hal/.env` to choose the wall-clock session limit; the installed Lamp default is `10`. Restart the `hal` service after changing it. A `/servo/track` call may pass `max_duration_s` to stop
+sooner (never later than the cap): the sensing skill's greeting look uses `3`, because a lamp that
+locks onto a face for 10 s after saying hello reads as a camera watching, not as a glance of
+recognition.
 
 ### Servo Position Limits
 
@@ -200,7 +223,7 @@ Set `HAL_TRACKING_MAX_DURATION_S` in the Lamp's `/opt/hal/.env` to choose the wa
 | No detector confirm for `STOP_NO_YOLO_S` (20 s) | Stop — ghost tracking |
 | CSRT misses `YOLO_MAX_MISS` (30) after `MAX_TRACKING_RETRIES` (4) | Stop — object gone |
 | Tracking duration > `HAL_TRACKING_MAX_DURATION_S` (10 s by default) | Stop — timeout to save motor/CPU |
-| GPIO-button or TTP223 single-click | Stop — explicit user attention-cancel |
+| GPIO-button or MPR121 single-click (Harness OFF) | Stop — explicit user attention-cancel. TTP223 headpad gestures do **not** stop tracking; they only call `head_pat_action`. |
 
 Note: a large bbox (e.g. a person filling the frame) is **not** a stop condition — PID drives off the centroid, not bbox size, so a close object still tracks. When tracking ends, idle interpolates from the arm's measured current pose instead of first moving through zero — see [Interaction with Other Systems](#interaction-with-other-systems).
 
@@ -212,13 +235,7 @@ Object tracking is driven by remote vision updates from the agent/cloud. When th
 
 All under `/servo/track`.
 
-### GET /servo/track/targets — List suggested targets
-
-```json
-{"targets": ["person", "cup", "bottle", "glass", "phone", "laptop", ...]}
-```
-
-Detection is open-vocabulary via YOLOWorld (and YuNet for faces) — any text works, this list is just suggestions.
+There is no target-list endpoint. Detection is open-vocabulary via YOLOWorld (and YuNet for faces) — any text works as `target` (e.g. `person`, `cup`, `bottle`, `phone`, `laptop`).
 
 ### POST /servo/track — Start tracking
 
@@ -363,7 +380,7 @@ something.
 
 **The body is owned for the whole look.** From the moment the aim starts until the shutter closes,
 `servo_ownership()` takes a refcounted slot in the same `_tracking_active` lock the vision tracker
-uses, which suppresses **all** emotion servo animation (`routes/emotion.py`) and makes the animation
+uses, which suppresses **all** emotion servo animation (`hal/routes/emotion.py`) and makes the animation
 loop drop any recording in progress.
 
 This is not optional polish. Emotion presets play **recorded** poses that are absolute on every
@@ -526,7 +543,9 @@ lamp decides for itself. A sweep is entered when:
   Monitor. The agent waits for the body and answers from it, the way `/api/vision/look` already
   works.
 - they accept an offer after a failed look — *"I can't see it. Want me to look around?"*
-- **the look-aim is about to give up** — before `look_lost` claims *"I can't find you"*, which until
+- **the look-aim is about to give up** — but as a **glance** (`glance=True`, 2 looks at the bearing,
+  no `look_still_searching`), not the full sweep: asked to look and not seeing anyone, a living thing
+  glances about; it does not quarter the room. Before `look_lost` claims *"I can't find you"*, which until
   now it said having only turned toward a remembered bearing. A bearing is a guess about where
   someone *was*, not a search, so the phrase should be earned. The aim's deadline **stops counting**
   for the duration (`t_end += time.monotonic() - swept_at` in `aim_for_look`): that deadline exists so
@@ -534,7 +553,8 @@ lamp decides for itself. A sweep is entered when:
   that, and charging the sweep against a budget it cannot fit in would mean never sweeping at all.
 - **the gaze watcher has been alone too long** — `HAL_GAZE_SWEEP_AFTER_S` (30 s) with nobody seen, or
   a repoint that turned to the bearing and found nobody there. Nobody asked for this one, which is
-  why it is the only entry with a cooldown — see *Looking around on its own*.
+  why it is the only entry with a cooldown and why it is only a **glance**, not this sweep — see
+  *Looking around on its own*.
 
 `POST /servo/search` — sweeps for a subject. Body (all optional): `{"target": "cup", "exhaustive": true}`.
 
@@ -585,7 +605,9 @@ The response is a structured body, not one prose string:
   as a person, and teaching the estimator that a keyboard is where the user sits is how the bearing
   quietly rots.
 - `image_path` is the winning frame, written into the active runtime's `media/hal-snapshots` — the
-  same capped, rotated pool `/camera/snapshot?save=true` uses (`_SNAPSHOT_MAX` = 20). It carries the
+  same capped, rotated pool `/camera/snapshot?save=true` and the realtime `look` frame use
+  (`_SNAPSHOT_MAX` = 20). `app_state.prune_snapshot_dir()` counts the `.jpg` files on disk after each
+  write and deletes the oldest by mtime, so frames from before a HAL restart are removed too. It carries the
   detection box drawn on it, via `look_debug.encode_annotated(..., centre_lines=False)`: the box is
   the answer, while the green/red full-height dx lines are the aim's working and would land on top
   of each other in the middle of a centred frame. The frame and the box always come from the **same**
@@ -600,6 +622,14 @@ bottom, out to the right, and (exhaustive only) over the top. The corners go to 
 **full** pitch rather than cos(45) of each, so a rounded square rather than a circle: that way each
 corner sees as far to the side as the left/right looks and as far down as the bottom look, adding new
 ground instead of re-covering the middle.
+
+**The user look-around rounds the top instead (#545).** `search_for_subject(for_user=True)` (the
+gaze watcher's look-around) walks `USER_LOOK_CIRCLE`: the same six looks with the pitch mirrored,
+so centre, left, round the **top**, out to the right. Faces sit at or above the seated view the sweep
+starts from; the bottom looks point at desks and keyboards. Device-observed 2026-09-30 on green-lamp:
+a standing user whose head was above every look was missed through all 18 looks. Object searches
+(`POST /servo/search`, "find my things") keep the downward ring, where
+things on the desk are. The upward looks share the `WRIST_PITCH_MIN` clamp described below.
 
 **Only `wrist_roll` and `wrist_pitch` move during a look.** The base turns once per bearing and the
 arm never reshapes itself. An earlier design spread the tilt across `base_pitch`, `elbow_pitch` and
@@ -627,6 +657,28 @@ frozen wherever the last look left the head. Aborted → the same: a click means
 attend to me", and the pose an interrupted sweep freezes in is not a resting one — the head can be
 cocked 45° over, facing a wall. Found → the head is straightened by turning the *base* as far as the
 head was turned, so the camera keeps pointing at the subject with the head level.
+
+**When the gaze watcher sweeps, it looks for the user, not for anybody (#545).** `gaze._maybe_sweep`
+calls `search_for_subject(for_user=True, glance=True)`. Every other caller keeps today's behaviour:
+`POST /servo/search` (objects, `exhaustive`); look-aim's fallback is a glance too, but without the
+user check. At each look it
+watches the faces in view for about 1.5 s (`user_check.observe_faces`, 6 frames; it skips the dwell
+when the first frame has no face) and stops only on a face that passes `user_check.adopts_bearing`:
+at least `HAL_GAZE_BEARING_MIN_FACE_HEIGHT_FRAC` (15%) of the frame tall, within
+`HAL_BEARING_SAMPLE_MAX_DX_FRAC` (25%) of frame centre, and facing the lamp (head yaw within
+`HAL_GAZE_BEARING_MAX_YAW_DEG`, 25°, never widened at the frame edge) in
+`HAL_GAZE_BEARING_MIN_FACING_RATIO` (40%) of the measured samples. Candidates are ranked by facing,
+then face size. Face-ID is not a way in: it names who was seen recently, not whose box this is, so a
+fresh label would let every near face through while the user is in view. Every accept and reject
+logs the per-frame head yaw, face height and offset (`yaw=[…] h=[…]% dx=…`). Device-observed
+2026-09-30 on green-lamp: a side-on co-worker at the frame edge (`dx=+45%`, 58 px of 720 = 8.1%)
+passed as "facing 100%", because gaze wake's cone there (`HAL_GAZE_MAX_YAW_DEG` 60 × edge widening
+≈ 103°) accepts any head. A co-worker one desk over measured up to 13.6% and confirmed a repoint
+while the user was away. The user measured 19.2–46% in frames on the same lamp. A body alone never ends the sweep, and centring follows that face
+(`_user_face_probe`), not the nearest person box. If no face passes, the sweep reports not found and
+takes the ordinary exit back to its starting pose. Device-observed 2026-09-29: the sweep took "the
+nearest" of 2–3 co-workers (`h=304px`) and framing then followed a side-on stranger to
+`base_yaw −97.4`.
 
 **With no bearing yet** — a fresh unit, or one whose bearing was reset — the sweep first rests the arm
 on the idle recording's own pose rather than starting from wherever it happens to stand. A loop that
@@ -691,16 +743,17 @@ decides **when**, via `POST /api/sensing/filler` with `{"pool": "..."}`.
 |---|---|---|
 | `look_searching` | the first step toward the remembered bearing | **on** (`HAL_LOOK_AIM_SPEAK`) |
 | `look_found` | a subject appears **after** a search was announced | on (same flag) |
-| `look_still_searching` | the midpoint of a sweep — stop 2 of 3, head centred (`_say_at_the_midpoint`) | on (`HAL_LOOK_AIM_SPEAK`) |
+| `look_still_searching` | the midpoint of a full sweep (`/servo/search`) — stop 2 of 3, head centred (`_say_at_the_midpoint`). Never on look-aim's glance | on (`HAL_LOOK_AIM_SPEAK`) |
 | `look_capturing` | the aim actually moved before the shutter | on (`HAL_LOOK_AIM_SPEAK_CAPTURE`) |
 
 The gating matters more than the phrases. **Nothing is said when the subject is already centred** —
 that capture completes in a few hundred milliseconds, so every phrase here is conditional on the aim
 having actually moved. *"There you are"* only fires as the resolution of an announced search, never
 on its own. Searching announces **once** per sweep rather than per step, plus a single
-`look_still_searching` line at the midpoint — the sweep is ~20 s long, and without it the opening
-phrase and the verdict sit either side of twenty seconds of silence, which reads as a lamp that has
-stopped rather than one that is looking. And the capture line fires only when the aim actually moved
+`look_still_searching` line at the midpoint of a full sweep — that sweep is ~20 s long, and without
+it the opening phrase and the verdict sit either side of twenty seconds of silence, which reads as a
+lamp that has stopped rather than one that is looking. Look-aim's glance is ~4 s and says nothing in
+between: narrating a short glance is a machine reporting its state. And the capture line fires only when the aim actually moved
 (`res.aimed and res.iterations > 0`): an aim that moved nothing says nothing, and — the part that was
 wrong until this branch — neither does an aim that searched and **failed**, which used to follow
 *"I can't find you"* with *"let me take a look"*.
@@ -728,6 +781,18 @@ simply does not speak.
 
 ## Gaze framing — keeping the user in shot
 
+Gaze sampling pauses during the transition into idle and for 350 ms after the
+first idle playback frame. It then samples during the **first** idle cycle,
+without waiting for that entire recording to finish. Previously `_idle_settled`
+only became true at the end of the first cycle, so repeated idle servo writes
+could suppress gaze for the whole cycle even when the pose did not change.
+The separate playback timestamp does not change the motor-noise flag, gaze
+acceptance thresholds, or the guard against repointing when a face is already
+visible. At a configured 6 samples/s, sampling can resume on the next watcher
+iteration after the 350 ms interval; actual camera/processing time still applies.
+This boundary is covered by deterministic playback tests, not yet by a new
+on-device latency measurement.
+
 Everything above is asked for: a look, a track, a search. This section is the watcher in
 `hal/drivers/tracking/gaze.py` doing it unprompted, so that when the user does speak the camera is
 already pointed somewhere useful. All of it is downstream of `HAL_GAZE_WAKE` (see
@@ -753,6 +818,13 @@ Release is therefore free: stop correcting and idle reclaims the arm within a fr
 pose to restore and no ownership to drop. The check fails **closed** when voice is unavailable. The one
 exception is a *prompted* climb, which a speech-driven repoint asked for and which would otherwise
 leave the head aimed at a chest for the whole utterance.
+
+**A held servo is off limits.** Pan, tilt, the face climb and its return to a known height,
+the speech-start repoint and the look-around all skip while any servo hold is active (a
+`reading`/`focus` scene, an explicit `/servo/hold`), and log why through the usual throttled
+line, e.g. `[gaze] no pan: servo held by scene` or `[gaze] not looking around: servo held by
+explicit`. A skipped look-around does not start its cooldown. Tracking already had the body
+through `_tracking_active`. See `led-control.md`, "Hold ownership".
 
 ### Vertical centring, and why it reads a median
 
@@ -882,14 +954,61 @@ spoke, the lamp turned to where it thought they were, and they were not there.
 
 Three further behaviours are worth stating because each was a bug first:
 
-- **A body counts as finding the user.** The verifier tracks faces and bodies on separate clocks; a
-  torso at the bearing means the bearing was *right*. Scoring it as a miss deleted correct bearings
-  while the user sat in front of the lamp.
-- **A repoint must end on a face.** Landing on a body is a half-success, so it prompts the climb
-  above rather than returning "found them" — which is why the climb has a `_PROMPT_MIN_SAMPLES` of 2.
+- **The verdict is judged on a face, never on a body (#545).** A face at least
+  `HAL_GAZE_BEARING_MIN_FACE_HEIGHT_FRAC` (15%) of the frame tall confirms the bearing. Facing and identity
+  are not required, because the user often talks while looking at their own monitor. A smaller face
+  is no face at all (see "A far face is no face" below), so a repoint that sees only one is a miss: in an open office a co-worker's back confirmed the bearing, and a 12–25 px side-on
+  face across the room became "the user". **Size alone decides near or far.** Position does not: a
+  bearing a few degrees off the user's seat puts them at the frame side, and a ±15% centre gate tried
+  on 2026-09-30 ruled the user's own 35% face (dx +34%) "far". Size separates the two instead: in the
+  2026-09-30 frames a neighbour one desk over reached at most 13.6% and the user was never under
+  19.2%, so the floor sits at 15%. The watcher stamps a
+  near-face clock (`_note_face_size`) for every face it is handed, and the verdict reads it.
+- **Only a body with its head above the frame waits for the climb.** A person box cut off by the frame
+  top (the `_headroom_from_person` test) stamps `_last_headless_body_t`, and only that starts a climb.
+  A body fully in frame already shows whatever face it has, so it is judged on the faces: near = hit,
+  otherwise its **size** decides (#567). A nearest person box
+  at least `HAL_GAZE_REPOINT_NEAR_BODY_MIN_AREA_FRAC` (20%) of the frame is someone at the desk whose
+  face the detector dropped — side-on, looking down — and the repoint is **not scored** (no strike, no
+  sweep), even with a co-worker's face in view. A smaller body = miss (`found a body but no face`), and
+  so is nobody at all. Height cannot make this call: on 2026-10-05 a non-user reached 73% of the frame
+  height. Area does: seated users measured 26–73% of the frame on three lamps, co-workers and passers-by
+  at most 13%. A near body **never confirms** the bearing. The same rule closes a climb: a climb that
+  ends with a near body is not scored. Every repoint verdict logs the largest body
+  it saw (`largest body N% of frame`) so the threshold can be tuned from device logs. Device-observed 2026-09-30: the user's
+  whole body in frame started a "climb" that never moved the head. A headless body prompts the climb above and holds the verdict
+  for up to `HAL_GAZE_REPOINT_CLIMB_TIMEOUT_S` (20 s), re-prompting the climb even with no
+  conversation open. A near face = hit; a near body = **not scored**; only a body too small to be at the desk =
+  **miss** (a co-worker standing across the room, clipped at the top, whose small face is no face);
+  nobody at all = **not scored**. A user's own clipped torso is always near.
+  Scoring a torso-only repoint as a miss once deleted correct bearings while the user sat in front of
+  the lamp.
+- **A far face is no face (#567).** The face picker (`detect_face_with_landmarks`) returns only faces at
+  least `HAL_GAZE_BEARING_MIN_FACE_HEIGHT_FRAC` (15%) of the frame tall, and never less than
+  `HAL_GAZE_MIN_FACE_PX`; the one nearest the centre among those wins. A smaller face is dropped, with
+  no largest-face fallback. It used to come back as "the face" whenever the user's own was not found,
+  and the watcher looks for a body only when it finds no face. So a co-worker's small face hid a user
+  standing in front of the lamp (green-lamp 2026-09-30: no body, no climb, a miss), pulled the pan
+  toward the co-worker, and on 2026-10-05 16:33:42 (green-lamp) hid the back of the user's head at 30%
+  of the frame, so the near-body guard below never fired. Now such a sample takes the no-face path:
+  person detection runs, the user's body drives the climb's `dy` and the near-body clock, and nothing
+  pans. The cost is a YOLO person pass on those samples, as for any sample with no face.
+  The body gaze reasons about is the **nearest** person box — the tallest one near enough to be the
+  asker, the same `_pick_nearest` rule look-aim and the search use — not `detect()`'s most confident
+  box. On lamp-4ace (2026-10-05 13:48:51) the user's 30% box at confidence 0.78 lost to a co-worker's
+  4% box at 0.83, so the user's clipped torso never started the climb. The candidates come from the
+  local YOLO only (`detect_candidates`), never the remote YOLO-World fallback `detect()` has: with
+  `HAL_TRACKING_DETECT_LOCAL=false` or no local weights, gaze sees no body at all — no climb and no
+  near-body evidence.
 - **It will not turn away from a face already in frame.** If a face was seen within
   `HAL_GAZE_REPOINT_SKIP_IF_FACE_S`, a speech-triggered reacquire declines: after a climb has found
   the user's face *above* the bearing, obeying the bearing means turning back down to look at nobody.
+- **Nor from someone sitting in front of it (#567).** `blind` at speech start means fewer than
+  `HAL_GAZE_MIN_SAMPLES` measured faces in the last `HAL_GAZE_WINDOW_S`: the face was not found, or the
+  sampler had nothing fresh. It says nothing about bodies. If the nearest person box was near (see
+  above) within `HAL_GAZE_REPOINT_SKIP_IF_FACE_S`, the reacquire declines (`no repoint: someone is
+  already in front of the lamp`): the lamp is already on the user, and the turn could only end in a
+  wrong verdict. A user measured *facing away* is a different verdict (`skip`) and never repoints.
 - **The hold ends with the utterance.** A speech-triggered reacquire points the lamp with
   `move_and_hold`, which drops whatever recording was playing and sets `_idle_settled` — correct
   for the utterance, wrong afterwards, because nothing else re-arms idle. The lamp simply stopped
@@ -904,8 +1023,14 @@ prints once a minute rather than once a pass.
 
 ### Looking around on its own
 
-If a repoint turns up nothing, `_verify_repoint` calls the same `/servo/search` sweep documented above
-with `confirmed_miss=True`. Since the repoint above is speech-driven, so is the sweep: the lamp
+If a repoint is scored a miss (nobody, or only a body too small to be at the desk), `_verify_repoint` calls `_maybe_sweep`
+with `confirmed_miss=True`, which **glances** rather than sweeps: `glance=True` keeps the base on the
+seed bearing and walks only `GLANCE_LOOKS` — the head left 45°, then right 45° — so 2 looks, about
+4 s, with no `look_still_searching` line. Then it returns to the starting pose and lets it go. The
+rule is *does a living thing do this?*: one that turns to a voice and finds nobody glances about; it
+does not quarter the room at 3 bearings × 6 looks like a security camera, which is what the full
+18-look sweep looked like when it ran unasked. The full sweep stays for searches somebody asked for
+(`/servo/search`). Since the repoint above is speech-driven, so is the sweep: the lamp
 searches because somebody spoke and it could not find them, never because a room merely looks empty.
 An absence trigger (`HAL_GAZE_SWEEP_AFTER_S`) still exists in `_maybe_sweep` but nothing reaches it —
 the watcher loop no longer calls the sweep at all. The cooldowns still apply, and the two exist because
@@ -917,15 +1042,23 @@ from trying — device-observed: three failed repoints dropped the estimate, and
 to repoint (nothing to turn to) and unable to sweep (11 minutes left) while the user was talking to it.
 
 `confirmed_miss` skips the absence wait by design — a repoint that moved and missed is the strongest
-evidence there is, so there is nothing to wait for. A successful sweep samples a fresh bearing on the
-spot.
+evidence there is, so there is nothing to wait for. A successful sweep records the bearing it is now
+pointing at, which is the face its user check passed (`_learn_from_user_sweep`), and only when centring
+succeeded. It no longer re-samples with `bearing_sampler`, which picked whichever near face the
+detector returned, sometimes the co-worker the check had just ranked below the user. While a
+body-only repoint's climb is still pending, a new repoint is declined (`a climb is still judging the
+last repoint`). Turning again would drop the head the climb raised and score one sighting twice. Faces
+count as repoint evidence only if seen after the turn.
 
 | Knob | Default | Meaning |
 |---|---|---|
-| `HAL_GAZE_SWEEP` | `true` | Autonomous look-around on/off. |
-| `HAL_GAZE_SWEEP_AFTER_S` | 30 | Nobody seen for this long. Longer than `HAL_GAZE_REPOINT_AFTER_S` (12 s) so the cheap move is always tried first and the ~20 s sweep stays the escalation, not the reflex. |
+| `HAL_GAZE_SWEEP` | `true` | Autonomous look-around (the glance) on/off. |
+| `HAL_GAZE_SWEEP_AFTER_S` | 30 | Nobody seen for this long. Longer than `HAL_GAZE_REPOINT_AFTER_S` (12 s) so the cheap move is always tried first and the ~4 s glance stays the escalation, not the reflex. |
 | `HAL_GAZE_SWEEP_COOLDOWN_S` | 900 | Between sweeps when a bearing exists. |
 | `HAL_GAZE_SWEEP_COOLDOWN_LOST_S` | 120 | Between sweeps when there is no bearing at all. |
+| `HAL_GAZE_BEARING_MIN_FACING_RATIO` | 0.4 | Facing share needed to adopt a new bearing. Lower than the wake gate's 0.6: a still user measured 50%. Not 0.3: the window holds 2–3 samples, so that is one glance. |
+| `HAL_GAZE_BEARING_MAX_YAW_DEG` | 25 | Head yaw that counts as facing for a new bearing. Its own limit, never widened at the frame edge, so wake-gate tuning cannot loosen it. |
+| `HAL_GAZE_BEARING_MIN_FACE_HEIGHT_FRAC` | 0.15 | Face height (of frame height) that counts as near enough to be at the desk, for every user-check path. Gaze's face picker also drops any smaller face outright (#567), so it gates gaze wake's votes and pan samples too. Measured in frames: office co-workers 8.3–13.6%, user 19.2–46%. A lamp placed further from its user may need it lower in `.env`. |
 
 ### Remembered user bearing
 
@@ -960,9 +1093,13 @@ too weak to use and too strong to replace.
 
 Sightings reach it two ways:
 
-- **From a look aim**, when the subject ends within **2%** of frame centre — tighter than the aim's
-  own framing tolerance, and deliberately so: at frame centre the servo position **is** the bearing,
-  with no pixel→angle conversion and therefore no dependency on the disputed camera FOV constant.
+- **From a look aim**, only for a face that passes the strict user check (#545): at least 15% of the
+  frame tall, within 25% of frame centre, and facing the lamp (yaw ≤ 25°) in 40% of about 1.5 s of
+  samples. The
+  bearing is recovered as `yaw + dx × scale` under the sampler's `HAL_BEARING_SAMPLE_MAX_DX_FRAC`
+  (0.25) limit, on a background thread (`_record_bearing_worker`) so the capture never waits, and it is
+  dropped if the head moved meanwhile. It used to record whatever box was centred, and a co-worker's
+  centred body taught the bearing.
 - **From the passive sampler** (`bearing_sampler.py`), every `HAL_BEARING_SAMPLE_INTERVAL_S` (300 s).
   The aim-only path recorded roughly two sightings a day, which is too slow to build an estimate the
   aim will act on — confidence grows with sightings, and at that rate a fresh device spends days
@@ -975,7 +1112,11 @@ Sightings reach it two ways:
 The sampler declines rather than guess. Horizontal offset is tolerated only to
 `HAL_BEARING_SAMPLE_MAX_DX_FRAC` (0.25), because that correction leans on the very FOV constant the
 aim exists to avoid trusting. It also skips while the body is aiming or tracking, while the camera is
-disabled, and takes the detector lock non-blocking so a user's question never waits on it.
+disabled, and takes the detector lock non-blocking so a user's question never waits on it. A face
+must be at least `HAL_GAZE_BEARING_MIN_FACE_HEIGHT_FRAC` (15%) of the frame tall, the same floor as
+every other bearing path (#545). It used look-aim's `HAL_LOOK_AIM_MIN_FACE_HEIGHT_FRAC` (8%), so a
+centred co-worker at 8–15% could teach the bearing. There is no facing check: it samples a single
+frame, and the user working at their own monitor must still be learned.
 
 **It learns from faces only, never from `person` boxes.** A person box says where a body is, and a
 body fills the frame whenever the camera happens to be aimed low — so learning from one memorises
@@ -1037,7 +1178,8 @@ Nothing on this device can observe that directly:
 
 So it is **inferred from failed predictions**: when aim priority 3 turns to the remembered bearing
 and finds nobody, that is a miss. `PREDICTION_MISS_LIMIT` misses drops the estimate, and it rebuilds
-from live sightings.
+from live sightings. Look-aim scores a turn to the bearing as a hit only when it sees a near face, as
+a miss when it sees nothing, and not at all when it sees only a body (#545).
 
 Three guards keep ordinary life from looking like a relocation:
 
@@ -1079,3 +1221,16 @@ curl -X POST 127.0.0.1:5001/servo/bearing/reset
 The reset is also wired to speech via `skills/servo-control` — *"I moved you"*, *"you're in a new
 place"*. Automatic detection needs several failures before acting, which is right for avoiding false
 positives but slow when the user already knows the lamp moved.
+
+## Returning from hold through servo-control
+
+The `servo-control` skill distinguishes motion state from direction. In an
+established posture/hold context, “back to normal” or “turn to normal position”
+selects `/servo/resume`, which clears hold and resumes idle with torque on.
+“Look straight ahead” selects only `/servo/aim` with `center`, preserving hold.
+An explicit request for both emits aim center then resume. “Stay still” or
+“don't resume” takes precedence; returning to center while staying still emits
+aim center then hold. Unrelated “back to normal” requests do not trigger servo
+actions; uncertain body state can be read from `GET /servo` (`motion_mode`).
+`/servo/play` with `idle` does not clear hold, and `/servo/release` disables torque
+rather than resuming idle. These are skill routing rules; HAL behavior is unchanged.

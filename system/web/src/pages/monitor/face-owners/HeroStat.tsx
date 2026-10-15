@@ -1,9 +1,6 @@
 import type { ReactNode } from "react";
 
-// HeroStat is a compact tile in the page hero showing one headline number
-// (Enrolled / Here now / Unknown voices / Unknown faces). Presentational only —
-// values are passed in from already-fetched state. `tone` tints the icon chip +
-// value so each metric reads with its own identity color at a glance.
+// HeroStat is a compact tile in the page hero showing one headline number (Enrolled / Here now / Unknown voices / Unknown faces).
 export function HeroStat({ icon, label, value, tone = "neutral", pulse }: {
   icon: ReactNode;
   label: string;
@@ -19,8 +16,8 @@ export function HeroStat({ icon, label, value, tone = "neutral", pulse }: {
     "var(--lm-text)";
   return (
     <div style={{
-      display: "flex", alignItems: "center", gap: 10,
-      padding: "8px 14px", borderRadius: 10,
+      display: "flex", alignItems: "center", gap: 12, minWidth: 0,
+      padding: "16px", borderRadius: 10,
       background: "color-mix(in srgb, var(--lm-card) 70%, transparent)",
       border: "1px solid var(--lm-border)",
       backdropFilter: "blur(4px)",
@@ -35,12 +32,12 @@ export function HeroStat({ icon, label, value, tone = "neutral", pulse }: {
       }} aria-hidden>{icon}</span>
       <div style={{ minWidth: 0 }}>
         <div style={{
-          fontSize: 18, fontWeight: 800, color, lineHeight: 1.1, letterSpacing: "-0.4px",
-          overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap",
+          fontSize: 24, fontWeight: 800, color, lineHeight: 1.3, letterSpacing: "-0.4px",
+          overflowWrap: "anywhere",
         }}>
           {value}
         </div>
-        <div style={{ fontSize: 10, color: "var(--lm-text-muted)", textTransform: "uppercase", letterSpacing: "0.06em", marginTop: 1 }}>
+        <div style={{ fontSize: 12, color: "var(--lm-text-muted)", marginTop: 4 }}>
           {label}
         </div>
       </div>

@@ -48,9 +48,11 @@ which brain is active.
 
 | `agent_runtime` | Backend |
 |---|---|
-| `"openclaw"` / unset | OpenClaw (default; or `gateway.default` from `ROBOT.md`) |
-| `"hermes"` | Hermes (`hermes.ProvideService`) |
+| unset | image-baked `/root/config/f_r_default_agent`, else `gateway.default` from `ROBOT.md`, else OpenClaw |
+| `"openclaw"` | OpenClaw (default) |
+| `"hermes"` / `"remote"` | Hermes (`hermes.ProvideService`; `remote` = Hermes-over-LAN via `ApplyExternalEndpoint`) |
 | `"picoclaw"` | PicoClaw (`picoclaw.ProvideService`) |
+| `"codex"` / `"claudecode"` / `"opencode"` | Codex / Claude Code / OpenCode (`<runtime>.ProvideService`) |
 | anything else | OpenClaw (logged as `FALLBACK — unknown runtime=…`) |
 
 On startup `ProvideGateway` prints an `AGENT BACKEND ACTIVE → PICOCLAW` banner
@@ -164,7 +166,9 @@ the watcher leaves that skill's version pending and retries it on the next poll.
   `discord_user_id`), slack (`slack_bot_token` + `slack_app_token` + `slack_user_id`),
   whatsapp native (`whatsapp_user_id` → `allow_from`, no token, QR pairing on first
   run). Secrets land in `.security.yml` under `channel_list.<ch>.settings`; structure
-  stays in `config.json`.
+  stays in `config.json`. A Telegram bot token without `telegram_user_id` leaves the
+  channel disabled: an empty `allow_from` would let anyone who finds the bot command
+  the device.
 
 The running gateway logs confirm the wiring on boot (`Gateway started on
 127.0.0.1:18790`, health at `/health` `/ready` `/reload`, `Channels enabled:
@@ -471,7 +475,9 @@ the reset wipes `/root/.picoclaw` **wholesale** and re-onboards a clean baseline
    overrides `Restart=always` (it is not a crash), so the gateway stays down while we
    wipe. `waitForPicoclawStop` polls `is-active` for up to 5s.
 2. **`systemctl disable picoclaw`** — a factory reset also wipes `/root/config/config.json`
-   and reboots into the **default (openclaw)** runtime, so PicoClaw must NOT auto-start.
+   and reboots into the device's **default** runtime (`f_r_default_agent`, else ROBOT.md
+   `gateway.default` — e.g. hermes on a Lamp — openclaw only if neither is set), so
+   PicoClaw must NOT auto-start.
    `switch-runtime` re-enables it only when the user switches back.
 3. **`rm -rf /root/.picoclaw`** — config, `.security.yml`, workspace (persona/memory/
    skills), sessions, and the **`.openclaw-migrated` marker** (so `presync.sh` §0
@@ -493,25 +499,30 @@ existing onboarding gateway restart; an unchanged reconcile is a no-op.
 **Jev is disabled by default** by `const jevEnabled = false` in `runtimes/picoclaw/jev_hook.go`. When disabled, bridges construct no selector; native onboarding installs no assets and creates no Jev registration. If an older Jev registration exists, Go only disables that registration and preserves unrelated settings. Disabled integrations do not read skills, call the provider, or add Jev content to requests. Enabling after validation requires changing the Go switch, rebuilding and restarting through runtime management. The observer still manages the global `hooks.enabled` gate; Jev leaves that gate unchanged.
 The sidecar stores only the absolute OS config path; credentials are read at use.
 
-The hook shares Hermes's selector implementation: at most 32 candidates, a
-3-second total selection/load budget, choice >= 0.70, margin >= 0.20 and
+The hook shares Hermes's selector implementation: a 256 KiB serialized request
+budget instead of a fixed candidate count (oversized catalogs abstain without
+truncation), a 3-second total selection/load budget, choice >= 0.70, margin >= 0.20 and
 independent fit >= 0.60. Errors, busy workers, timeout, abstention, slash commands
 and explicit `[skills: ...]` instructions preserve ordinary runtime discovery.
 Only current user text and candidate descriptions reach Jev, never chat history.
 Logs use `[picoclaw-jev]` and omit prompts, credentials and skill contents.
 
 The candidate roster comes from PicoClaw's native system `<skills>` summary,
-restricted to existing files inside `/root/.picoclaw/workspace/skills`. No extra
-filesystem catalog is invented. Missing/unsupported roster shapes fail open.
+including workspace, global and built-in skills. Native discovery determines
+workspace > global > built-in precedence and applies the turn's `AllowedSkills`
+filter before publishing; the hook does not scan other directories or restore
+omitted skills. Identical entries repeated across system message parts are
+deduplicated. Missing/unsupported roster shapes fail open.
 The selected complete SKILL.md, absolute path and reference directory are loaded
 as transient current-user-message context, preserving system messages and tools.
-Files larger than 128 KiB, paths escaping that skill root, ambiguous names and
+Files larger than 128 KiB, non-absolute or traversal paths, ambiguous names and
 inline shell templates are rejected; nothing in a skill is executed by preloading.
 A bounded 256-turn in-memory cache remembers only the selected skill and original
 prompt. Every model iteration rechecks the current native roster and safely
 reloads the complete file; removal or load failure invalidates that selection.
 Attachment/content-part, system, sensing and already-handled turns bypass Jev.
-Descriptor-relative no-follow opens reject symlinks and non-regular files; the
+Descriptor-relative no-follow opens start at the filesystem root and reject
+symlinks in every ancestor, symlink files and non-regular files; the
 128 KiB limit also applies to the composed context. No persona or conversation-history file is written.
 Unknown turn IDs/iterations and child turns abstain.
 

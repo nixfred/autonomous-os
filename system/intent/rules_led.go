@@ -1,19 +1,17 @@
-// LED rules — color, on/off, dim. led_color must run before the generic
-// led_on/led_off so "turn the light red" doesn't hit the plain-white rule.
 package intent
 
 import (
 	"fmt"
 	"go.autonomous.ai/os/system/lib/hal"
 	"log/slog"
+	"math"
 	"strings"
 	"sync"
 
 	"go.autonomous.ai/os/system/device"
 )
 
-// colorKeywords maps color keywords to RGB values.
-// Checked in order — first match wins.
+// colorKeywords maps color keywords to RGB; first match wins.
 var colorKeywords = []struct {
 	keywords []string
 	rgb      [3]int
@@ -43,7 +41,7 @@ func extractColor(t string) ([3]int, string, bool) {
 	return [3]int{}, "", false
 }
 
-// isLEDOnCommand returns true if t contains a "turn on light" trigger phrase.
+// isLEDOnCommand reports whether t contains a "turn on light" phrase.
 func isLEDOnCommand(t string) bool {
 	triggers := []string{"turn on the light", "light on", "set color", "change color", "set the light"}
 	for _, kw := range triggers {
@@ -55,7 +53,7 @@ func isLEDOnCommand(t string) bool {
 }
 
 var ledRules = []rule{
-	// --- LED color (must be before generic LED on/off) ---
+	// LED color must run before generic LED on/off.
 	{
 		name:       "led_color",
 		capability: device.CapLight,
@@ -75,7 +73,6 @@ var ledRules = []rule{
 		},
 	},
 
-	// --- LED on/off ---
 	{
 		name:       "led_on",
 		capability: device.CapLight,
@@ -91,16 +88,19 @@ var ledRules = []rule{
 		capability: device.CapLight,
 		match:      anyOf("turn off the light", "light off"),
 		exec: func(string) *Result {
-			// No emotion after /led/off: any emotion (even idle) re-lights the
-			// strip with its own color, undoing the off the user just asked for
-			// (the off user-state then makes LED restore "keep emotion color",
-			// so it never goes back to black). Turn off → stay off.
+			// No emotion after /led/off: any emotion would re-light the strip.
 			executionFailed := post("/led/off", "") != nil
 			return &Result{ExecutionFailed: executionFailed, TTSText: "Light off!", LEDOff: true, Actions: []string{"POST /led/off"}}
 		},
 	},
 
-	// --- Dim / brightness ---
+	{
+		name:       "brighten",
+		capability: device.CapLight,
+		match:      anyOf("brighten the light", "brighten light", "brighter"),
+		exec:       func(string) *Result { return brightenCurrentLight() },
+	},
+
 	{
 		name:       "dim",
 		capability: device.CapLight,
@@ -149,4 +149,54 @@ func dimCurrentLight() *Result {
 	}
 	slog.Info("intent dim applied", "before", color, "after", next)
 	return &Result{TTSText: "Dimmed.", LEDChanged: next != [3]int{}, LEDOff: next == [3]int{}, Actions: actions}
+}
+
+// brightenCurrentLight shares the dim lock so opposite adjustments cannot overwrite each other.
+func brightenCurrentLight() *Result {
+	if !dimMu.TryLock() {
+		return &Result{ExecutionFailed: true, TTSText: "I couldn't change that setting because another adjustment is in progress. Please try again."}
+	}
+	defer dimMu.Unlock()
+	actions := []string{"GET /led/color"}
+	failure := func() *Result {
+		return &Result{ExecutionFailed: true, TTSText: "I couldn't confirm the light got brighter.", Actions: actions}
+	}
+	color, err := hal.GetColor()
+	if err != nil {
+		return failure()
+	}
+	peak := max(color[0], color[1], color[2])
+	if peak == 255 {
+		return &Result{TTSText: "The light is already at maximum brightness.", Actions: actions}
+	}
+	// Start a dark lamp gently; otherwise raise its peak by 25%, retaining its hue.
+	next := [3]int{32, 27, 20}
+	if peak > 0 {
+		nextPeak := min(255, peak+max(1, peak/4))
+		for i, channel := range color {
+			next[i] = channel * nextPeak / peak
+		}
+	}
+	body := fmt.Sprintf(`{"color":[%d,%d,%d]}`, next[0], next[1], next[2])
+	actions = append(actions, "POST /led/solid "+body)
+	if err := post("/led/solid", body); err != nil {
+		return failure()
+	}
+	actions = append(actions, "GET /led/color")
+	actual, err := hal.GetColor()
+	if err != nil {
+		return failure()
+	}
+	actualPeak, requestedPeak := max(actual[0], actual[1], actual[2]), max(next[0], next[1], next[2])
+	if actualPeak <= peak || actualPeak > requestedPeak {
+		return failure()
+	}
+	// HAL can proportionally clamp RGB to its safety ceiling. Accept that only
+	// when readback confirms an actual increase and the expected scaled hue.
+	for i, channel := range next {
+		if actual[i] != int(math.RoundToEven(float64(channel)*float64(actualPeak)/float64(requestedPeak))) {
+			return failure()
+		}
+	}
+	return &Result{TTSText: "Brighter now.", LEDChanged: true, Actions: actions}
 }

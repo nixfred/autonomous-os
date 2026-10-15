@@ -6,7 +6,7 @@ OS server sử dụng MQTT để giao tiếp với backend server (báo cáo tr�
 
 - Client: Eclipse Paho autopaho (Go)
 - Auto-reconnect khi mất kết nối
-- Client ID format: `device-{DeviceID}`
+- Client ID format: `os-server-{DeviceID}`
 
 ## Cấu Hình
 
@@ -40,6 +40,8 @@ OS server sử dụng MQTT để giao tiếp với backend server (báo cáo tr�
 }
 ```
 
+`ota` có hằng số nhưng không có case trong router; xem [`ota` — không được xử lý](#ota--không-được-xử-lý).
+
 ### `info` — Báo cáo thông tin thiết bị
 
 **Nhận:** `{"cmd": "info"}`
@@ -54,6 +56,8 @@ OS server sử dụng MQTT để giao tiếp với backend server (báo cáo tr�
   "mac": "{MAC address}",
   "time": "2026-03-26T17:00:00Z",
   "wakeword_enabled": false,
+  "voice_input_mode": "automatic",
+  "cloud_perception": { "motion": false, "emotion": false, "pose": false, "fire_hazard": false, "speaker_id": false, "speech_emotion": false },
   "agent_runtime": "openclaw"
 }
 ```
@@ -66,7 +70,9 @@ Phản hồi còn kèm các field tùy chọn khi có: `hal_version`, `openclaw_
 `opencode_version`, `local_ip`, `tts_provider`, `tts_voice`, `stt_language`, `timezone`,
 `unsupported_channels`, `skills`. `wakeword_enabled` luôn có mặt và báo trạng thái
 effective của wake-word gate top-level trong config (`true` hoặc `false`; config legacy
-thiếu giá trị này sẽ báo `false`). `timezone` là múi giờ IANA **trực tiếp** của device (ví dụ
+thiếu giá trị này sẽ báo `false`). `cloud_perception` luôn có mặt và báo các opt-in camera
+và giọng nói qua cloud đã lưu (config legacy thiếu giá trị sẽ báo tất cả `false`); xem
+[`cloud_perception.set`](#cloud_perceptionset). `timezone` là múi giờ IANA **trực tiếp** của device (ví dụ
 `Asia/Ho_Chi_Minh`), đọc tươi từ `/etc/timezone` (fallback về config), không chỉ là
 bản ghi trong config. Cả sáu version per-runtime đều được probe lúc startup (mỗi cái
 từ `--version` riêng) và bắn cạnh nhau; `agent_runtime` cho biết cái nào đang active.
@@ -340,6 +346,11 @@ nhận HAL nhận yêu cầu phát, không đảm bảo audio đã phát xong.
 | `tts.set` | Lưu cấu hình TTS voice/provider/language/speed | `provider`, `voice`, `language`, `speed` (tùy chọn) |
 | `tts.preview` | Preview TTS một lần (không ghi config) | `text` (bắt buộc), tùy chọn `provider`/`voice`/`language`/`speed` |
 | `wakeword.gate` | Bật/tắt wake-word gate top-level (bất đồng bộ; ack `starting`) | `enabled` (boolean bắt buộc) |
+| `wakeword.settings.get` | Đọc cài đặt đánh thức: gate, câu đánh thức, tiếng chime, đèn đánh thức, thời gian nghe tiếp, kèm các giới hạn (đồng bộ) | _(không có)_ |
+| `wakeword.settings.set` | Lưu một phần bất kỳ của cài đặt đánh thức qua đúng đường `PUT /api/device/config`; trả lời một lần kèm cài đặt đã lưu | bất kỳ trong `enabled`, `phrases`, `chime`, `light`, `followup_s` |
+| `wakeword.light.preview` | Chạy thử một đèn đánh thức trong 3 giây qua HAL `POST /led/wake-light/preview`; không lưu gì (đồng bộ) | `color`, tùy chọn `effect`/`speed` |
+| `cloud_perception.set` | **Tắt** các luồng nhận thức camera hoặc giọng nói qua cloud (chỉ opt-out; bất đồng bộ; ack `starting`) | một hoặc nhiều `motion`, `emotion`, `pose`, `fire_hazard`, `speaker_id`, `speech_emotion` (phải là `false`) |
+| `voice.input_mode` | Chọn cách nhập giọng nói (ack bất đồng bộ) | `mode`: `automatic` hoặc `tap_to_talk` |
 | `timezone.set` | Áp dụng múi giờ IANA của device (bất đồng bộ; ack `starting`) | `timezone` (bắt buộc, ví dụ `Asia/Ho_Chi_Minh`) |
 | `oauth.set` | Lưu/thay token OAuth cho một provider | `provider`, `access_token`, tùy chọn `refresh_token`/`token_type`/`expires_at`/`scopes`/`user_email`/`client_id` |
 | `oauth.remove` | Xóa token OAuth đã lưu của provider | `provider` |
@@ -353,6 +364,22 @@ nhận HAL nhận yêu cầu phát, không đảm bảo audio đã phát xong.
 | `chat.send` | Mở một turn của agent từ backend rồi stream ngược về (ack một run id, sau đó bắn `chat.event`) | `message` (bắt buộc), tuỳ chọn `images[]`/`files[]`/`session_id`/`speak` |
 | `skills.save` | Ghi một skill soạn sẵn vào thư mục skill của runtime đang chạy (đồng bộ) | `name`, `description`, `instructions` |
 | `skills.upload` | Cài một file `.md`, `.zip`, hoặc `.skill` vào runtime đang chạy (đồng bộ) | `filename`, `content_base64` |
+| `face.enroll` | Đăng ký một ảnh khuôn mặt qua HAL `POST /face/enroll` (bất đồng bộ; ack `starting`) | `image_base64`, `label`, tùy chọn `telegram_username`/`telegram_id` |
+| `face.owners` | Liệt kê người đã đăng ký qua HAL `GET /face/owners` (đồng bộ) | _(không có)_ |
+| `face.remove` | Xoá toàn bộ thư mục `users/<label>/` của một người (khuôn mặt, giọng, Telegram, lịch sử) qua HAL `POST /face/remove` (bất đồng bộ; ack `starting`) | `label` |
+| `voice.enroll` | Ghi âm 15 giây bằng mic của chính đèn rồi đăng ký giọng qua HAL `POST /speaker/record-enroll` (bất đồng bộ; ack `starting` kèm thời lượng) | `label` |
+| `voice.owners` | Liệt kê file mẫu giọng của mọi người từ `users/<label>/voice/` (đồng bộ) | _(không có)_ |
+| `voice.remove` | Xoá toàn bộ hồ sơ giọng của một người qua HAL `POST /speaker/remove`; dữ liệu khuôn mặt giữ nguyên (bất đồng bộ; ack `starting`) | `label` |
+| `voice.file.get` | Trả về một file mẫu giọng dạng base64 để phát lại (đồng bộ) | `label`, `file` |
+| `voice.file.remove` | Xoá một mẫu giọng và file `.npy` đi kèm, giống `POST /api/voice/file/remove` (đồng bộ) | `label`, `file` |
+| `led.resting.get` | Đọc lựa chọn đèn nghỉ của chủ máy, mặc định của device và màu đang áp qua HAL `GET /led/resting` (đồng bộ) | _(không có)_ |
+| `led.resting.set` | Lưu đèn nghỉ (`default`, `off` hoặc màu `custom`) qua HAL `PUT /led/resting`; giữ qua reboot (đồng bộ) | `mode`, `color` khi `custom` |
+| `led.resting.preview` | Hiện thử một màu mà không lưu qua HAL `POST /led/resting/preview`; tự quay về sau 10 giây kể từ lần preview cuối; chỉ ack khi lỗi | `color` |
+| `volume.get` | Đọc âm lượng loa theo 0-100% của dải cho phép (đồng bộ) | _(không có)_ |
+| `volume.set` | Đặt âm lượng loa, 0-100% của dải cho phép, qua HAL `POST /audio/volume` (đồng bộ) | `volume` |
+| `mic.get` | Đọc trạng thái tắt mic và công tắc mic phần cứng (đồng bộ) | _(không có)_ |
+| `mic.set` | Tắt/bật mic qua HAL `POST /voice/mute` / `/voice/unmute`; công tắc phần cứng được ưu tiên (đồng bộ) | `muted` |
+| `realtime.get` | Đọc cài đặt realtime (key chỉ hiện dưới dạng `has_api_key`) và danh sách provider/voice/reasoning hợp lệ (đồng bộ) | _(không có)_ |
 | `environment.status` | Đọc snapshot môi trường HAL theo capability, không phụ thuộc model cảm biến | _(không)_ |
 | `system.info` | Snapshot tổng hợp: versions + network + host | _(không)_ |
 | `system.version` | Chỉ versions các thành phần (rẻ hơn `system.info`) | _(không)_ |
@@ -361,6 +388,18 @@ nhận HAL nhận yêu cầu phát, không đảm bảo audio đã phát xong.
 | `system.shutdown` | Xếp lịch shutdown OS qua HAL có cue và release servo | _(không)_ |
 | `system.ota_versions` | Version OTA từng component + những gì bootstrap đang cài (dữ liệu của card Versions trên web) | _(không)_ |
 | `system.software_update` | Cài ngay bản đã publish của một component (nút `update` của card Versions); phản hồi `success`/`started`, sau đó gửi báo cáo hoàn tất không cần yêu cầu | `target` (bắt buộc) |
+| `device.rename` | Ghi lại tên agent trong `IDENTITY.md` (wake word mới được WatchIdentity cập nhật theo); sau đó báo cho agent tên mới | `name` (bắt buộc) |
+| `device.soft_reset` | Xoá `config.json` và restart os-server về chế độ AP setup (không reboot, giữ firmware). Fire-and-forget: **không publish ack** | _(không có)_ |
+| `openclaw.setup` / `hermes.setup` / `picoclaw.setup` / `claudecode.setup` / `codex.setup` / `opencode.setup` | Đổi agentic backend sang runtime mà kind chỉ định (ack `starting`, rồi `success` khi readiness probe qua, hoặc `failure` sau khi rollback; mỗi ack lặp lại kind). os-server restart sau `success` | _(không có)_ |
+| `schedule.sync` | Thay toàn bộ danh sách tác vụ hẹn giờ (backend là nguồn chuẩn); ack `success` kèm `next_run_at` của từng schedule | `timezone`, `schedules[]` |
+| `schedule.run` | Chạy ngay một schedule đã lưu (không đổi nhịp và `next_run_at`); `failure` khi agent đang bận | `id` (bắt buộc) |
+| `schedule.mutate.ack` | Phán quyết của backend cho một đề xuất từ thiết bị; thiết bị bỏ intent đang xếp hàng khi nhận bất kỳ phán quyết cuối nào | `intent_id`, `applied`, `conflict`, tuỳ chọn `reason` |
+| `harness.pair.start` | Bắt đầu ghép đôi Harness; phản hồi thông tin ghép đôi (mã đang hiệu lực) | _(không có)_ |
+| `harness.status` | Trạng thái ghép đôi/kết nối Harness | _(không có)_ |
+| `harness.pair.cancel` | Huỷ lần ghép đôi Harness đang chờ; phản hồi `{cancelled:true}` | _(không có)_ |
+| `harness.pair.revoke` | Xoá ghép đôi Harness và tắt Harness-only voice; phản hồi `{unpaired:true}` | _(không có)_ |
+
+`schedule.mutate` chỉ là chiều **gửi ra** (publish trên `fd_channel`, không bao giờ nhận): khi người dùng tạo, sửa hoặc xoá tác vụ từ UI của chính thiết bị (`POST`/`PATCH`/`DELETE /api/schedule…`), thiết bị publish đề xuất `{intent_id, op, schedule_id?, base_rev?, schedule?}` và gửi lại cho tới khi nhận `schedule.mutate.ack`; `schedule.sync` kế tiếp mới là trạng thái thiết bị coi là chuẩn.
 
 `system.reboot` và `system.shutdown` publish `status:"starting"` trước khi
 thiết bị đặt lịch action, để backend nhận ACK trước lúc thiết bị rời mạng. Hai
@@ -523,17 +562,119 @@ hãy poll `system.ota_versions` để lấy trạng thái cuối.
 
 `kind` không hợp lệ sẽ phản hồi `status:"failure"` kèm `error:"unknown kind: <kind>"`.
 
+#### `voice.input_mode`
+
+**Nhận:** `{"cmd":"data","kind":"voice.input_mode","data":{"mode":"tap_to_talk"}}`
+
+`automatic` là mặc định (kể cả config cũ thiếu trường); giữ nguyên flow hiện tại và dùng cờ `wakeword` đã lưu. `tap_to_talk` dành cho runtime trên device khi Harness-only OFF: chạm một lần bắt đầu thu và upload song song tới STT/realtime, chạm lần nữa kết thúc và commit realtime để trả lời hoặc delegate mà không chờ STT chốt hay nhận diện người nói; realtime tắt/không khả dụng thì fallback sang STT `voice_command` sẵn có. Gemini/OpenAI dùng streaming với commit thủ công; Pipecat giữ bước chốt STT nội bộ, còn GPT Live giữ audio tới tap kết thúc vì không có manual commit. Im lặng không tự gửi. Chế độ này bỏ qua wake gate/window và không xóa cờ wake đã lưu. Khi đang phát TTS, chạm chỉ ngắt; chạm tiếp theo mới thu. Khóa mic vật lý luôn có hiệu lực.
+
+`mode` là bắt buộc, chỉ nhận `automatic` hoặc `tap_to_talk`. Payload sai trả `failure` trước khi thay đổi. Lệnh hợp lệ ACK `starting`, rồi `success`/`failure` kèm `data.mode`. HTTP/MQTT dùng chung khóa lưu và áp dụng: lưu `voice_input_mode` vào config.json, gọi HAL `POST /voice/input-mode` với timeout 30 giây. Đổi riêng mode không restart HAL hay os-server; HAL hủy lượt thu đang dở và cấu hình lại voice worker/session. ACK success chỉ sau khi HAL áp dụng xong. Lỗi lưu/apply giữ trạng thái chờ để gửi lại cùng giá trị; gửi trùng sau thành công không áp dụng lại. Nếu cùng request đổi cả trường cần restart (wake/boot/realtime), vẫn chỉ restart một lần. MQTT info và BE ping phản ánh giá trị đã cấu hình, không chứng minh apply thành công; xem terminal ACK. Harness ON giữ luồng tap riêng.
+
 #### `wakeword.gate`
 
 Bật hoặc tắt cờ `wakeword` top-level. Lệnh dùng cùng kiểu ack bất đồng bộ như
-`realtime.set`: device ack đã nhận, lưu cờ vào `config.json`, restart HAL khi
-giá trị thay đổi, rồi publish kết quả.
+`realtime.set`: device ack `starting` ngay khi nhận, rồi lưu cờ và áp dụng trong
+worker chạy nền. Các cập nhật wake từ MQTT và HTTP Settings được xử lý tuần tự.
 
 **Nhận:** `{"cmd":"data","kind":"wakeword.gate","data":{"enabled":true}}`
 
 Ack `success` cuối cùng echo lại `{"enabled":true}`. Thiếu `enabled` hoặc JSON
-không hợp lệ trả `status:"failure"`. `success` nghĩa là cờ đã được lưu và HAL
-đang restart; không đợi HAL sẵn sàng.
+không hợp lệ trả `status:"failure"`. `success` nghĩa là cờ đã được lưu và lệnh
+`systemctl restart` HAL, nếu cần, đã hoàn tất thành công (riêng lệnh restart có
+timeout 30 giây); chưa
+xác nhận voice pipeline sẵn sàng. Lỗi lưu, lỗi restart và restart quá thời gian
+đều trả `failure`. Config có thể đã được lưu khi restart thất bại. Trong tiến
+trình os-server hiện tại, trạng thái wake chờ áp dụng được giữ lại sau lỗi lưu
+hoặc restart, nên gửi lại cùng giá trị mong muốn sẽ thử áp dụng lại. Khi đã áp
+dụng thành công, giá trị wake không đổi sẽ không gây thêm lần restart.
+
+#### `wakeword.settings.*` — Cài đặt đánh thức qua MQTT
+
+Bản dành cho điện thoại và website của phần đánh thức trong web **Settings > Device > How to talk**.
+`set` đi qua đúng phần kiểm tra và lưu của `PUT /api/device/config`, nên sửa qua
+HTTP và MQTT được xếp hàng và theo cùng luật.
+
+| Thao tác trên app | MQTT kind |
+|-------------------|-----------|
+| Mở màn hình | `wakeword.settings.get` |
+| Lưu | `wakeword.settings.set` |
+| Thử màu/hiệu ứng đèn trên device | `wakeword.light.preview` |
+
+```json
+{"cmd": "data", "kind": "wakeword.settings.get", "data": {}}
+{"cmd": "data", "kind": "wakeword.settings.set", "data": {"phrases": ["sam", "hey sam"], "chime": true,
+  "light": {"enabled": true, "color": [16, 9, 3], "effect": "spin", "speed": 1.5}, "followup_s": 5}}
+{"cmd": "data", "kind": "wakeword.light.preview", "data": {"color": [16, 9, 3], "effect": "spin", "speed": 1.5}}
+```
+
+`get` và `set` trả `success` kèm:
+
+```json
+{"enabled": true, "voice_input_mode": "automatic", "agent_name": "sam",
+ "phrases": ["sam", "hey sam"], "phrases_custom": true, "phrases_default": ["wake up sam", "hello sam", "..."],
+ "name_anywhere": false, "max_phrases": 30, "max_phrase_chars": 40,
+ "chime": true, "has_light": true,
+ "light": {"enabled": true, "color": [16, 9, 3], "effect": "spin", "speed": 1.5},
+ "light_effects": ["solid", "breathing", "spin", "blink"], "light_speed_min": 0.25, "light_speed_max": 3,
+ "followup_s": 5, "followup_custom": true, "followup_min_s": 3, "followup_max_s": 30}
+```
+
+- `enabled` là gate **Require attention trigger** (config `wakeword`). Cài đặt
+  đánh thức chỉ có tác dụng khi `voice_input_mode` là `automatic`; ẩn chúng khi
+  là `tap_to_talk`.
+- `phrases` là danh sách đang dùng. `phrases_custom` là false khi đó là danh
+  sách có sẵn (tự đổi theo tên agent). Trong `set`, `phrases` thay cả danh
+  sách; `[]` khôi phục danh sách có sẵn. Câu được chuyển chữ thường, gộp khoảng
+  trắng và bỏ trùng; mỗi câu cần ít nhất một chữ cái và tối đa
+  `max_phrase_chars` ký tự, tổng cộng tối đa `max_phrases` câu.
+- `name_anywhere` là true trên Intern: mỗi mục là một **tên**, có tên ở bất kỳ
+  đâu trong câu là đánh thức ("hey intern", "what time is it, intern?"), và
+  danh sách có sẵn là `["autonomous", "intern"]` cộng tên agent. Hiển thị các
+  mục như tên và bỏ cảnh báo một từ. Trên Lamp là false: mục là câu chào + tên,
+  khớp ở đầu hoặc cuối câu.
+- `chime` và `light.enabled` là hai tín hiệu khi đánh thức; phải giữ ít nhất
+  một cái, nên tắt cả hai sẽ lỗi `keep the wake chime or the wake light on, so
+  a wake is noticeable`.
+- `light` là kiểu đèn đang áp: kiểu chủ máy đã lưu đè lên kiểu listening của
+  board (`[4, 8, 16]`, `breathing`, `1.2`). Trong `set`, `light` thay cả kiểu
+  đèn và công tắc đã lưu; gửi đủ bốn trường. `color` là `[r, g, b]` 0-255 và
+  không được đen; `effect` thuộc `light_effects`; `speed` trong khoảng
+  `light_speed_min`–`light_speed_max`. Device có `has_light: false` bỏ qua nó.
+- `followup_s` là thời gian device nghe tiếp sau khi đánh thức hoặc sau câu trả
+  lời mà không cần câu đánh thức (`followup_min_s`–`followup_max_s`). Khi
+  `followup_custom` là false thì đó là mặc định của image do HAL báo (5 giây
+  trên Intern v2 và Lamp), hoặc 10 giây khi HAL không chạy.
+
+`set` chỉ đổi các trường được gửi; payload rỗng lỗi `nothing to change`. Câu
+đánh thức, chime, đèn và thời gian nghe tiếp áp dụng ngay. Đổi `enabled` sẽ
+restart HAL (tối đa 30 giây): nếu sau 5 giây vẫn chưa xong, device trả
+`success` kèm cài đặt đã lưu và `applying: true`, còn lỗi restart sau đó được
+gửi thành một `failure` riêng cùng kind. Lỗi kiểm tra dữ liệu luôn trả
+`failure` trước khi lưu bất cứ gì.
+
+`wakeword.light.preview` chạy kiểu đèn trong 3 giây rồi trả đèn về như cũ.
+`effect` mặc định `breathing`, `speed` mặc định `1.2`. Khi device đang ngủ,
+đang nói, đang phát nhạc hoặc đèn tắt mic đang chiếm dải đèn, nó trả `success`
+kèm `{"status": "ok", "painted": false}`. Device không có capability `light`
+trả `failure` với `this device has no light`.
+
+#### `cloud_perception.set`
+
+**Tắt** các luồng nhận thức gửi ảnh camera hoặc audio giọng nói lên DL backend. MQTT không xác thực người
+gửi nên chỉ được rút lại đồng ý: key nào đặt `true` đều bị từ chối với
+`status:"failure"` và config không đổi. Bật một luồng vẫn là lựa chọn tại chỗ trong web
+**Settings > Privacy** của device ([os-server_vi.md](os-server_vi.md#nhận-thức-camera-qua-cloud)).
+Key không gửi giữ nguyên giá trị đã lưu.
+
+**Nhận:** `{"cmd":"data","kind":"cloud_perception.set","data":{"pose":false}}`
+
+Request hợp lệ ack `starting`, rồi đi qua cùng đường tuần tự với
+`PUT /api/device/config`: các key được gửi gộp vào giá trị đã lưu mới nhất dưới khoá
+dùng chung (nên hai lệnh tắt đồng thời không ghi đè nhau), HAL áp dụng live (hoặc, nếu apply lỗi,
+bị restart và phải trả lời lại lệnh apply), rồi device mới ack `success` hoặc `failure` kèm sáu giá trị kết
+quả trong `data`. Payload rỗng, JSON không hợp lệ hoặc có giá trị
+`true` đều ack `failure` trước khi thay đổi. `info` báo trạng thái đã lưu trong
+`cloud_perception`.
 
 #### `timezone.set`
 
@@ -605,6 +746,41 @@ sau một tiếng kể từ lúc lưu.
 writer đặc biệt, và chủ động xoay vòng entry nào có CẢ `refresh_token` LẪN
 `refresh:true` (backend sở hữu quyền quyết định refresh qua cờ `refresh`) khi còn dưới
 10 phút là hết hạn, qua endpoint backend `/connector/refresh-token`.
+
+**Biến theo từng kết nối:** connector có API hoặc token endpoint riêng cho từng tài
+khoản (ví dụ domain của cửa hàng) có thể mang các giá trị đó trong map `credentials` được
+relay: các khóa riêng lẻ (vd `shop`) cùng `connector_vars`, một JSON object gồm các giá
+trị chuỗi. Với connector refresh qua backend, thiết bị lưu chúng cùng phần còn lại của
+`credentials` và, ở mỗi lần refresh, gửi object đã parse làm `vars` trong body của
+`/connector/refresh-token` (`{"connector","refresh_token","vars":{...}}`) để backend gọi
+đúng tài khoản đó. `vars` bị bỏ qua khi connector không có biến nào, nên connector với
+endpoint tĩnh gửi đúng body như trước. `connector_vars` không parse được sẽ được log (chỉ
+tên connector) và coi như không có. Bước ghi lại sau refresh giữ nguyên `credentials` đã
+lưu, nên các giá trị này tồn tại qua mọi lần xoay vòng token.
+
+**Skill connector (`skills/connectors`):** agent gọi các dịch vụ đã liên kết qua
+`scripts/connector.py`, chỉ gửi credential tới host chính thức của connector. Phần lớn
+host cố định theo connector; **Shopify** thì theo từng tài khoản: helper gửi token (trong
+`X-Shopify-Access-Token`, không phải `Authorization`) chỉ tới đúng host cửa hàng lưu trong
+`credentials.shop` và từ chối mọi host khác. Skill mô tả cách tạo sản phẩm nháp và bài
+viết, và chặn mọi thứ khách hàng nhìn thấy sau bước đọc lại để xác nhận.
+
+**Shopify là connector dùng client credentials.** Khách hàng tự tạo app Shopify của họ và
+nhập domain cửa hàng, client ID và client secret trong ứng dụng Autonomous. Backend kiểm
+tra bằng cách tạo thử một token, rồi relay `connector.set.shopify` với
+`auth_type: "pat"`, một `access_token` sống khoảng 24 giờ, **không** có refresh token,
+`refresh: false`, và `credentials` gồm `{shop, client_id, client_secret}`. Vì không có
+refresh token nên entry không bao giờ vào vòng lặp `/connector/refresh-token` (vòng lặp
+chỉ chọn entry có `refresh_token` và `refresh:true`). Thay vào đó, helper của skill tự gia
+hạn token: trước mỗi lời gọi, nếu token đã lưu bị thiếu hoặc còn dưới năm phút, nó gửi
+POST `grant_type=client_credentials` kèm client ID và secret đã lưu tới
+`https://<shop đã lưu>/admin/oauth/access_token` (chỉ host đó, không theo redirect) và
+cache kết quả trong `shopify.token.json` cạnh file entry. Cache do helper sở hữu (mode
+`0600`, ghi nguyên tử), được gắn với hash của shop + client ID nên bị bỏ qua khi một trong
+hai đổi, không bao giờ chứa secret, và bị xóa ở lần helper tiếp theo phát hiện connector đã bị gỡ. Helper không bao giờ ghi
+lại file entry do connector writer quản lý, thử lại đúng một lần với token mới sau khi gặp
+`401`, và không in token lẫn secret. Nếu Shopify từ chối credentials đã lưu, helper thoát
+với thông báo "kết nối lại" thay vì lặp vô hạn.
 
 #### `channel.refresh_config`
 
@@ -719,6 +895,12 @@ kèm tên thư mục skill). Truyền basename hay thử `..` đều không kh�
 khớp chính xác với listing, không bao giờ join đường dẫn trên filesystem.
 Khi có `path`, device chỉ đọc file đó; skill có nhiều reference/asset sẽ không
 làm chậm phản hồi vì phải nạp mọi file còn lại trước.
+
+Chỉ liệt kê nội dung của skill. Dotfile và file rác do build hoặc editor sinh ra
+bị bỏ qua, và cũng không đọc được qua `path`: thư mục `__pycache__/` và
+`node_modules/`, `Thumbs.db`, và file có đuôi `.pyc`, `.pyo`, `.swp`, `.swo`,
+`.tmp` hoặc `.log` (cùng danh sách mà `scripts/release/upload-skills.sh` loại khỏi
+zip của skill). `GET /api/agent/skills/files` áp dụng cùng quy tắc.
 
 **Đồng bộ** — đọc thư mục skill là đọc đĩa local, nên không có ack `starting`.
 
@@ -907,6 +1089,343 @@ Sau response `success`, device lập tức publish uplink MQTT `info` thông th�
 với inventory `skills` đã cập nhật. Nếu uplink best-effort này lỗi thì chỉ log,
 không biến kết quả upload thành thất bại.
 
+#### `face.enroll`
+
+Đăng ký một ảnh khuôn mặt cho một người. Đây là bản MQTT của HAL
+`POST /face/enroll` (lệnh mà phần cài đặt Face trên web đang gọi): os-server
+kiểm tra payload rồi chuyển sang HAL. HAL lưu ảnh vào `users/{label}/`,
+train embedding và ghi các trường Telegram vào `metadata.json`.
+
+**Receive:**
+```json
+{"cmd": "data", "kind": "face.enroll", "data": {
+  "image_base64": "/9j/4AAQSkZJRgABAQ...",
+  "label": "alice",
+  "telegram_username": "alice_tg",
+  "telegram_id": "123456789"
+}}
+```
+
+| Trường | Bắt buộc | Ghi chú |
+|--------|----------|---------|
+| `image_base64` | có | Byte JPEG hoặc PNG, base64 chuẩn. Tiền tố `data:image/...;base64,` sẽ được bỏ. Kích thước sau decode tối đa 10 MiB |
+| `label` | có | Tên người, 1–64 ký tự sau khi trim; HAL chuẩn hóa tên (tên thư mục là `label` trong phản hồi) |
+| `telegram_username` | không | Lưu vào metadata của người đó |
+| `telegram_id` | không | Telegram user ID để nhắn DM |
+
+Mỗi lệnh gửi một ảnh; muốn đăng ký nhiều ảnh cho một người thì gửi lại lệnh
+với cùng `label`. Ảnh lớn có thể dùng envelope `privacy`: `data` được tải qua
+TLS thay vì đi qua broker.
+
+**Bất đồng bộ**: payload không hợp lệ bị báo lỗi ngay, không gọi HAL. Payload
+hợp lệ ack `starting`, rồi `success` hoặc `failure` khi HAL xong. Trên device,
+các lệnh đăng ký chạy lần lượt từng lệnh một vì HAL ghi lại file metadata của
+người đó mà không khóa (`face.remove` dùng chung khóa này). `failure` mang lý do từ HAL trong `error`, ví dụ
+`POST /face/enroll returned 400: <detail>` khi HAL từ chối ảnh, hoặc `503` khi
+sensing không chạy. Ảnh không bao giờ bị ghi vào log.
+
+```json
+{
+  "device": "lamp", "type": "data", "kind": "face.enroll",
+  "status": "starting | success | failure",
+  "error": "<message>",
+  "data": { "status": "ok", "label": "alice", "telegram_username": "alice_tg",
+            "telegram_id": "123456789", "photo_path": "/root/.../users/alice/<file>.jpg",
+            "enrolled_count": 2 }
+}
+```
+
+`data` chỉ có khi `success`. `enrolled_count` là số người mà nhận diện khuôn
+mặt biết sau ảnh này (không phải số ảnh, và không tính người chỉ có giọng).
+Con số này khác `enrolled_count` của `face.owners`.
+
+#### `face.owners` / `face.remove`
+
+`face.owners` liệt kê những người đã đăng ký qua HAL `GET /face/owners`. Lệnh
+chạy đồng bộ (chỉ quét thư mục) nên không có ack `starting`. Bucket chung
+`unknown` của HAL (người chưa nhận diện) bị loại khỏi danh sách, và chỉ trả về
+các trường danh tính; log theo ngày mà HAL cũng trả thì không có.
+
+Danh sách gồm mọi người có ảnh khuôn mặt, mẫu giọng hoặc `metadata.json`, nên
+người chỉ enroll giọng vẫn xuất hiện với `photo_count: 0`. `enrolled_count`
+đếm đúng những người này, nên có thể lớn hơn con số chỉ tính khuôn mặt mà
+`face.enroll` và `face.remove` trả về. `photos` chỉ là tên file; không có kind
+MQTT nào để tải ảnh về.
+
+```json
+{"cmd": "data", "kind": "face.owners"}
+```
+```json
+{
+  "kind": "face.owners", "status": "success | failure", "error": "<message>",
+  "data": { "enrolled_count": 1, "persons": [
+    { "label": "alice", "telegram_username": "alice_tg", "telegram_id": "123456789",
+      "photo_count": 2, "photos": ["1711929600000.jpg", "1711929700000.jpg"] } ] }
+}
+```
+
+`face.remove` xoá cả người, không chỉ khuôn mặt: HAL `POST /face/remove` xoá
+toàn bộ thư mục `users/<label>/`, gồm ảnh khuôn mặt, mẫu giọng đã enroll,
+`metadata.json` (Telegram) và lịch sử mood, wellbeing, posture, habit. Không
+hoàn tác được, nên client cần ghi rõ "Xoá người này" và hỏi xác nhận trước.
+Sau đó HAL train lại tất cả người còn lại từ đĩa, nên thời gian tăng theo số
+người và số ảnh. Lệnh ack `starting`, rồi `success` hoặc
+`failure`, và dùng chung khóa với `face.enroll` nên remove không bao giờ chạy
+chồng lên một lần đăng ký. `label` bắt buộc (1–64 ký tự); `unknown` bị từ chối
+mà không gọi HAL. Label không tồn tại trả lỗi `POST /face/remove returned
+404: person not found`.
+
+```json
+{"cmd": "data", "kind": "face.remove", "data": {"label": "alice"}}
+```
+```json
+{
+  "kind": "face.remove", "status": "starting | success | failure", "error": "<message>",
+  "data": { "status": "ok", "label": "alice", "enrolled_count": 0 }
+}
+```
+
+#### `voice.*` — Cài đặt Voice qua MQTT
+
+Các kind `voice.*` cho điện thoại làm đúng những gì phần cài đặt Voice trên
+web (`VoiceSection.tsx`) làm qua HTTP:
+
+| Thao tác trên web | Lệnh HTTP của web | MQTT kind |
+|-------------------|-------------------|-----------|
+| Start Recording (15 giây trên robot) | HAL `POST /speaker/record-enroll` | `voice.enroll` |
+| Danh sách Voice Files | `voice_samples` của HAL `GET /face/owners` | `voice.owners` |
+| Phát một mẫu | HAL `GET /face/file/<label>/voice/<file>` | `voice.file.get` |
+| Nút × trên một mẫu | os-server `POST /api/voice/file/remove` | `voice.file.remove` |
+| Remove all (giữ dữ liệu khuôn mặt) | HAL `POST /speaker/remove` | `voice.remove` |
+
+`label` được trim và chuyển chữ thường như web (1–64 ký tự). Đăng ký và hai
+lệnh xoá chạy lần lượt từng lệnh một trên device.
+
+**`voice.enroll`** ghi âm từ **chính mic của đèn** — không bao giờ dùng audio
+từ điện thoại, vì nhận diện giọng nghe qua mic đó. Thời lượng ghi là 15 giây,
+bằng web; người dùng nên đứng gần đèn và đọc to suốt thời gian ghi (web hiển
+thị các câu trong `components/setup/voice-phrases.ts`; đếm ngược 3 giây
+"chuẩn bị" là việc của app). Payload không hợp lệ bị báo lỗi ngay, không gọi
+HAL. Payload hợp lệ ack `starting` khi bắt đầu ghi — `data` mang `label` và
+`duration_sec` để đếm ngược — rồi `success` kèm hồ sơ giọng, hoặc `failure`
+kèm lý do từ HAL, vài giây sau khi ghi xong. Nếu đang có thay đổi giọng khác
+chạy, `starting` sẽ chờ lệnh đó xong. Gửi lại lệnh với cùng `label` sẽ thêm
+một mẫu. Mẫu mang origin mặc định của HAL là `web`.
+
+```json
+{"cmd": "data", "kind": "voice.enroll", "data": {"label": "alice"}}
+```
+```json
+{
+  "kind": "voice.enroll", "status": "starting | success | failure", "error": "<message>",
+  "data": { "label": "alice", "duration_sec": 15 }
+}
+```
+
+Khi `success`, `data` là hồ sơ giọng:
+
+```json
+{ "name": "alice", "display_name": "alice", "enrollment_sources": ["web"],
+  "num_samples": 2, "num_extended": 0,
+  "enrolled_at": "2026-10-01T07:00:00Z", "updated_at": "2026-10-01T07:05:00Z" }
+```
+
+Ví dụ lỗi: `POST /speaker/record-enroll returned 409: Privacy switch is on --
+microphone recording is blocked`, `503: voice enroll needs a real microphone`
+trong simulator, `503: embedding service unavailable — please try again`.
+
+**`voice.owners`** liệt kê mọi người có ít nhất một file trong
+`users/<label>/voice/`, kèm tên file đã sắp xếp — đúng `voice_samples` mà web
+hiển thị. Danh sách gồm cả file embedding `.npy` và các file khác cạnh WAV,
+giống web. os-server đọc thư mục trực tiếp, không gọi HAL. Bucket `unknown`
+của HAL và thư mục ẩn bị bỏ qua.
+
+```json
+{"cmd": "data", "kind": "voice.owners"}
+```
+```json
+{
+  "kind": "voice.owners", "status": "success | failure", "error": "<message>",
+  "data": { "persons": [
+    { "label": "alice", "voice_samples": ["sample_web_1711929600_ab12.npy", "sample_web_1711929600_ab12.wav"] } ] }
+}
+```
+
+**`voice.file.get`** trả về một file trong `users/<label>/voice/` dạng base64
+để phát lại. `file` phải là một tên trong `voice_samples`; đường dẫn, symlink
+ra ngoài thư mục và file lớn hơn 2 MiB đều bị từ chối. Một mẫu 15 giây
+khoảng 480 KB.
+
+```json
+{"cmd": "data", "kind": "voice.file.get", "data": {"label": "alice", "file": "sample_web_1711929600_ab12.wav"}}
+```
+```json
+{
+  "kind": "voice.file.get", "status": "success | failure", "error": "<message>",
+  "data": { "label": "alice", "file": "sample_web_1711929600_ab12.wav",
+            "content_type": "audio/wav", "size": 480044, "content_base64": "UklGR..." }
+}
+```
+
+**`voice.file.remove`** xoá một mẫu audio (`.wav`, `.ogg`, `.mp3`, `.webm`,
+`.m4a`) và file embedding `.npy` của nó. Lệnh chạy cùng code với
+`POST /api/voice/file/remove` (`system/lib/voicefile`): file khác bị từ chối
+với `only audio samples can be deleted`, mẫu không tồn tại trả lỗi
+`file not found`. Khi WAV cuối cùng bị xoá, HAL `POST /speaker/remove` xoá
+toàn bộ hồ sơ giọng và `profile_removed` là `true`. Lệnh trả lỗi
+`voice enrollment in progress — try again` khi đang có thay đổi giọng chạy.
+
+```json
+{"cmd": "data", "kind": "voice.file.remove", "data": {"label": "alice", "file": "sample_web_1711929600_ab12.wav"}}
+```
+```json
+{
+  "kind": "voice.file.remove", "status": "success | failure", "error": "<message>",
+  "data": { "deleted": "sample_web_1711929600_ab12.wav", "remaining": 1, "profile_removed": false }
+}
+```
+
+**`voice.remove`** xoá toàn bộ hồ sơ giọng của người đó qua HAL
+`POST /speaker/remove`; ảnh khuôn mặt, `metadata.json` và lịch sử giữ nguyên.
+Lệnh ack `starting`, rồi `success` hoặc `failure`. Người không có hồ sơ giọng
+trả lỗi `POST /speaker/remove returned 404: voice profile not found: <label>`.
+
+```json
+{"cmd": "data", "kind": "voice.remove", "data": {"label": "alice"}}
+```
+```json
+{
+  "kind": "voice.remove", "status": "starting | success | failure", "error": "<message>",
+  "data": { "status": "ok", "name": "alice", "removed": true }
+}
+```
+
+#### `led.resting.*` — Đèn nghỉ qua MQTT
+
+Các kind `led.resting.*` cho điện thoại đúng phần **Resting light** của web
+(`LedSection.tsx`). HAL quản resting look và lưu lựa chọn ở
+`/var/lib/hal/resting_led.json`; os-server chỉ kiểm tra input và chuyển tiếp.
+
+| Thao tác trên app | Gọi HAL | MQTT kind |
+|-------------------|---------|-----------|
+| Mở màn hình | `GET /led/resting` | `led.resting.get` |
+| Kéo màu (đèn đổi theo ngay) | `POST /led/resting/preview` | `led.resting.preview` |
+| Save / tắt / về mặc định | `PUT /led/resting` | `led.resting.set` |
+
+```json
+{"cmd": "data", "kind": "led.resting.set", "data": {"mode": "custom", "color": [8, 4, 1]}}
+{"cmd": "data", "kind": "led.resting.preview", "data": {"color": [20, 0, 10]}}
+```
+
+`mode` là `default` (preset của device), `off`, hoặc `custom`; `custom` cần
+`color` `[r, g, b]` với mỗi kênh 0-255, màu đen được lưu thành `off`. Các mode
+khác bỏ qua `color`. `get` và `set` trả `success` kèm snapshot của HAL:
+
+```json
+{"mode": "custom", "color": [8, 4, 1],
+ "default": {"effect": "solid", "color": [5, 4, 3]},
+ "effective": {"effect": "solid", "color": [8, 4, 1]}}
+```
+
+**Xem trực tiếp.** Khi chủ máy kéo màu, gửi `led.resting.preview`, giới hạn
+khoảng 5 lần mỗi giây (~200 ms một lần) cộng vị trí cuối cùng. Mỗi preview vẽ
+ngay mà không đụng lựa chọn đã lưu hay ghi thẻ nhớ, và không trả lời khi thành
+công để một lần kéo không làm ngập fd_channel. HAL bỏ qua việc vẽ khi device
+đang ngủ, đang nói, phát nhạc hoặc đang hiện đèn tắt mic. Nếu không có `set` theo sau, đèn quay về màu
+đã lưu 10 giây sau lần preview cuối, nên thoát màn hình giữa chừng cũng không để
+lại màu thử. Gửi `led.resting.set` khi chủ máy bấm Save; nó hủy preview đang chờ,
+lưu lựa chọn, xoá lệnh tắt/màu đặt tay trước đó và vẽ lại. Đi qua broker sẽ trễ
+thêm vài trăm mili giây.
+
+Device không có capability `light` trả `failure` với `this device has no light`.
+Input sai bị từ chối trước khi gọi HAL.
+
+#### `volume.*` / `mic.*` — Âm lượng loa và mic qua MQTT
+
+Bản điện thoại của thẻ **Audio** trong Overview trên web. Cả hai cần capability
+`audio` (nếu không sẽ báo `this device has no audio`) và trả lời đồng bộ.
+
+| Thao tác trên app | Gọi HAL | MQTT kind |
+|-------------------|---------|-----------|
+| Hiện âm lượng | `GET /audio/volume` | `volume.get` |
+| Thả thanh trượt âm lượng | `POST /audio/volume` | `volume.set` |
+| Hiện trạng thái mic | `GET /voice/status` | `mic.get` |
+| Nút Mute / Unmute | `POST /voice/mute` / `/voice/unmute` | `mic.set` |
+
+```json
+{"cmd": "data", "kind": "volume.set", "data": {"volume": 90}}
+{"cmd": "data", "kind": "mic.set", "data": {"muted": false}}
+```
+
+**Âm lượng** dùng đúng thang của thanh trượt trên web: `volume` là 0-100% của dải
+cho phép, trong đó 100% là trần `audio.max_volume` trong SAFETY.md (hoặc 100% của
+mixer nếu device không khai báo). os-server đổi sang % mixer thật
+(`raw = round(volume × max_volume / 100)`); HAL kẹp trong giới hạn và lưu lại.
+`volume.get` và `volume.set` trả về:
+
+```json
+{"volume": 90, "raw": 72, "max_volume": 80}
+```
+
+Hiển thị `volume`; `raw` và `max_volume` chỉ để tham khảo. Gửi `volume.set` khi
+người dùng thả thanh trượt, giống web. Nếu app muốn loa đổi theo trong lúc kéo,
+giới hạn khoảng 200 ms một lần và luôn gửi giá trị cuối. Mỗi lệnh ghi mixer và
+trả lời.
+
+**Mic**: bắt buộc có `muted` (`true` tắt, `false` bật). `mic.get` và `mic.set`
+thành công trả về:
+
+```json
+{"muted": true, "hw_switch_muted": true, "available": true}
+```
+
+`hw_switch_muted` là công tắc mic vật lý, `null` trên device không có công tắc.
+Khi nó là `true` thì không bật mic được: `mic.set` với `muted: false` báo lỗi
+`Hardware mic switch is off — flip the physical switch to unmute`. Hãy vô hiệu nút
+Unmute và hiện dòng đó. `available` là false khi voice pipeline không chạy. Tắt
+mic cũng bật đèn báo tắt mic, và lựa chọn được giữ qua các lần restart HAL.
+
+#### `realtime.get` / `realtime.set` — Cài đặt realtime voice qua MQTT
+
+Bản điện thoại của trang **Settings → Realtime** trên web (trên web chỉ hiện ở chế độ debug).
+
+```json
+{"cmd": "data", "kind": "realtime.get"}
+```
+
+`realtime.get` trả `success` đồng bộ, gồm cài đặt đã lưu và các lựa chọn để hiển thị:
+
+```json
+{
+  "config": {"enabled": true, "provider": "gemini", "model": "…", "voice": "Kore",
+             "reasoning": "LOW", "base_url": "", "has_api_key": false},
+  "options": {"providers": ["gemini", "openai", "gptlive", "pipecat_v1", "none"],
+              "voices": {"gemini": ["…"], "openai": ["…"], "gptlive": ["…"], "pipecat_v1": []},
+              "reasoning": {"gemini": ["MINIMAL", "LOW", "MEDIUM", "HIGH"], "openai": ["…"], "gptlive": [], "pipecat_v1": []}}
+}
+```
+
+Key không bao giờ được trả về; `has_api_key` cho biết có key riêng đã lưu hay không.
+`base_url` chỉ là giá trị override (rỗng nghĩa là lấy từ AI brain). `web_search`
+chỉ xuất hiện với `pipecat_v1`. Danh sách voice hay reasoning rỗng nghĩa là provider
+đó không có tùy chọn này, nên ẩn ô chọn.
+
+`realtime.set` lưu bất kỳ trường nào trong `enabled`, `provider`, `model`, `voice`,
+`reasoning`, `api_key`, `base_url` và `web_search` (chỉ pipecat_v1). Trường bỏ trống
+giữ nguyên. Lệnh ack `starting`, kiểm tra theo cùng danh sách lựa chọn, lưu
+`config.json`, restart HAL rồi ack `success` hoặc `failure`:
+
+```json
+{"cmd": "data", "kind": "realtime.set", "data": {"enabled": true, "provider": "gemini", "voice": "Kore", "reasoning": "LOW"}}
+```
+
+Model, voice và reasoning được lưu riêng theo từng provider và áp cho provider
+đang được đặt (hoặc provider hiện tại). Đổi provider mà không gửi các trường này
+thì giữ lựa chọn đã lưu của provider đó; voice hay reasoning không có trong danh
+sách của provider sẽ bị từ chối. Chuỗi rỗng giữ nguyên trường, nên không xoá được
+`api_key` hay `base_url` đã lưu qua MQTT. Ack trả lại request nhưng bỏ `api_key`. Sau `success`, HAL sẽ
+không phản hồi vài giây trong lúc restart.
+
 #### `chat.send` + `chat.event`
 
 Sentinel nội bộ `NO_REPLY` dùng khi chuyển tiếp sẽ được loại khỏi `chat.event`; client sẽ nhận tiến trình Harness và phản hồi cuối cùng.
@@ -1008,8 +1527,9 @@ Vài điểm triển khai mà người viết backend cần biết:
 - **Forward bằng sensing type `mqtt_chat`, không phải `web_chat`.** Mọi gate xử lý
   hai type như nhau (`sensingmsg.IsChat`: suppress TTS, không wake vật lý, không
   opening filler, queue giống hệt khi agent bận, cùng prefix `[user] ` gửi model).
-  Tách type chỉ để badge turn trên Flow Monitor cho biết **tin nhắn gõ ở đâu** —
-  📱 `mqtt_chat` (app điện thoại) vs 🖥 `web_chat` (composer của monitor). Nếu
+  Tách type để badge turn trên Flow Monitor cho biết **tin nhắn gõ ở đâu** —
+  📱 `mqtt_chat` (app điện thoại) vs 🖥 `web_chat` (composer của monitor) — và để
+  tin nhắn kết thúc bằng `[via:mobile]` thay vì `[via:web]` (xem os-server_vi.md, "Marker nguồn"). Nếu
   `speak: true` thì turn forward thành `voice` và hiện như turn voice.
 - **Một client broker riêng** (`device-<id>-chat`) được giữ mở cho stream. Helper
   `publish` dùng chung mở rồi đóng kết nối cho từng message — hợp lý với kết quả
@@ -1064,6 +1584,10 @@ nguyên vẹn để backend trả đúng client đã hỏi; cả hai tuỳ chọ
   và `.log` không được serve (config JSON của runtime chứa gateway token); path
   phải resolve (`EvalSymlinks`) vào trong root, nên `..` lẫn symlink thoát ra đều
   chết.
+- **MQTT còn từ chối ảnh camera của HAL trong `/tmp/hal-*`** (ảnh sensing,
+  motion, emotion và tư thế). MQTT không xác thực người gửi và tên file là
+  timestamp đoán được, nên chỉ web chat đã đăng nhập mới hiện được. Ảnh agent chụp
+  ("chụp ảnh đi") nằm trong `media/` của runtime nên vẫn được trả bình thường.
 - **Mọi trường hợp từ chối đều trả cùng một message**, `"file not available"`.
   Nói rõ là sai đuôi / ngoài root / không tồn tại thì kẻ dò biết được cấu trúc
   filesystem của device; lý do thật ghi vào log trên device.
@@ -1084,6 +1608,9 @@ mục đích đó.
 
 ### `harness.voice-mode.get` / `harness.voice-mode.set` — Giọng nói Harness-only
 
+Bật mode yêu cầu HAL xác nhận board đang chạy có cấu hình MPR121. Metadata thiếu/false hoặc lỗi đọc HAL trả `status:"failure"` và giữ mode tắt. Vẫn cho phép tắt. Snapshot có thêm `supported`; xem [Tích hợp Harness](harness_vi.md#chế-độ-giọng-nói-harness-only).
+
+
 **Nhận trên `fa_channel`:**
 ```json
 {"cmd":"data","kind":"harness.voice-mode.get"}
@@ -1101,10 +1628,10 @@ Cả hai lệnh phản hồi trên `fd_channel` bằng metadata `MQTTDataRespons
 `type:"data"`, cùng `kind` với request và snapshot giống
 `GET /api/harness/voice-mode` (lược bỏ metadata thiết bị trong ví dụ):
 ```json
-{"type":"data","kind":"harness.voice-mode.set","status":"success","data":{"enabled":true,"generation":1789350000000000,"machineId":"computer-id","agentId":"agent-id","agentName":"Mike","focusRevision":"instance:3","focusAvailable":true}}
+{"type":"data","kind":"harness.voice-mode.set","status":"success","data":{"enabled":true,"supported":true,"generation":1789350000000000,"machineId":"computer-id","agentId":"agent-id","agentName":"Mike","focusRevision":"instance:3","focusAvailable":true}}
 ```
 
-Snapshot là `{enabled,generation,machineId,agentId,agentName?,focusRevision,focusAvailable,pending?,error?}`.
+Snapshot là `{enabled,supported,generation,machineId,agentId,agentName?,focusRevision,focusAvailable,pending?,error?}`.
 Khi focus chưa khả dụng, snapshot có thể chứa `focusAvailable:false` và
 `error` dù lệnh thành công. Input không hợp lệ hoặc controller không khả dụng
 trả `status:"failure"` cùng field `error` của envelope.
@@ -1210,11 +1737,11 @@ client ID riêng duy nhất cho app (không dùng client ID của device). Subsc
 `buddy.pair.start` / `buddy.pair.revoke` hiện có lên `fa_channel`. Không cần sửa
 BFF. Cần kiểm chứng ACL và khả năng truy cập broker từ mạng mobile trên triển
 khai thật. Luồng phục vụ app foreground đang kết nối, không phải push notification
-khi app đã đóng. Xem [prompt bàn giao mobile](../buddy-mobile-handoff_vi.md).
+khi app đã đóng. Xem [prompt bàn giao mobile](buddy-mobile-handoff_vi.md).
 
-### `ota` — Trigger OTA update
+### `ota` — không được xử lý
 
-Xử lý bởi bootstrap worker, không qua MQTT handler trực tiếp.
+Router MQTT của os-server không có case `ota`: message bị log là `unknown command` rồi bỏ qua. OTA chạy theo lịch riêng của bootstrap worker; muốn cài ngay một component qua MQTT thì dùng `data` kind `system.software_update`.
 
 ## Code
 
@@ -1231,6 +1758,12 @@ Xử lý bởi bootstrap worker, không qua MQTT handler trực tiếp.
 | `system/server/device/delivery/mqtt/data_handler.go` | Handle `data` command kinds `oauth.set`/`oauth.remove` (+ access-token store) |
 | `system/server/device/delivery/mqtt/skills_install_store_handler.go` | Handle `skills.install_store` (async catalog download → `AgentGateway.InstallSkillArchive`) |
 | `system/server/device/delivery/mqtt/skills_upload_handler.go` | Handle `skills.upload` (SKILL.md inline → `AgentGateway.InstallSkillMarkdown`) |
+| `system/server/device/delivery/mqtt/face_enroll_handler.go` | Handle `face.enroll` (kiểm tra payload, rồi gọi bất đồng bộ `hal.FaceEnroll` → HAL `POST /face/enroll`) |
+| `system/server/device/delivery/mqtt/face_owners_handler.go` | Handle `face.owners` (→ HAL `GET /face/owners`, bỏ bucket `unknown`) và `face.remove` (bất đồng bộ → HAL `POST /face/remove`) |
+| `system/server/device/delivery/mqtt/led_resting_handler.go` | Handle `led.resting.get`, `led.resting.set` và `led.resting.preview` (HAL `/led/resting`, capability `light`) |
+| `system/server/device/delivery/mqtt/audio_handler.go` | Handle `volume.get`, `volume.set` (0-100% của dải SAFETY.md → HAL `/audio/volume`), `mic.get` và `mic.set` (HAL `/voice/status`, `/voice/mute`, `/voice/unmute`; 409 → thông báo công tắc phần cứng) |
+| `system/server/device/delivery/mqtt/voice_enroll_handler.go` | Handle `voice.enroll` (bất đồng bộ → HAL `POST /speaker/record-enroll`, mic của đèn, 15 giây), `voice.owners`, `voice.file.get`, `voice.file.remove` (qua `system/lib/voicefile`) và `voice.remove` (bất đồng bộ → HAL `POST /speaker/remove`) |
+| `system/lib/voicefile/voicefile.go` | Liệt kê, đọc và xoá mẫu giọng trong `users/<label>/voice/`; dùng chung cho `POST /api/voice/file/remove` và các kind `voice.*` |
 | `system/server/device/delivery/mqtt/skills_files_handler.go` | Handle `skills.files` (đọc file của một skill đã cài: danh sách, hoặc nội dung một file) |
 | `system/server/device/delivery/mqtt/skills_uninstall_handler.go` | Handle `skills.uninstall` |
 | `system/server/device/delivery/mqtt/chat_send_handler.go` | Handle `chat.send` — forward turn qua loopback tới sensing endpoint |

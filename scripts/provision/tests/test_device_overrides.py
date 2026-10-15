@@ -24,7 +24,7 @@ class DeviceOverrideTests(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
         self.profile = self.root / "staged-device"
-        for name in ("ROBOT.md", "SAFETY.md", "rootfs/opt/hal/.env", "rootfs/etc/asound.conf"):
+        for name in ("ROBOT.md", "SAFETY.md", "rootfs/opt/hal/.env", "rootfs/etc/asound.conf", "rootfs/etc/systemd/system/lamp-cmedia-speaker.service"):
             dest = self.profile / name
             dest.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(SOURCE / name, dest)
@@ -66,7 +66,7 @@ class DeviceOverrideTests(unittest.TestCase):
                       "HAL_GEMINI_USE_LANGUAGE_CODES=true"):
             self.assertIn(value + "\n", env)
         self.assertIn("startup_volume: 35", (self.profile / "ROBOT.md").read_text())
-        self.assertIn("max_volume: 35", (self.profile / "SAFETY.md").read_text())
+        self.assertIn("max_volume: 50", (self.profile / "SAFETY.md").read_text())
         self.assertIn("max_speed: 120", (self.profile / "SAFETY.md").read_text())
         alsa = (self.profile / "rootfs/etc/asound.conf").read_text()
         self.assertEqual(alsa, (SOURCE / "overrides/pro-respeaker-lite/rootfs/etc/asound.conf").read_text())
@@ -75,19 +75,21 @@ class DeviceOverrideTests(unittest.TestCase):
         self.assertEqual(identity.read_text(), "pro-respeaker-lite\n")
         self.assertFalse((self.root / "opt/hal/.env").exists())
 
-    def test_pro_only_adds_environment_to_standard(self):
+    def test_pro_adds_environment_and_preserves_existing_speaker_gain(self):
         before = self.snapshot()
         self.select("pro")
         overrides.apply_overrides(self.profile, self.root)
         after = self.snapshot()
         changed = {name for name in before.keys() | after.keys() if before.get(name) != after.get(name)}
-        self.assertEqual(changed, {"ROBOT.md", "sen63c.json", "rootfs/opt/hal/.env"})
+        self.assertEqual(changed, {"ROBOT.md", "sen63c.json", "rootfs/opt/hal/.env",
+                                   "rootfs/etc/systemd/system/lamp-cmedia-speaker.service"})
         # The generic renderer namespaces saved volume for every selected profile;
-        # no microphone, playback, processing or volume-policy overrides exist.
+        # pro retains its hardware gain while standard gains 3 dB.
         env = (SOURCE / "rootfs/opt/hal/.env").read_text()
         self.assertEqual(
             (self.profile / "rootfs/opt/hal/.env").read_text(),
-            overrides.merge_env(env, "HAL_VOLUME_STATE_PATH=/root/config/.volume-pro"),
+            overrides.merge_env(env, "HAL_VOLUME_STATE_PATH=/root/config/.volume-pro\n"
+                                "HAL_VOICE_OPENING_FILLERS_ONLY=true"),
         )
         for name in ("rootfs/etc/asound.conf", "SAFETY.md"):
             self.assertEqual((self.profile / name).read_bytes(), (SOURCE / name).read_bytes())
@@ -95,7 +97,9 @@ class DeviceOverrideTests(unittest.TestCase):
             (self.profile / "ROBOT.md").read_text().replace("  environment:", "  # environment:"),
             (SOURCE / "ROBOT.md").read_text(),
         )
-        self.assertFalse((self.profile / "overrides/pro/rootfs").exists())
+        service = "rootfs/etc/systemd/system/lamp-cmedia-speaker.service"
+        self.assertIn("sset Speaker 9", (SOURCE / service).read_text())
+        self.assertIn("sset Speaker 6", (self.profile / service).read_text())
 
     def test_pro_xvf3800_keeps_the_array_tuning(self):
         # The reSpeaker XVF3800 assembly tested before the ReSpeaker Lite: live
@@ -121,6 +125,7 @@ class DeviceOverrideTests(unittest.TestCase):
                 env = (self.profile / "rootfs/opt/hal/.env").read_text()
                 self.assertNotIn("HAL_LITE_ADAPTIVE_GATE", env)
                 self.assertIn("HAL_AEC_ENABLED=" + ("true" if profile in ("standard", "pro") else "false") + "\n", env)
+                self.assertIn("HAL_VOICE_OPENING_FILLERS_ONLY=" + ("true" if profile in ("standard", "pro") else "false") + "\n", env)
 
     def test_arbitrary_profile_uses_package_data_without_product_logic(self):
         (self.profile / "overrides/pro").rename(self.profile / "overrides/studio")
@@ -163,7 +168,7 @@ class DeviceOverrideTests(unittest.TestCase):
         first = self.snapshot()
         overrides.apply_overrides(self.profile, self.root)
         self.assertEqual(first, self.snapshot())
-        for name in ("ROBOT.md", "SAFETY.md", "rootfs/opt/hal/.env", "rootfs/etc/asound.conf"):
+        for name in ("ROBOT.md", "SAFETY.md", "rootfs/opt/hal/.env", "rootfs/etc/asound.conf", "rootfs/etc/systemd/system/lamp-cmedia-speaker.service"):
             shutil.copy2(SOURCE / name, self.profile / name)
         overrides.apply_overrides(self.profile, self.root)
         self.assertEqual(first, self.snapshot())
@@ -208,7 +213,7 @@ class DeviceOverrideTests(unittest.TestCase):
         overrides.apply_overrides(self.profile, self.root)
         self.assertIn("environment", parse_device("lamp", (self.profile / "ROBOT.md").read_text()).capabilities)
         # Profile changes render a fresh package; they do not undo a prior render.
-        for filename in ("ROBOT.md", "SAFETY.md", "rootfs/opt/hal/.env", "rootfs/etc/asound.conf"):
+        for filename in ("ROBOT.md", "SAFETY.md", "rootfs/opt/hal/.env", "rootfs/etc/asound.conf", "rootfs/etc/systemd/system/lamp-cmedia-speaker.service"):
             shutil.copy2(SOURCE / filename, self.profile / filename)
         for source in SOURCE.glob("*.json"):
             shutil.copy2(source, self.profile / source.name)

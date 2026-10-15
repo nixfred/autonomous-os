@@ -75,9 +75,10 @@ mới là pass-through.
 | 2 | `quiet_hours` (light + audio) | `active_max_brightness` (theo giờ) + `audio_quiet_now` | gate LED + route music | **đã thực thi (v1)** |
 | 3 | `motion.max_speed` (theo sự hiện diện) | `min_move_duration` | route servo | **đã thực thi (v1)** (`max_accel` dự trữ) |
 | 3b | `motion.stop_always` | — | — | **được khai báo / đảm bảo theo cấu trúc** — chưa có route-level gate nào dùng field này (xem bên dưới) |
-| 4 | trạng thái fail-safe (mất mạng/gateway → dừng tracking; lỗi board → cô lập `503`; `thermal.max_temp_c` → health event quá nhiệt SoC + dừng tracking; setup + quá dòng servo dự trữ) | hook WS-disconnect + `503` theo từng capability + monitor nhiệt (`thermal_over`/`read_soc_temp_c`) | `services` khi gateway WS disconnect + route HAL/`/health` + `server.py` `_thermal_monitor` | **thực thi một phần (v1)** (setup + quá dòng dự trữ) |
+| 4 | trạng thái fail-safe (mất mạng/gateway → dừng tracking; lỗi board → cô lập `503`; `thermal.max_temp_c` → health event quá nhiệt SoC + dừng tracking; chạm vật cản → dừng tại chỗ (giữ torque) + chime + tạm dừng ngắn; giới hạn torque servo ở các khớp chịu trọng lượng; quá tải servo → cắt torque + chime + thử lại theo giờ; setup dự trữ) | hook WS-disconnect + `503` theo từng capability + monitor nhiệt (`thermal_over`/`read_soc_temp_c`) + guard contact + overload (`OverloadGuard`) | `services` khi gateway WS disconnect + route HAL/`/health` + `server.py` `_thermal_monitor` + `animation_service.py` `_overload_tick` | **thực thi một phần (v1)** (setup dự trữ) |
 | 5 | trần `audio.max_volume` | `clamp_volume` | route `/audio/volume`, phía trên chỗ rẽ nhánh loa/sink BT | **thực thi (v1)** |
-| 6 | `motion.max_cog_offset_mm` (theo sự hiện diện) | chấm trọng tâm toàn thân theo từng frame (`recording_stability.py`) | lúc load recording (`resample_recording`), cả driver thật lẫn mock | **thực thi (v1)** |
+| 6 | `motion.max_cog_offset_mm` (theo sự hiện diện) | chấm trọng tâm toàn thân theo từng frame (`recording_stability.py`) | lúc load recording (`resample_recording`), cả driver thật lẫn mock; `POST /servo/move` và `/servo/nudge` thì cắt ngắn tư thế | **thực thi (v1)** |
+| 7 | `motion.joint_limits` (theo sự hiện diện) | kẹp `[min, max]` theo từng khớp (`LeLampFollower.send_action`) | mọi lần ghi `Goal_Position` trên driver feetech — recording, tracking/gaze/aim, `/servo/move`, nudge, web; log `[joint-limits]` (tối đa 1 lần/giây). Lamp: hợp của dải mà recording, aim preset và tracking dùng, cộng 5° (`base_yaw` ±105, `base_pitch` −2..67, `elbow_pitch` −11..77, `wrist_roll` ±60, `wrist_pitch` −89..57), nên không thứ gì đã ship bị đổi; nó chỉ chặn lệnh lạc | **thực thi (v1)** |
 
 Mỗi slice thêm field vào `SafetyPolicy` và gate function rồi nối một/nhiều route;
 loader và contract front-matter **không** đổi hình dạng giữa các slice (chỉ thêm field
@@ -162,6 +163,8 @@ route mà tính chất đó tồn tại vì nó — cắt ngang move hoặc reco
 Nó KHÔNG phải `/servo/release` — cái đó đi về tư thế nghỉ rồi mới tắt torque; một
 lệnh dừng mà lại di chuyển trước là sai với mọi thân có bánh hoặc có chân (#201).
 
+`POST /servo/move` từ chối target joint không hữu hạn với 422. Khi có giới hạn `motion.max_speed`, mọi joint được yêu cầu phải có vị trí hiện tại hữu hạn; lỗi đọc pose, thiếu joint hoặc pose không hợp lệ trả 503 trước khi phát lệnh di chuyển. Không khai báo giới hạn này thì giữ nguyên pass-through. Không thêm giới hạn góc joint mới. `/servo/stop` dừng worker tracking trước khi kiểm tra kết nối motor, tránh để tracking chạy khi motor mất kết nối; vẫn trả 503 nếu không thể halt phần cứng.
+
 Vòng lặp vision-tracking cũng đã được gate, nhưng cần cơ chế riêng:
 `min_move_duration` không bound được nó vì không có đích nào để kéo dài duration,
 chỉ có speed profile theo từng frame. `cap_speed_dps` kẹp trần pursuit/saccade của
@@ -193,7 +196,12 @@ thì ghi log là không chấm được tư thế rồi pass-through chứ khôn
 khai 22 mm (đo được: clip bên thứ ba làm lật lamp-0c89 đạt đỉnh 31.6 mm, recording
 tệ nhất trong bộ ship là 17.7 mm, 28 cái còn lại ≤ 17.6 mm — xem
 `robots/lamp/docs/motion-playback.md`); chưa thân nào khác khai, nên không có gì
-khác đổi hành vi. Mỗi thân phải tự suy ra con số từ thư viện animation của chính
+khác đổi hành vi. Lệnh di chuyển trực tiếp cũng được chấm: `POST /servo/move` và
+`/servo/nudge` không từ chối tư thế vượt trần mà **cắt ngắn** nó (`limit_lean_back`),
+chỉ đi tới chỗ trọng tâm còn trong trần, và `/servo/move` báo mục tiêu thực gửi
+trong `clamped`. Các vòng lặp thị giác (tracking, gaze, aim) cắt y như vậy với trần
+riêng chặt hơn 16 mm (`MAX_LEAN_BACK_MM`), vì mặt nằm trên khung hình khiến chúng
+cứ đòi ngẩng thêm. Mỗi thân phải tự suy ra con số từ thư viện animation của chính
 nó — đó là milimet theo hình học và khối lượng của thân đó, không phải hằng số để
 chép lại.
 
@@ -221,8 +229,10 @@ thời gian, rồi kết thúc lease bằng cách giữ tại vị trí đo đư
 xác nhận tư thế đó từ phản hồi vị trí đo được trước khi tắt torque. Nếu không tới
 được tư thế nghỉ, driver halt-hold và giữ torque bật. Handshake bắt buộc
 firmware khai `motion.timed_move`, đọc vị trí thật, halt-and-hold và torque
-release. Nếu HAL, process hoặc Wi-Fi biến mất, firmware ESP32 hết hạn lease (hoặc
-xử lý disconnect) rồi giữ tại vị trí đo được; firmware chỉ có tham số spring
+release. Nếu HAL, process hoặc Wi-Fi biến mất, firmware ESP32 hết hạn lease rồi
+dừng và giữ tại vị trí đo được; còn khi WebSocket bị đóng, firmware đang cài sẽ
+nhả torque và khởi động lại, vì vậy HAL giữ kết nối mở khi commissioning không
+đạt target; firmware chỉ có tham số spring
 speed chưa hiệu chuẩn sẽ bị từ chối vì không thể giữ đúng trần độ/giây đã khai.
 Đường này đã có test protocol phía host; fault injection trên Wi-Fi và phần cứng
 thật vẫn là bước qualification trên thiết bị.
@@ -256,6 +266,49 @@ yêu cầu, nên chỉ thời gian trên host không chứng minh chuyển độ
 HAL gia hạn lease trong lúc kiểm tra tới đích (sai số tối đa 1 độ), dùng khoảng
 chờ ổn định 2 giây trước khi halt và báo lỗi thay vì báo thành công. Từng request
 protocol vẫn chịu command timeout đã cấu hình.
+
+Commissioning home thuộc công cụ thử nghiệm riêng của Stack-chan, không thuộc
+contract motion chung của OS. Entrypoint chuẩn `hal.server:app` không có endpoint
+`/stackchan/*` hoặc `/servo/home*`. Schema HTTP và route thử nghiệm nằm trong
+`robots/_experimental/stackchan/commissioning.py`; driver Stack-chan thực thi
+frame tọa độ và giới hạn commissioning riêng. Route servo, model và contract
+`MotionService` dùng chung được giữ nguyên.
+
+Entrypoint thử nghiệm cung cấp `GET /stackchan/home` để discovery capability thụ
+động và `GET /stackchan/home/position` để đọc pan/tilt đo được trong
+`calibrated_home_deg_v1`; cả hai không acquire motion lease. Chuyển động mặc định
+bị tắt (`STACKCHAN_HOME_COMMISSIONING_ENABLED=0`). Khi được bật rõ ràng,
+`POST /stackchan/home/move` yêu cầu capability firmware `motion.home_degrees.v1`,
+frame tọa độ tường minh, chỉ target tilt từ 7 đến 10 độ và duration yêu cầu từ
+2 đến 10 giây. Safety policy có thể kéo dài duration tới 60 giây. Feedback ban
+đầu phải có pan trong ±30 độ và tilt trong [0, 5). Torque yaw tắt trong chuyển
+động chỉ có pitch này. Dưới 5 độ, stop hoặc mất transport có thể khiến torque
+tắt hoặc session lỗi; vẫn cần hỗ trợ cơ khí và giám sát trực tiếp.
+
+Trong mỗi chuyển động, kể cả lần lặp lại tùy chọn, driver đọc feedback sau khoảng
+chờ tối đa 250 ms hoặc nửa TTL của lease, lấy giá trị ngắn hơn. Độ trễ request
+cộng thêm vào khoảng này; command timeout đã cấu hình vẫn áp dụng. Feedback lỗi
+hoặc yaw lệch quá 1 độ sẽ kích hoạt halt mà không đợi hết duration. Giám sát theo
+mẫu không thể phát hiện mọi sai lệch giữa các lần đọc. Khi không tới đích sau
+settling, driver halt và trả các mẫu đo settling nhưng giữ kết nối. Lỗi firmware
+cũng giữ kết nối; command timeout vẫn đóng kết nối, và firmware đang dùng sẽ
+nhả torque rồi reboot khi mất kết nối. Không thể bảo đảm giữ vị trí thành công
+cho mọi lỗi, nhất là dưới ngưỡng giữ của firmware.
+
+Thành công yêu cầu pitch đo được trong sai số 1 độ so với target, ít nhất 6 độ
+và đã tiến dương ít nhất 1 độ. Nếu đầu dừng thiếu nhưng ổn định (các mẫu cuối
+trong 0,2 độ, đã tiến ít nhất 1 độ, đạt ít nhất 6 độ, thiếu hơn 1 nhưng không
+quá 3 độ), driver lặp lại đúng target tối đa một lần. Phản hồi ghi `recommands`.
+Chỉ khi đo được đã tới đích, `lease.release` mới cấp torque lại cho cả hai trục;
+sau đó driver đọc lại vị trí.
+
+Dùng `POST /stackchan/stop` và `POST /stackchan/release` của công cụ để chẩn đoán.
+Lỗi firmware trả 502 với `op`, `code`, `message`; các lỗi nhả lực khác được báo,
+gồm không tới đích và bị hủy, trả 502 với `message`, `errors`. Endpoint nhả lực
+thử nghiệm không báo thành công khi thao tác thất bại. `/servo/stop` và
+`/servo/release` chung giữ hành vi OS hiện có; chỉ phản hồi thành công của
+endpoint release cũ chưa chứng minh torque đã được nhả. Công cụ này không xác
+minh calibration hoặc qualification phần cứng để sử dụng thường xuyên.
 
 Driver Stack-chan vẫn ở giai đoạn thử nghiệm. Trước khi qualification thiết bị:
 
@@ -310,8 +363,8 @@ rồi mới giữ nguyên body.
 ### Slice 4 — trạng thái fail-safe (checklist)
 
 Fail-safe **theo trạng thái** chứ không clamp từng request: khi thiết bị mất một phụ
-thuộc tới hạn, nó rơi về tư thế an toàn một cách tất định, *dưới* tầng agent. Ba điều
-kiện đã thực thi; setup-incomplete và over-current servo còn dự trữ.
+thuộc tới hạn, nó rơi về tư thế an toàn một cách tất định, *dưới* tầng agent. Sáu điều
+kiện đã thực thi; setup-incomplete còn dự trữ.
 
 - [x] **Mất mạng / gateway → dừng tracking do agent điều khiển.** Khi gateway
       WebSocket disconnect, `runtimes/openclaw/service_ws.go` gọi
@@ -333,8 +386,164 @@ kiện đã thực thi; setup-incomplete và over-current servo còn dự trữ.
       critical trip riêng của board, không đoán chung chung.
 - [ ] **Setup chưa xong → dự trữ.** Chưa gate trong runtime (chỉ reflex setup/identity
       là ý định đã khai, chưa thực thi).
-- [ ] **Quá dòng (servo) → dự trữ.** Không có cảm biến dòng servo trên phần cứng; dự trữ
-      cho phần cứng/telemetry lộ ra được nó.
+- [x] **Chạm vật cản → dừng tại chỗ, chime, tạm dừng ngắn.** Dừng tay đèn khi nó va
+      vào vật gì đó lúc đang chuyển động. Dùng chung thread monitor, lần đọc
+      `Present_Load` và handler `on_overload` với cut-off quá tải bên dưới, và được cấu
+      hình trong cùng file: object `contact` tùy chọn (`load`, `hold_s`, `pause_s`, đúng
+      ba key đó) trong entry board; không có `contact` nghĩa là không có contact stop.
+      `load` là một sàn chung cho mọi khớp hoặc một map `{joint: floor}`, và khớp không có
+      trong map thì không được theo dõi. Khớp được theo dõi ở mức sàn của nó trở lên (Lamp:
+      `base_yaw` `550`, `wrist_roll` `750`, `wrist_pitch` `650`, đơn vị 0,1 % lực đẩy tối
+      đa) trong `contact.hold_s` (Lamp: `0.05` s, khoảng hai mẫu 50 ms) sẽ dừng chuyển
+      động đang chạy, và khớp nào vượt **envelope đã học** khi một recording đã học đang
+      chạy cũng vậy (xem đoạn tiếp theo); khi đó driver ghim tư thế hiện tại và giữ **torque bật**, nên tay đèn không rơi;
+      runtime dừng vision tracker qua `on_contact`, không phát âm thanh (bỏ chime vì
+      kêu quá thường xuyên, gây khó chịu).
+      Trong `contact.pause_s` (Lamp: `3` s)
+      mọi lệnh ghi goal bị chặn để không lái ngược vào vật cản, và `/servo/move`,
+      `/servo/aim`, `/servo/nudge` lỗi với "Servo contact stop active". Sau đó trạng thái
+      được đọc lại từ phần cứng và idle chạy tiếp; thân máy đã được park trong lúc đó thì
+      giữ nguyên. Contact stop được kiểm tra trước cut-off, và tay đang giữ mà vẫn bị ép
+      thì cut-off vẫn trip như cũ. Khi đặt `contact.release_after_s` (Lamp: `1` s), tay
+      vẫn **giữ** tay đèn lâu chừng đó trong lúc tạm dừng — khớp vừa dừng vẫn ở sàn đã làm
+      nó dừng trở lên (sàn tải hoặc lag của đường bao đã học nếu có) hoặc bị đẩy lệch 1° khỏi
+      tư thế đã ghim (`CONTACT_RELEASE_LAG`), nếu khớp đó có sàn contact cố định, hoặc khớp
+      nào còn vượt sàn
+      contact cố định hay sàn tải/lag `off_playback` — thì không phải va chạm thoáng qua: driver log
+      `[contact] … releasing torque` và chuyển sang cắt torque như cut-off (tay đèn rũ,
+      khoá `retry_s`, chime của cut-off). Chạm rồi buông trong khoảng đó thì chỉ tạm dừng.
+      Sàn đã làm dừng quan trọng với đèn đã học: trên lamp-52e6 tay chặn `base_yaw` ở
+      39.6 % (đường bao 18 %) nhưng không giữ nổi tới sàn cố định 55 %, chỉ giữ ở 23-36 %; trên lamp-a0ae (`P=16`) tay
+      giữ `base_yaw` chỉ ở 12-16 % nhưng lệch 1.3-8.5°, còn `base_yaw` ghim yên không ai
+      chạm lệch 0.0°.
+      Khớp gánh trọng lượng (không có sàn cố định: `base_pitch`, `elbow_pitch`) không bao
+      giờ nhả theo sàn đã học: khi ghim, nó vẫn chịu tải trọng lực (và bị võng) tuỳ tư thế lúc dừng,
+      không phải tư thế đường bao đã học. Không ai chạm, `elbow_pitch` của lamp-a0ae dừng ở
+      38.0 % trên sàn 22.7 % rồi giữ 33.4 %, nên cộng 10 % vẫn rũ. Các khớp đó chỉ nhả theo
+      sàn `off_playback` hoặc cut-off. Lộ ra ở `GET /health.servo_overload.contact` (`active`,
+      `resume_in_s`, `trips`, `last_trip`, các ngưỡng). Sàn của Lamp lấy từ lamp-52e6
+      (2026-10-09): qua 19 recording, đỉnh chuyển động tự do là `base_yaw` 46 %,
+      `wrist_roll` 52 %, `wrist_pitch` 43 %, còn lấy tay chặn `base_yaw` đẩy nó lên
+      94-100 %. `base_pitch` và `elbow_pitch` không có sàn cố định: do gánh trọng lượng tay
+      đèn, chúng lên 83-100 % khi chuyển động tự do, trong khi lấy tay chặn chỉ đọc được
+      36-74 %, nên một sàn cố định không phân biệt được hai trường hợp.
+      **Envelope đã học (như lượt học của cửa thang máy).** Load của một lượt chạy tự do ở
+      mỗi frame của recording lặp lại được, nên khi đặt `contact.profile_margin` (Lamp:
+      `120` = 12 %) driver giữ một envelope riêng cho từng máy ở
+      `/var/lib/hal/contact_profile.json` (`HAL_CONTACT_PROFILE_PATH`; không có bản mặc
+      định dùng chung, vì tải và ma sát khác nhau giữa các máy — envelope học trên
+      lamp-52e6 làm idle của lamp-a0ae dừng nhầm mỗi 8 giây — nên máy chưa tự học chỉ
+      chạy với các sàn cố định): `{recording: {joint:
+      [load tối đa mỗi frame], "lag:<joint>": [|goal - present| tối đa mỗi frame, 0,1
+      độ]}}`. Các entry lag có ích ở chỗ load bất lực: một khớp đang chạm trần torque,
+      hoặc một khớp mềm mà tay chỉ làm chậm lại, sẽ tụt sau goal của nó. Khi đặt
+      `contact.lag_margin` (Lamp: `35` = 3,5°), khớp nào trễ hơn lag đã học đúng mức đó
+      cũng tính là va chạm. Goal là giá trị `LeLampFollower.send_action` ghi gần nhất,
+      khi mọi khớp đều có một giá trị ghi trong giây vừa qua (`GOAL_CACHE_S`), nên mỗi
+      nhịp lúc phát recording chỉ đọc `Present_Load` và `Present_Position`; sau một lần
+      di chuyển raw, một lần bật/tắt torque, hoặc khi không có lần ghi nào gần như vậy,
+      `Goal_Position` được đọc lại từ servo. `POST /servo/contact/learn` (hoặc nút **Learn** ở mục Touch
+      Sensitivity trang Servo của web Monitor; `{"recordings": [...], "runs": 2}`; mặc định mọi recording trừ `music_*`) chạy tự do mỗi recording `runs` lần ở
+      nền và lưu giá trị tối đa từng frame; vùng quanh tay đèn phải trống, vì thứ gì nó
+      chạm vào đều được học là bình thường. Khi một recording đã học chạy frame của chính
+      nó, sàn của mọi khớp là envelope (tối đa trong ±3 frame) cộng margin, kể cả
+      `base_pitch` và `elbow_pitch`. Đoạn ramp vào recording không có envelope và giữ các
+      sàn cố định. Khi không recording nào sở hữu thân máy (quay nhìn theo gaze, tracking,
+      `/servo/move`, giữ tư thế) thì map tùy chọn `contact.off_playback` được áp thay: sàn
+      load theo tên khớp và sàn lag dạng `lag:<joint>` (Lamp: `base_pitch` 57 %,
+      không có sàn tải `elbow_pitch`, vì elbow của lamp-a0ae chạm trần torque 60 % ngay cả
+      khi nâng tay không ai chạm; lag `base_yaw` 10°, `base_pitch` 14°, `elbow_pitch` 12°,
+      `wrist_roll` 9°, `wrist_pitch` 12°, lưu theo 0,1 độ). Ở trần torque 60 % các khớp
+      trễ nhiều hơn: các sàn lấy từ dữ liệu trần 70 % đã trip nhầm 5 lần trong một lượt
+      học trên lamp-52e6, còn các sàn này không trip nhầm lần nào qua ~3 phút (6
+      recording + 90 s idle). Các sàn này đứng ngoài trong lúc một lệnh xoay trực tiếp chạy
+      (`move_to`/`move_to_raw`: gaze/search quay, aim, `/servo/move`, khởi động, zero, park) và thêm `OFF_PLAYBACK_SETTLE_S`
+      (0,5 s) sau đó, lúc này chỉ còn các sàn cố định: lệnh nhanh chạy trước đà tăng tốc
+      của servo, và trên lamp-a0ae độ trễ đó (`wrist_roll` 12-14°) cùng tải lúc khởi động
+      (`elbow_pitch` 54 %) đã dừng tay đèn 0,2 s sau khi bắt đầu những lần xoay không ai
+      chạm. Máy đã học recording đang chạy — kể cả idle đã ổn định — dùng envelope của
+      chính nó thay cho `off_playback` (elbow nặng hơn của lamp-a0ae khi idle lên 54-60 %
+      so với sàn 52 % lấy từ lamp-52e6). Trên lamp-52e6, gaze cắt ngang phần lớn recording chỉ trong một giây mỗi
+      khi có người ngồi trước đèn, nên đây là chỗ tay người thường gặp tay đèn. Học lại
+      sau khi hiệu chuẩn lại tay đèn.
+      **Học ngầm** (`PassiveLearner` trong `hal/drivers/motors/contact_profile.py`) giữ
+      envelope luôn mới mà không cần lượt học: mỗi lần phát một recording (kể cả
+      `music_*`) được lấy mẫu như lượt học, và chỉ được tính khi chạy từ frame đầu tới
+      frame cuối mà không có contact stop, cut-off, di chuyển trực tiếp hay lượt học nào
+      xen vào. 5 lần chạy sạch gần nhất của mỗi recording được giữ trong RAM, và từ 2 lần
+      trở lên (bằng số lần một lượt học chạy) mỗi lần chạy sạch kéo envelope của
+      recording đó về phía chúng: giá trị tối đa từng frame khi chưa đủ 5 lần (lỏng
+      nhất), đủ 5 lần thì giá trị lớn thứ hai, nên một lần bị tay chạm nhẹ không được
+      tính. Giá trị cao hơn thay envelope ngay, nên một frame tải nặng chỉ làm dừng một
+      lần, tối đa tới 80 % của cut-off cho tải và 30° cho lag; giá trị thấp hơn chỉ giảm
+      một phần tư khoảng chênh mỗi lần, nên vài lần chạy lúc servo mát không làm đèn
+      quá nhạy. Envelope đầu tiên của một recording cũng giảm như vậy từ các sàn cố định
+      nó dùng trước đó (Lamp: sàn `load` của contact, rồi tải và lag `off_playback`, rồi
+      `torque_limit` của khớp bị giới hạn), nên nó bắt đầu đúng chỗ đèn đang đứng. Frame
+      mà một lần chạy sau mới lấy mẫu lần đầu (lấy mẫu 20 Hz bỏ sót một số frame 30 fps
+      mỗi lần) thì giảm từ giá trị đã học của các frame lân cận trong ±3 frame, để nó
+      không giữ cả cửa sổ sàn ở mức sàn cố định. Lần
+      chạy nào bị trip không bao giờ được tính, nên một lần dừng do va chạm mà không ai
+      giữ qua hết thời gian pause (kết thúc mà không nhả torque) được coi là dừng nhầm:
+      envelope trong ±3 frame quanh đó tăng ngay tới mức mà mẫu đó không còn làm dừng,
+      tối đa 10 lần mỗi ngày cho mỗi recording, và không giảm trong 24 giờ sau đó. Khớp
+      bị giới hạn torque mà dừng đúng ở `torque_limit` (trong khoảng 1 %) thì tăng tới
+      mức trần trên toàn bộ recording, để khớp đó chỉ còn được canh bằng lag ở đó:
+      elbow của lamp-c0a4 chạm trần 60 % ở những frame `idle` khác nhau, và đã làm
+      `idle` dừng mỗi 5 giây với sàn 41 %. Cập nhật được lưu tối đa 1 phút một lần
+      (ghi đè file, khoảng 100 KB mỗi lần). Envelope được lưu
+      kèm `torque_limit` lúc học (`contact_profile.json.signature`); đổi `torque_limit`
+      thì khi khởi động envelope bị bỏ và dùng các sàn cố định cho tới khi học lại
+      (envelope học ở 60 % làm idle của lamp-c0a4 trip `base_pitch` khoảng 300 lần trong
+      25 phút ở 70 %).
+      `GET /health.servo_overload.contact.profile` hiện `margin`, số recording đã học,
+      recording mà lượt học đang chạy và `passive_runs` (số lần chạy sạch đang giữ của
+      mỗi recording).
+      **Giới hạn:** không thấy gì trước khi chạm, và một vật
+      nhẹ mà tay đèn đẩy đi được, như cái cốc hay khung ảnh, có thể không bao giờ làm khớp nào đủ tải để
+      trip.
+- [x] **Giới hạn torque servo → tay đèn mềm hơn.** Map `torque_limit` tùy chọn
+      (`{joint: limit}`, đơn vị 0,1 % lực đẩy tối đa) trong cùng entry board được ghi vào
+      `Torque_Limit` của từng servo (register 48 của STS3215) mỗi lần configure, nên khớp
+      đó đẩy vào tay hay vật cản tối đa chỉ mạnh đến vậy. Khi đó `Present_Load` chạm trần ở
+      mức giới hạn, nên một sàn load cao hơn nó (80 % của cut-off) không bao giờ trip trên
+      khớp đó. Lamp giới hạn `base_yaw`, `base_pitch` và `elbow_pitch` ở `600` (60 %): qua
+      19 recording trên lamp-52e6, trần 70 % đẩy độ trễ bám tệ nhất từ 17° lên 18°
+      (`shock`), 50 % kéo nó lên 24°; chọn 60 % để đẩy nhẹ hơn. `Present_Load` của ba khớp
+      này đứng ở 60 %, nên cut-off 80 % không bao giờ trip trên chúng — chính trần torque
+      giới hạn lực đẩy của chúng; cut-off vẫn bảo vệ `wrist_roll` và `wrist_pitch`.
+- [x] **Quá tải servo (kẹt) → cắt torque, chime, thử lại theo giờ.** Bảo vệ bánh răng
+      khi tay đèn bị chặn hoặc bị ép. Ở tầng driver, chỉ cho feetech
+      (`AnimationService`), do device quản lý: ngưỡng lấy từ
+      `robots/<device>/servo_overload.json` (map `boards` với `load`, `hold_s`,
+      `retry_s`, `enabled` tùy chọn), đọc bởi `hal/board/servo_overload.py`; không có
+      file, không có entry board hoặc `enabled: false` nghĩa là không có cut-off, còn
+      file sai định dạng làm boot thất bại. Đây không phải field của `SAFETY.md`. Không
+      cần cảm biến dòng: một thread monitor đọc `Present_Load` của mọi khớp (register 60
+      của STS3215, duty điều khiển theo đơn vị 0,1 %) mỗi 50 ms (20 Hz). Khớp nào ở mức `load`
+      trở lên (Lamp: `800` = 80 %) trong `hold_s` (Lamp: `1.5` s) sẽ trip
+      `OverloadGuard` thuần (`hal/drivers/motors/overload.py`). Khi trip, driver dừng chuyển động đang
+      chạy và ghi `Torque_Enable=0` cho mọi servo, **không có bước park** (tay đang bị
+      chặn nên thả lỏng tại chỗ); runtime sau đó phát ack chime và dừng vision tracker.
+      Khớp nào ghi tắt torque thất bại (rớt gói) được thử lại mỗi 50 ms tới khi xác
+      nhận; trước đó `/health` báo `cut_complete: false` kèm các khớp trong
+      `pending_off`. Trong `retry_s` (Lamp: `120` s) không goal nào tới được bus, vì ghi
+      goal sẽ bật lại torque trên loại servo này: frame của playback và tracker bị bỏ,
+      `/servo/move`, `/servo/aim` và `/servo/nudge` lỗi với "Servo overload cut-off
+      active", một raw move đang chạy (startup / zero / park) dừng ở frame kế tiếp, move
+      mới bị bỏ qua, và bật torque bị bỏ qua. Mọi kiểm tra này chạy dưới chính bus lock
+      mà cut-off dùng, nên cut không thể chen vào giữa lần kiểm tra và lần ghi. Hết thời gian
+      chờ, thân máy trở lại qua đường `resume()` bình thường (bật torque, đọc lại trạng
+      thái từ phần cứng, ramp vào idle; hold trước đó bị bỏ). Nếu trong lúc đó nó đã được
+      release (ngủ) hoặc zero-pose thì vẫn thả lỏng tới lần resume kế tiếp. Vẫn bị chặn
+      → trip lại. Đọc load lỗi không bao giờ trip. Lộ ra ở `GET /health.servo_overload`
+      (`active`, `retry_in_s`, `trips`, `cut_complete`, `pending_off`, `last_trip`, cùng
+      `load` / `peak` theo từng khớp để tinh chỉnh). Giá trị 80 % / 1.5 s của Lamp đo trên lamp-52e6 (2026-10-09) ở full
+      torque: đỉnh chuyển động tự do 87 % (`base_pitch` trong `shock`) kéo dài dưới
+      0.3 s; lấy tay giữ `base_yaw`/`elbow_pitch` lên 94-100 %; recording `goodbye` hiệu
+      chuẩn sai cạ xuống bàn (100 % trong 1.2 s) vẫn dưới hold 1.5 s. Cut-off giữ ack
+      chime (contact stop có chime riêng).
+      Chỉ Lamp kèm file này.
 - [x] **Unit:** `thermal_over` trip tại/trên `max_temp_c`, giữ qua hysteresis khi còn
       trên `resume_temp_c`, clear tại/dưới nó, và là False khi không có policy / không có
       section thermal / nhiệt không đọc được; `read_soc_temp_c` parse millidegrees → °C và
@@ -345,6 +554,8 @@ kiện đã thực thi; setup-incomplete và over-current servo còn dự trữ.
       đốt nóng SoC vượt `max_temp_c`).
 
 ### Slice 5 — `audio.max_volume` (checklist)
+
+Profile Lamp `pro-respeaker-lite` đặt `max_volume` là 50% và giữ `startup_volume` ở 35%. Thang volume trên web quy đổi 100% thành giới hạn mixer 50% này.
 
 Trần âm lượng áp dụng cả ngày, độc lập với `audio.quiet_hours`: khung giờ chỉ chặn
 output *tuỳ ý* (nhạc), còn trần giới hạn *mọi thứ to tới đâu*, kể cả câu trả lời nói.
