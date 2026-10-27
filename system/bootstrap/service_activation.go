@@ -7,14 +7,12 @@ import (
 	"os/exec"
 	"sort"
 	"strings"
-	"time"
 
 	"go.autonomous.ai/os/system/bootstrap/state"
 	"go.autonomous.ai/os/system/domain"
-	"go.autonomous.ai/os/system/lib/core/system"
 )
 
-// activationPlan accepts only decoded, signature-verified service metadata. It
+// activationPlan accepts decoded service metadata from the configured trust mode. It
 // validates the whole replacement graph before starting any service transition.
 func (b *Bootstrap) activationPlan(meta domain.OTAMetadata) ([]string, error) {
 	r, err := b.serviceRegistry()
@@ -39,6 +37,15 @@ func (b *Bootstrap) activationPlan(meta domain.OTAMetadata) ([]string, error) {
 		}
 		if compareVersions(floor, c.Version) > 0 {
 			return nil, fmt.Errorf("activation floor exceeds version for %q", key)
+		}
+		if err := domain.ValidateOTAActivationReleases(c); err != nil {
+			return nil, fmt.Errorf("activation %q: %w", key, err)
+		}
+		release, ok := c.ActivationReleaseByDevice[deviceType]
+		if !ok || release.Version != c.Version || release.SHA256 != c.SHA256 {
+			// A new upload or an old unbound promotion needs fresh explicit
+			// authorization. Existing installed services use ordinary updates.
+			continue
 		}
 		desired[key] = c
 	}
@@ -121,6 +128,34 @@ func updaterSupportsActivationProtocol(data []byte) bool {
 	return count == 1
 }
 
+// Lamp migration must prepare complete device configuration before stopping V1.
+// The older activation-only updater cannot enforce that boundary.
+func updaterSupportsLampMigration() bool {
+	path, err := exec.LookPath("software-update")
+	if err != nil {
+		return false
+	}
+	data, err := os.ReadFile(path)
+	if err != nil || !updaterSupportsActivationProtocol(data) {
+		return false
+	}
+	return updaterSupportsProtocol(data, "preflight") && updaterSupportsProtocol(data, "cleanup")
+}
+
+func updaterSupportsProtocol(data []byte, protocol string) bool {
+	prefix := "# Service OTA " + protocol + " protocol:"
+	count := 0
+	for _, line := range strings.Split(string(data), "\n") {
+		if strings.HasPrefix(line, prefix) {
+			if line != prefix+" 1" {
+				return false
+			}
+			count++
+		}
+	}
+	return count == 1
+}
+
 func (b *Bootstrap) activatePromotedServices(ctx context.Context, meta domain.OTAMetadata) (bool, error) {
 	keys, err := b.activationPlan(meta)
 	if err != nil {
@@ -138,18 +173,19 @@ func (b *Bootstrap) activatePromotedServices(ctx context.Context, meta domain.OT
 	}
 	changed := false
 	for _, key := range keys {
+		if key == "lamp-os" && !updaterSupportsLampMigration() {
+			return changed, fmt.Errorf("software-update requires preflight and cleanup protocols before lamp-os migration")
+		}
 		c := meta[key]
 		if strings.TrimSpace(blocked[key]) == strings.TrimSpace(c.Version) {
 			// Stop dependents too: installing a successor would bypass the failed version guard.
 			return changed, fmt.Errorf("activation %q version %q blocked after rollback", key, c.Version)
 		}
 		b.announceUpdateStart()
-		runCtx, cancel := context.WithTimeout(ctx, 10*time.Minute)
 		// The updater revalidates the fresh signed promotion under its update lock.
-		out, runErr := system.Run(runCtx, "software-update", key, "--activate-promoted")
-		cancel()
+		out, runErr := runUpdater(ctx, installTimeout, key, "--activate-promoted")
 		if runErr != nil {
-			return changed, fmt.Errorf("activate %s: %w: %s", key, runErr, out)
+			return changed, fmt.Errorf("activate %s: %w: %s", key, runErr, updaterOutputTail(out))
 		}
 		r, err := b.serviceRegistry()
 		if err != nil {

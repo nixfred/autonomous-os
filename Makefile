@@ -367,7 +367,7 @@ autonomous-build-chat:
 OTA_SIGNING_KEY_DIR ?= $(HOME)/.config/autonomous/ota
 OTA_SIGNING_KEY_ID ?= ota-$(shell date +%Y%m%d)
 
-.PHONY: hal-deploy os-deploy device-deploy hal-log os-log ota-keygen upload-aec-wheel upload-os-server upload-bootstrap upload-hal upload-claude-desktop-buddy upload-autonomous-buddy upload-web upload-skills upload-hooks upload-setup upload-setup-ap upload-openclaw upload-codex upload-claudecode upload-opencode upload-hermes upload-picoclaw upload-device upload-twitch-irc upload-autonomous-chat upload-setup-remote-hermes upload-all promote-os-server promote-bootstrap promote-web promote-hal promote-claude-desktop-buddy promote-openclaw promote-codex promote-claudecode promote-opencode promote-hermes promote-picoclaw promote-device
+.PHONY: hal-deploy os-deploy device-deploy hal-log os-log ota-keygen upload-aec-wheel upload-webrtcvad-wheel upload-os-server upload-bootstrap upload-hal upload-claude-desktop-buddy upload-autonomous-buddy upload-web upload-skills upload-hooks upload-setup upload-setup-ap upload-openclaw upload-codex upload-claudecode upload-opencode upload-hermes upload-picoclaw upload-device upload-twitch-irc upload-autonomous-chat upload-setup-remote-hermes upload-all promote-os-server promote-bootstrap promote-web promote-hal promote-claude-desktop-buddy promote-openclaw promote-codex promote-claudecode promote-opencode promote-hermes promote-picoclaw promote-device
 
 # Generate a deployment-owned Ed25519 keypair outside the repository. The
 # private PEM is for release writers only; the printed public key is provisioned
@@ -470,6 +470,10 @@ upload-skills:
 # Publishes dist/aec/*.whl, built by scripts/release/build-aec-wheel.sh <ip>.
 upload-aec-wheel:
 	bash scripts/release/upload-aec-wheel.sh
+
+# Publishes dist/webrtcvad/*.whl, built by scripts/release/build-webrtcvad-wheel.sh <ip>.
+upload-webrtcvad-wheel:
+	bash scripts/release/upload-webrtcvad-wheel.sh
 
 upload-hooks:
 	bash scripts/release/upload-hooks.sh
@@ -652,5 +656,4 @@ upload-service:
 
 promote-service:
 	@test -n "$(COMPONENT)" || (echo "COMPONENT is required" >&2; exit 1)
-	@test -n "$(OTA_SIGNING_PRIVATE_KEY)" -a -n "$(OTA_SIGNING_KEY_ID)" || (echo "Service metadata requires OTA signing credentials" >&2; exit 1)
 	FOR="$(FOR)" ACTIVATE="$(ACTIVATE)" bash scripts/release/promote-ota.sh "$(COMPONENT)" $(V)

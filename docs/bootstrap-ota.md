@@ -398,6 +398,15 @@ fails the profile update. A failed check restores the previous profile and
 its prior service state automatically. Use `software-update rollback device` for
 an operator rollback; the rejected device-profile version is then blocked.
 
+Before stopping anything, the updater checks that the installed HAL can load the
+new profile. HAL reads `ROBOT.md` from 0.1.2 (`DEVICE_HAL_MIN`); older HAL opens
+only `DEVICE.md` and does not start without it. A profile without `DEVICE.md` is
+therefore refused when `/opt/hal/VERSION_HAL` is below 0.1.2 or unreadable: the
+update fails with "Device profile needs HAL >= 0.1.2 … Update HAL first; profile
+unchanged", and no service, file or recovery journal is touched. The download is
+repeated on each attempt until HAL is updated. A device without `/opt/hal`, or a
+profile that still ships `DEVICE.md`, is not affected.
+
 ### Optional hardware overrides
 
 The OS reads the single-line name in `/etc/autonomous/hardware-profile`.
@@ -769,7 +778,7 @@ the MQTT `data` kind `system.ota_versions` (both via `system/ota`; the cloud's
 
 | Component | Update Steps |
 |---|---|
-| `os-server` | Run `software-update os-server` (blocks up to 10 min) |
+| `os-server` | Run `software-update os-server` (blocks up to 30 min, see below) |
 | `bootstrap` | Spawn detached `software-update bootstrap` (self-update, survives restart) |
 | `web` | Run `software-update web` |
 | `device` | Run `software-update device` for `devices.<device_type>`; apply any explicitly selected hardware override, then install rootfs including generated HAL `.env` |
@@ -777,6 +786,35 @@ the MQTT `data` kind `system.ota_versions` (both via `system/ota`; the cloud's
 | `hal` | Run `software-update hal` → `systemctl restart hal` |
 | `codex` / `claudecode` / `opencode` / `picoclaw` | Run `software-update <key>` — only on the device whose `agent_runtime` IS that runtime |
 | `hermes` | Run `software-update hermes` — only when `agent_runtime` is hermes, the metadata entry carries `commit`, AND the on-device updater is the pinning one (`updaterSupportsHermesPin`: it reads `.hermes.commit`). An unpinned entry (no `commit`) is skipped by both the loop and `/versions`, so the web button never appears for it — `hermes update` would land on upstream HEAD and the floor could never be met. |
+
+**Install time limit.** Every `software-update <key>` install that bootstrap
+runs (automatic poll, force update, promoted service activation) may take up to
+30 minutes; an install that starts from a much older version can legitimately
+need that long. `software-update recover` keeps a 10-minute limit. When a limit
+passes, bootstrap stops the updater rather than abandoning it:
+
+1. SIGTERM goes to every updater process: the transient
+   `software-update-<key>-<pid>` unit when the updater runs as one, otherwise
+   the updater's own process group. The updater's EXIT trap restores the previous
+   installation, and long-running child steps (downloads, package installs) end.
+2. After a 3-minute grace, enough for the restore and its health check, SIGKILL
+   goes to the same processes, so no leftover process keeps holding the update lock.
+3. If the restore did not finish, its journal remains and the next bootstrap poll
+   runs `software-update recover`.
+
+Stopping or restarting bootstrap itself does not abort an install in progress;
+only the time limit does. The os-server `system.software_update` completion
+watcher waits up to 40 minutes, which covers the limit plus the grace.
+
+**Failure reasons.** The updater's own output goes to its transient unit's
+journal. When the unit fails, the updater repeats the last 40 lines of that
+journal on stderr, and bootstrap puts the last 2,000 bytes of the updater's
+output into its error (`software-update <key>: exit status 1: …`), so the
+reason is in bootstrap's log without opening the device journal. The HAL
+install names the step that failed: `using uv <version> at <path>` or
+`uv <version> at <path> is older than <min>` (then the pinned uv is installed),
+`HAL staging failed: unzip exited <n>`, or `HAL staging failed: uv sync exited <n>`
+with the uv version and path, the lock flag and the free space.
 
 Manual and force OpenClaw updates run `software-update openclaw`. Before
 installing the version selected by OTA metadata, the updater reads that npm
@@ -924,6 +962,16 @@ recovered on the next updater invocation or running bootstrap poll; this does
 not guarantee recovery from arbitrary SD-card corruption or a machine that
 cannot boot far enough to run those services.
 
+Recovery runs the updater already on the device, before the cycle reaches the
+refresh above. If that updater fails recovery, bootstrap refreshes it from the
+feed once and, only when the file actually changed, retries recovery with the
+new copy (`recoverWithFreshUpdater`). This applies at startup, in automatic
+polls, component checks and force updates. Without it, a recovery bug in the
+on-device updater would stop every cycle before the fix could arrive. An
+unchanged updater, a failed refresh or a held installer lock returns the
+original error and does not rerun recovery. Bootstraps without this step still
+need a manual updater fix on such a device.
+
 If a first HAL installation had no prior runtime or backup, recovery removes the
 failed candidate from the live path and leaves HAL stopped. It does not claim to
 restore a nonexistent prior installation.
@@ -942,8 +990,21 @@ core-failure gating). Uploading HAL alone does not distribute these changes.
 ### HAL Case
 
 The updater finds `uv` on `PATH`, then at `/root/.local/bin/uv`, then at
-`/home/pollen/.local/bin/uv` (Reachy's installer location). Before stopping HAL,
-it selects Python extras from `DEVICE_TYPE` in `/opt/hal/.env`, falling back to
+`/home/pollen/.local/bin/uv` (Reachy's installer location).
+
+HAL's `pyproject.toml` and `uv.lock` need uv 0.6.6 or newer (`HAL_UV_MIN`).
+Older images can ship an older uv:
+- uv 0.4.x fails with `unknown field required-environments`.
+- uv 0.5.31 to 0.6.5 report that the lockfile needs updating under `--locked`.
+
+Either way the sync fails, and the device stays on its old HAL. When the found
+uv is missing or older than the floor, the updater uses `/usr/local/lib/autonomous/uv/uv`
+if that one is new enough. Otherwise it installs the pinned uv (`HAL_UV_PIN`,
+0.12.23) there with astral's installer for that version and
+`UV_UNMANAGED_INSTALL`, which writes no receipt and changes no PATH. The device's
+own uv is left as it is. A failed install stops the update before HAL is stopped.
+
+Before stopping HAL, the updater selects Python extras from `DEVICE_TYPE` in `/opt/hal/.env`, falling back to
 `device_type` in `/root/config/config.json`: `reachy-mini` uses `hardware + reachy`
 to retain the Pollen SDK; every other device uses `hardware + aec + pipecat`.
 
@@ -1325,8 +1386,16 @@ HAL version is the plain text file `hal/VERSION_HAL` (installed as `/opt/hal/VER
 
 ## Service replacement through the existing OTA feed
 
-Service-defined components use the existing signed metadata payload; there is no
+Service-defined components use the existing metadata feed and trust mode; there is no
 second release manifest and no architecture-specific `runtime`, `v2` or `v3` key.
+A device without `signing_public_key` accepts the legacy unsigned feed, including
+service installation and subsequent updates. Service packages still require a
+valid SHA-256 and URL in either mode. If a public key is configured, signature
+verification remains mandatory; an invalid or missing signature never falls back
+to legacy mode. Publishing to GCS uses the existing gsutil credentials. Optional
+release signing remains available, and a signed feed cannot be overwritten as
+unsigned merely because the publishing shell lacks its key.
+
 A component describes the actual service being shipped:
 
 ```json
@@ -1337,6 +1406,7 @@ A component describes the actual service being shipped:
     "sha256": "<artifact SHA-256>",
     "min_version_by_device": {"lamp": "0.1.0"},
     "activate_by_device": {"lamp": true},
+    "activation_release_by_device": {"lamp": {"version": "0.1.0", "sha256": "<same artifact SHA-256>"}},
     "service": "lamp-os",
     "replaces": ["hal", "os-server"]
   }
@@ -1346,12 +1416,15 @@ A component describes the actual service being shipped:
 The component key and bare service name must match. `replaces` names existing
 `hal`/`os-server` or registered service-defined components, not arbitrary
 system services. Other legacy components are not replacement targets in this revision. Bootstrap itself cannot be replaced by this mechanism. Names,
-ownership and signed metadata are validated before a service transition. No
+ownership and metadata are validated before a service transition. No
 command line or shell hook is accepted from these fields.
 
-Initial migration is automatic when the signed service entry explicitly sets
+Initial migration is automatic when the service entry explicitly sets
 `activate_by_device[device_type]` to `true` and has a nonempty, valid
-`min_version_by_device[device_type]` no greater than the published version.
+`min_version_by_device[device_type]` no greater than the published version, plus
+`activation_release_by_device[device_type]` matching the exact published version
+and SHA-256. An old boolean-only promotion does not authorize migration.
+`ACTIVATE=1` selects the current published version and writes that binding.
 The release operator enables this through promotion; the device user does not
 need SSH or a CLI command:
 
@@ -1361,14 +1434,18 @@ make promote-service COMPONENT=lamp-os FOR=lamp V=0.1.0 ACTIVATE=1
 
 Bootstrap discovers promoted service components and invokes
 `software-update lamp-os --activate-promoted`. The updater checks the freshly
-fetched signed metadata and actual device type again before using the existing
-service transition transaction. Unsigned metadata, missing device targeting,
+fetched metadata and actual device type again before using the existing
+service transition transaction. Missing device targeting,
 invalid promotion floors, conflicting ownership, and obsolete updater support
 cannot authorize a first installation. Compatible bootstrap and updater releases
-must reach devices before enabling activation in the feed.
+must reach devices before enabling activation in the feed. Initial automatic
+`lamp-os` migration requires updater preflight and cleanup protocols as well as
+activation support; older activation-only updaters are rejected before cutover.
 
-Publishing alone does not activate a service. Promotion without `ACTIVATE`
-preserves existing activation settings. `ACTIVATE=0 FOR=lamp` disables future
+Publishing a changed version/artifact clears activation flags and bindings; the
+new artifact needs a fresh explicit activation promotion. Republishing the same
+version/hash preserves them. Promotion without `ACTIVATE` preserves existing
+activation settings. `ACTIVATE=0 FOR=lamp` removes its binding and disables future
 first installations for Lamp; it does not uninstall or roll back an active
 service. The flag targets a device type, not a device ID or percentage rollout.
 
@@ -1379,6 +1456,8 @@ activation. Independent service components can coexist. The manual operator
 command `sudo software-update lamp-os --activate` remains available for testing;
 it is not required for fleet migration.
 
+Updater refresh also preserves installed preflight and cleanup capabilities: a stale published script cannot remove them, including while the device still runs V1.
+
 ### Package adapter contract
 
 The ZIP contains `VERSION` matching the metadata version, executable
@@ -1386,10 +1465,44 @@ The ZIP contains `VERSION` matching the metadata version, executable
 systemd unit; packages do not supply arbitrary systemd units. The entrypoint
 supports fixed arguments:
 
+- `bin/service prepare`: required for initial `lamp-os` migration, with
+  `SERVICE_PREFLIGHT` containing `1` in the ZIP. Prepare isolated candidate data
+  and validate configuration/prerequisites without stopping current owners or
+  touching hardware. Other existing services can opt in with the same marker.
 - `bin/service serve`: supervise this component and its child processes.
 - `bin/service health`: query the running component and return JSON containing
   `ready: true`, the matching `version`, and its running supervisor `pid`. The
   updater checks that PID against systemd's MainPID under a bounded deadline.
+- `bin/service cleanup`: packages with `SERVICE_CLEANUP=1` use this fixed command
+  after stop to remove only their own lifecycle resources. Cleanup is bounded and
+  must succeed before recovery restarts previous hardware owners.
+
+V1's web (lampOS #2396): when the `lamp-os` adapter installs, it records V1's
+`nginx.service` in its journal if that unit is enabled at boot, then disables
+and stops it. A moved lamp then has port 80 free after V2 starts, and no V1
+route (`/monitor`, `/setting`, the `/api` proxy to os-server, `/hw`) answers.
+Nginx's files are left untouched. The generic ZIP carries no `lamp-setup`, so
+nothing starts nginx on V2. `cleanup`, which runs on a rollback before
+recovery, enables and starts it again, so V1 comes back with its whole site.
+A lamp whose nginx was not enabled is left as it is.
+
+The `lamp-os` ZIP built on main carries `SERVICE_PREFLIGHT=1` and
+`SERVICE_CLEANUP=1`. Its `bin/service prepare` execs the release's own
+`bin/lamp-keeper prepare` (the V2 contract from lamp-voice #1094) with
+`AUTONOMOUS_SERVICE_NAME` and `AUTONOMOUS_SERVICE_DATA` removed, as `serve`
+does for the keeper. Because it execs rather than spawns, the updater's
+120-second timeout, signals and exit status reach the keeper directly; no
+orphan keeps running after a timeout. The keeper writes the device key
+(`llm_api_key` of `/root/config/config.json`) to `/etc/lampOS/voice/credential`
+and `/etc/lampOS/policy/jev.key` where missing. It stops nothing and touches no
+hardware or unit. With no usable key it exits 0 and setup takes the key, so a
+successful prepare does **not** prove voice credentials or setup are complete.
+Packaging fails when the built `lamp-keeper` lacks `prepare` (a source older
+than #1094), and an old keeper reached anyway exits nonzero. Prepare does not
+convert V1 calibration or settings; the device profile, poses and the other
+required paths below remain per-device prerequisites. A `lamp-os` ZIP without
+`SERVICE_PREFLIGHT=1` (0.0.2 and earlier) is rejected for initial migration; do
+not promote it merely because the updater has been upgraded.
 
 The health adapter must not start a second runtime or move hardware. Readiness
 proves only the package's declared startup checks, not successful conversation,
@@ -1399,10 +1512,16 @@ make any existing V2 build installable.
 
 ### Transition, data and rollback boundaries
 
-Download and validate the candidate before stopping current services. The updater
+Download, extract and run declared `prepare` before stopping current services.
+Preparation failure removes staging and leaves the old owners running. For an
+installed service update, prepare an initial private-data snapshot; after stopping
+writers, take a second consistent snapshot and prepare it again before switching.
+A failure at that second stage uses journaled recovery. The updater
 records the previous ownership and recovery state, stops the declared old owners
 and verifies they have stopped before starting the replacement. On failure, or
-recovery of an interrupted transition, it restores the previous configuration.
+recovery of an interrupted transition, it attempts to restore the previous
+configuration. Failed stop, cleanup or restart leaves the recovery journal and
+blocks cutover; it is not proof that V1 has already recovered.
 Persisted ownership also prevents legacy OTA paths or reboot from resurrecting
 superseded hardware owners. Rollback must not restart an ancestor while its
 replacement remains active.
@@ -1414,6 +1533,21 @@ private state snapshots for rollback; rolling back can discard writes made since
 the snapshot. Packages must not mutate shared V1 data and then claim rollback is
 complete merely because the old binary starts.
 
+The first successful activation retains a separate legacy checkpoint that later
+service updates do not overwrite. `software-update rollback lamp-os` selects the
+previous release; `software-update rollback-to-legacy lamp-os` restores the initial
+legacy ownership/running state even after V2 updates. A missing or mismatched
+checkpoint fails closed rather than inventing the previous state. Bootstrap runs
+pending recovery at startup before waiting for a metadata URL or parsing poll
+settings. A recovery error stops startup; the journal remains for retry.
+The narrow exception is a validated bootstrap self-update journal while another
+process actually holds the updater's `flock`: the new bootstrap serves `/health`
+so the installer can finish, but every OTA mutation still returns update-in-progress.
+PID files are not evidence of an active installer. When the lock is released, a
+remaining journal follows normal recovery. After V2 replaces HAL/os-server,
+validated bootstrap/web recovery remains allowed; journals targeting the replaced
+HAL/os-server/device profile remain blocked.
+
 Bootstrap remains independent and updateable. A compatibility declaration prevents
 replacing it or the updater with an older implementation that does not understand
 service ownership and recovery. This compatibility check does not substitute for
@@ -1424,65 +1558,192 @@ voice/hardware acceptance remain required before rollout.
 
 ### Publishing a service component
 
-Build and qualify the package separately, then publish using the existing signing
-credentials (`OTA_SIGNING_PRIVATE_KEY`, `OTA_SIGNING_KEY_ID`):
+Build and qualify the package separately, then publish using the existing GCS
+credentials. Signing is optional, as with legacy component releases:
 
 ```bash
 make upload-service COMPONENT=lamp-os V=0.1.0 PACKAGE=/path/lamp-os.zip REPLACES='hal os-server'
 make promote-service COMPONENT=lamp-os FOR=lamp V=0.1.0 ACTIVATE=1
 ```
 
-The publisher requires signed metadata, validates the package, preserves existing
+The publisher validates the package and its SHA-256, preserves existing
 promotion floors and other components, and rejects topology changes under an
-existing key. Package URLs include the content hash. A version cannot be reused
-with different content while it is the feed's current version. Serialize release
-publishing as with the existing release scripts; metadata publishing is not a
-concurrent multi-writer transaction. Promotion with `ACTIVATE=1` authorizes automatic first installation on the
+existing key. Package URLs include the content hash. Publishing an older version
+than the feed is rejected; the current version cannot be reused with different
+content. All release metadata writers read an immutable GCS generation and publish
+with a generation-match precondition. Concurrent changes abort publication; retry
+from a fresh feed read, never overwrite another operator's promotion with stale
+metadata. Existing GCS authentication and optional signing are unchanged.
+Promotion with `ACTIVATE=1` authorizes automatic first installation of that artifact on the
 selected device type; later updates continue to follow the promotion floor.
-If an automatic activation fails after the transition starts, recovery restores
-the previous services and records the rejected version so polling does not keep
-retrying it. A pending recovery journal is retained if that rejection cannot be
-persisted. `ACTIVATE=0` preserves existing version floors.
+If automatic activation fails after the transition starts, recovery attempts to
+restore previous services and records the rejected version so polling does not
+keep retrying it. The pending journal is retained when stop, cleanup, restoration
+or recording the rejection fails; manual diagnosis may still be required. `ACTIVATE=0` preserves existing version floors.
 
-### Build the V2 supervisor from main
-
-From a checkout containing the release tooling, run:
+### Build and publish the complete V2 service package
 
 ```bash
 make upload-lamp-os
 ```
 
-This command fetches `refs/heads/lamp-voice` from the checkout's `origin` into a
-private temporary repository, freezes the fetched commit, and extracts only
-`lampOS/`. It does not switch the current branch or include dirty source files.
-Using that workspace's pinned Rust toolchain and lockfile, it runs
-`cargo zigbuild --locked --release --target aarch64-unknown-linux-gnu -p lamp-keeper`.
-Prerequisites are Cargo/rustup, cargo-zigbuild, Zig, the pinned toolchain's
-`aarch64-unknown-linux-gnu` target, and authenticated `gsutil`.
+The command fetches and freezes `origin`'s `lamp-voice` commit in an isolated
+source directory. `LAMP_OS_SOURCE_COMMIT=<40-hex SHA>` builds that reviewed
+commit instead of the branch head; the fetched commit must match it exactly,
+otherwise the command stops before building. It builds the Rust workspace binaries and the OTA lifecycle
+adapter in a disposable Linux ARM64 Docker container, using the source's pinned
+Rust toolchain and lockfiles. Host Cargo/Zig are no longer required. Prerequisites:
+Docker with Linux ARM64 support, git, curl, Python 3.10+ and authenticated gsutil.
+`OTA_SIGNING_PRIVATE_KEY` / `OTA_SIGNING_KEY_ID` are optional. The Debian bookworm builder
+requires a Debian 12-compatible ARM64 runtime; this is not a universal robot image.
 
-The resulting supervisor is uploaded as `lamp-os`, with `build.json`, `VERSION` and
-`SHA256SUMS`, under
-`gs://${GCS_BUCKET}/${BUCKET_PREFIX}/services/lamp-os/builds/<version>/<commit>/<sha256>/`.
-The existing defaults are `s3-autonomous-upgrade-3` and `os`; environment overrides
-work as for other release commands. The command downloads the stored binary and
-checks its SHA-256 before reporting success. It validates an ARM64 ELF header
-before uploading. This is a build/provenance check, not a hardware qualification.
+The ZIP contains `VERSION`, `bin/service` (the Rust OTA lifecycle adapter),
+`bin/lamp-keeper`, the required V2 runtime binaries including the turn-end worker,
+SHA-pinned models/ONNX Runtime, linked non-glibc shared libraries, character and
+policy resources, unit templates, and a full file checksum manifest. Device secrets
+and calibration are never copied from a developer's test Lamp. `lamp-update` and
+`lamp-surround` binaries may be included but their independent update services are
+not activated: bootstrap owns this release's updates.
 
-This first-stage artifact is the `lamp-keeper` supervisor, intended to become
-`bin/service` in a later `lamp-os` service package. It is **not** the complete V2
-OTA ZIP: child binaries, models, device configuration/calibration and rendered
-units must be packaged and qualified separately. No OTA metadata, version floor,
-or activation setting is changed. Use `upload-service` only once that full
-package is ready; V1 and other device types remain unaffected by this upload.
+`system/VERSION_LAMP_OS` advances its patch after a complete package is built.
+The ZIP's VERSION and package.json contain the version; package.json also records
+the frozen source commit. Publication reuses `upload-service`: one content-addressed
+ZIP in `gs://${GCS_BUCKET}/${BUCKET_PREFIX}/services/lamp-os/<sha256>.zip` and one
+`lamp-os` entry in the existing OTA JSON, with `replaces: ["hal", "os-server"]`.
+Existing promotion floors are preserved, but a changed artifact clears activation
+flags/bindings and requires fresh activation promotion. Defaults remain bucket
+`s3-autonomous-upgrade-3`, prefix `os`. Retain version-file changes in release
+history; a stale checkout cannot publish an older version over the feed.
 
-`system/VERSION_LAMP_OS` tracks this release stream independently of HAL and
-bootstrap. It starts at `0.0.0`; after a valid binary build, `upload-lamp-os`
-increments its patch version (first upload: `0.0.1`). That version is written to
-`build.json`, the uploaded `VERSION` file, and the GCS path. The keeper reads the
-release's `VERSION` file for OTA health; this command does not modify the Rust
-crate version. As with the existing release commands, a failed upload after the
-bump leaves the version file advanced. Keep release invocations serialized and
-retain the updated version file in the release history; do not hand-bump it.
+For local artifact validation without publishing or advancing the version file:
 
-If Cargo is missing from the caller's PATH, the command also checks
-`${CARGO_HOME:-$HOME/.cargo}/bin` for an existing installation. It does not install Rust.
+```bash
+LAMP_OS_BUILD_ONLY=1 LAMP_OS_OUTPUT=/path/lamp-os.zip make upload-lamp-os
+```
+
+The complete generic ZIP still needs a prepared device: root-owned,
+non-group/world-writable `/etc/lampOS/package-profile.json` with `unit_id`, a
+`substitutions` map for the manifest's declared placeholders, and optional
+`required_paths`. Values such as servo poses, device paths and service accounts
+must come from that Lamp. Private `/etc/lampOS/voice/provider.json` and controls
+configuration remain separately provisioned. Missing prerequisites or another
+host's identity fail preflight. This command does not implement automatic V1
+credential/calibration conversion. V2 runtime state placed outside the updater's
+private data directory is not covered by its data snapshot; schema changes there
+need a separately qualified backward-compatible migration/rollback policy.
+Inspect the packaged manifest for exact
+requirements before selecting a device for migration.
+
+The adapter creates child units and ownership drop-ins only under
+`/run/systemd/system`, binds them to `lamp-os`, and journals its own files before
+writing them. It does not enable or mask child/legacy units persistently. Normal
+shutdown and the fixed `ExecStopPost` cleanup operation remove only unchanged
+owned files; stop/cleanup failure prevents assuming rollback is complete. The
+`SERVICE_CLEANUP` marker opts into this operation; the updater also invokes
+cleanup synchronously after stopping a marked package, including recovery, so
+a failed systemd post-stop hook cannot be mistaken for success; existing packages without the
+marker keep their behavior. The generated top-level unit allows 60 seconds for
+shutdown. Upgrade the updater before installing this package: the adapter checks
+its cleanup capability and fails safely on older updaters. The keeper runs as a
+monitored child with its implicit installer disabled. The shared bus directory
+under `/run/lampos-bus` is intentionally retained until reboot; cleanup does not
+recursively remove IPC data.
+
+Health reports the adapter PID, version and child systemd activity with freshness
+checking. It does not prove successful speech, provider connectivity or physical
+motion safety. Real-device activation, reboot/interruption recovery and rollback
+must be tested before a migration promotion. No generic profile implies permission
+to replace other robot types or all Lamps.
+
+The release inventory also carries `lamp-selftest`, `lamp-settings` and
+`lamp-setup` when built upstream; adding their executables does not enable their
+services or run self-test/reset operations. `lamp-cloud` and `lamp-skills` are
+product services and their executables are carried (packaging fails if the
+source declares them and the build lacks them), but their units are not
+installed or started: `lamp-cloud` connects to the company broker, is opt-in and
+must not share V1 os-server's MQTT client ID, and `lamp-skills` also needs the
+product skills and settings that this ZIP does not carry yet.
+`lamp-body-measure` is a factory/provisioning tool that writes one lamp's
+`BODY_POSES` at rest. The generic ZIP carries it as `tools/lamp-body-measure`,
+for the V1 migration script below, and poses are never shipped or copied from
+another lamp. Built from a lampOS source that has
+`deploy/units/lamp-body-measure.service` (lampOS #2163), the generic ZIP also
+carries that oneshot and puts the tool beside `lamp-body`
+(`runtime/body/<sha>/`). On a lamp with neither `/etc/lampOS/body/lamp.env` nor
+`/var/lib/lampos-body/measured.env`, it reads the lamp at rest after cutover,
+seated (`--home`, the pitch window and `--torque on`, no stand), before the
+first body start. The body then moves the head and base only until a person
+confirms its first stand. A read it refuses (torque on) keeps the body from
+starting, and it never turns torque off. From an older source the ZIP is as
+before. Built from a source that has `deploy/units/lamp-first-stand.service`
+(lampOS #2396), the generic ZIP also carries that unit, with the same tool
+beside `lamp-body`. The unit runs `lamp-body-measure first-stand` as root.
+- Once someone is near a seated lamp, the lamp asks for its first stand.
+- A touch held a second is the yes. The arm then stands as the factory's
+  steps stand it, and `/etc/lampOS/body/lamp.env` is written.
+- Nothing moves without the yes. The unit takes no bus from a product unit. `lamp-memory-fixture`,
+`lamp-records-fixture`, `lamp-policy-replay` and the current
+`lamp-same-voice pairs` measurement CLI are development tools and are excluded. `lamp-station` (the production station's bench tool) is excluded the same way. `lamp-body-mood` is a factory tool carried with `lamp-body-measure` under `tools/`, and `lamp-peek` is carried without a unit. A lampOS source with `lampOS/deploy/package-binaries.json` (lamp-voice #2481) classifies its own binaries there (`core`, `optional`, `provisioning`, `development`), and the packager follows it. Then a new binary needs no change on main. The lists above are kept only for sources from before that file. A name in two lists, or a `core` part the packager cannot place yet, still fails packaging.
+Unknown binaries still fail packaging so a new runtime cannot be silently
+omitted.
+
+The generic ZIP still renders main's `DEFAULT_UNITS` from `lampOS/deploy/units`.
+Where those templates differ from the part's own unit in `lampOS/deploy/product`
+in a way that stops the lamp, the packager aligns them and fails if either side
+changed shape:
+
+- `lamp-policy.service` runs as `@LAMP_USER@` instead of `DynamicUser` (outside
+  the bus group), with `StateDirectoryMode=0700` (lamp-policy refuses a 0755 log
+  directory) and the product unit's `--endpoint` (the Jev relay; without it the
+  policy calls its built-in default).
+- Every part whose product unit sets `LAMP_BUS=on`, `LAMP_BUS_AUDIO=on` or
+  `--bus-root /run/lampos-bus` gets the same: the voice, body and eyes join the bus
+  and the voice publishes the microphone, so name hears it and health hears every
+  part.
+
+The ZIP also carries the product's `voice-provider.json`, `controls.json` and
+`controls-pins.json` templates under `provision/`. The V2 product installer still
+installs more (setup gating, schedule, skills, ears, air, records, the voice's
+other `LAMP_*` features, `current` links), so a migrated lamp is not yet a full V2
+product install.
+
+### Migrating a V1 Lamp
+
+`scripts/provision/lamp-v2-migrate` runs on the lamp as root after the package is
+on the feed. It changes nothing with `--dry-run`, and otherwise:
+
+1. Checks the lamp: `device_type` `lamp`, an updater with the preflight protocol,
+   `lamp-os` not yet active, the `orangepi` account.
+2. Reads the hardware: the one `1a86` servo adapter under `/dev/serial/by-id`,
+   the one USB camera (`/dev/video0`, `vendor:product@usb-port`), the
+   `device_micro2` microphone (`--microphone mic2`), `allwinnerhdmi`/`Speaker`,
+   the fastest CPUs and the `cpu`/`skin` thermal zones. Anything ambiguous or
+   missing refuses.
+3. Downloads the feed's `lamp-os` ZIP (`OTA_METADATA_URL` or
+   `/root/config/bootstrap.json`, checked against its sha256; `--package ZIP`
+   reads a local one) and refuses a package without `tools/` and `provision/`.
+4. Measures the poses unless `/etc/lampOS/body/lamp.env` exists (`--remeasure`
+   measures again): HAL stops for a few seconds, `lamp-body-measure` reads the
+   lamp at rest as `orangepi` (it refuses root) with no register writes, and HAL
+   starts again whatever happens. The lamp must be folded and still. The gaze is
+   not measured by the tool; without one the body would refuse `--gaze-socket`,
+   so the script adds `--gaze 755,555`, the middle of the two V1 Lamps measured
+   in lampOS `docs/body.md`, to be measured on the lamp later.
+5. Writes `/etc/lampOS/body/lamp.env`, `package-profile.json`,
+   `voice/provider.json` (0600), `controls/controls.json` and
+   `controls/controls-pins.json` (without the touch-only `reset`/`legacy_head`,
+   since the generic controls unit runs without `--touch`), and creates the voice
+   sessions, memory, actions and lock directories. A file that differs is left
+   alone unless `--force`.
+6. Runs `software-update lamp-os --activate` and waits. Prepare writes the
+   credentials; if V2 does not become ready, the updater restores V1.
+
+`--no-activate` stops after step 5 and `--rollback` runs
+`software-update rollback-to-legacy lamp-os`. The script does not promote
+anything and does not change other lamps.
+
+Verified on lamp-a63e (V1, 2026-10-19) with packages built from lamp-voice
+`ec9b26a`: V1 to V2, then V2 to V2 updates, every part active and health `ok`.
+Its voice could not reach Gemini (the campaign-api quota of that device,
+`quota_exceeded`), so speech was not verified and the voice restarts until the
+quota returns.

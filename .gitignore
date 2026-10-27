@@ -66,8 +66,9 @@ integrations/perception-service/tests/mock_data/audio/speakers/
 
 # Hardware CAD binaries are stored via Git LFS — see .gitattributes
 
-# Locally built wheels for the hal `aec` extra (scripts/release/build-aec-wheel.sh)
+# Locally built HAL wheels (scripts/release/build-aec-wheel.sh, build-webrtcvad-wheel.sh)
 dist/aec/
+dist/webrtcvad/
 
 # Language-ID model cache (downloaded release asset)
 .models-hal/

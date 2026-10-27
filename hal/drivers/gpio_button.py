@@ -19,6 +19,11 @@ from hal.drivers.device_tap_actions import physical_short_tap
 
 logger = logging.getLogger(__name__)
 
+# Quiet time after the last edge before the line level is read back. Contact bounce on
+# the Intern 2 button settles within ~5 ms; a dropped edge is corrected this long after
+# the line goes quiet.
+SETTLE_S = 0.05
+
 class GPIOButtonHandler:
     def __init__(self, config: ButtonConfig, *, name="primary",
                  behavior="standard", hold_s=5.0, factory_reset=True):
@@ -49,13 +54,28 @@ class GPIOButtonHandler:
         self._chip = config.chip
         self._pin = config.line
         self._debounce_ns = config.debounce_ns
-        self._last_press_tick = 0
-        self._last_release_tick = 0
+        # One debounce clock for both directions: edges inside the window after an
+        # accepted transition are contact bounce. Separate press/release clocks let a
+        # release bounce end a tap and a later press bounce start a phantom hold.
+        self._last_transition_tick = None
+        self._last_edge_tick = None
+        self._last_edge_at = 0.0
+        # Serializes state changes from the lgpio callback, the settle timer and the
+        # hold watcher. Order: _state_lock before _hold_lock.
+        self._state_lock = threading.RLock()
+        self._settle_timer = None
 
     def _hold_watcher(self, stop_event):
-        """Report hold tiers; shared feedback owns all LED animation."""
+        """Report hold tiers; shared feedback owns all LED animation.
+
+        Also confirms the hold against the line itself: once the line has been quiet for
+        SETTLE_S and reads released, the hold ends there, so a lost release edge can never
+        grow into a long hold."""
         last_stage = 0
         while not stop_event.is_set():
+            if self._read_level() == 1 and time.monotonic() - self._last_edge_at >= SETTLE_S:
+                self._reconcile()
+                return
             with self._hold_lock:
                 if stop_event.is_set() or self._hold_watcher_stop is not stop_event:
                     return
@@ -119,6 +139,10 @@ class GPIOButtonHandler:
     def stop(self):
         """Cancel pending work; actions already executing cannot be recalled."""
         self._stopped = True
+        with self._state_lock:
+            if self._settle_timer is not None:
+                self._settle_timer.cancel()
+                self._settle_timer = None
         with self._hold_lock:
             self._pressed = False
             if self._hold_watcher_stop is not None:
@@ -144,25 +168,71 @@ class GPIOButtonHandler:
             finally:
                 self._handle = None
 
+    def _read_level(self):
+        """Current line level (0 pressed, 1 released), or None when it cannot be read."""
+        if self._handle is None or self._lgpio is None:
+            return None
+        try:
+            level = self._lgpio.gpio_read(self._handle, self._pin)
+        except Exception:
+            return None
+        return level if level in (0, 1) else None
+
+    def _arm_settle_check(self):
+        """(Re)start the read-back that runs SETTLE_S after the latest edge."""
+        if self._settle_timer is not None:
+            self._settle_timer.cancel()
+        timer = threading.Timer(SETTLE_S, self._reconcile)
+        timer.daemon = True
+        self._settle_timer = timer
+        timer.start()
+
+    def _reconcile(self):
+        """Apply the settled line level when the edges left the state wrong.
+
+        The transition is dated at the latest edge, when the line actually moved."""
+        level = self._read_level()
+        if level is None or self._stopped:
+            return
+        with self._state_lock:
+            if self._stopped or (level == 0) == self._pressed:
+                return
+            logger.info("%s line settled %s with its edge debounce-dropped -- applying",
+                        self._source, "pressed" if level == 0 else "released")
+            self._last_transition_tick = self._last_edge_tick
+            self._transition(level, self._last_edge_at)
+
     def _on_edge(self, chip, gpio, level, tick):
         if self._stopped or level not in (0, 1):
             return
-        # Per-edge debounce.
-        if level == 0:
-            if tick - self._last_press_tick < self._debounce_ns:
+        now = time.monotonic()
+        with self._state_lock:
+            self._last_edge_tick = tick
+            self._last_edge_at = now
+            # Whatever this edge does, read the line back once it goes quiet.
+            self._arm_settle_check()
+            if (self._last_transition_tick is not None
+                    and tick - self._last_transition_tick < self._debounce_ns):
                 return
-            self._last_press_tick = tick
-        else:
-            if tick - self._last_release_tick < self._debounce_ns:
+            if level == 1 and not self._pressed:
+                # Stale release edge (matching press was debounce-dropped).
+                # _press_start may be from minutes ago — refusing to act is
+                # safer than firing a destructive action against stale state.
+                logger.warning("GPIO button release without matching press -- ignoring")
                 return
-            self._last_release_tick = tick
+            if level == 0 and self._pressed:
+                return
+            self._last_transition_tick = tick
+            self._transition(level, now)
 
+    def _transition(self, level, at):
+        """Press or release at monotonic time `at`; caller holds _state_lock."""
         if level == 0:
             # Button pressed (falling edge). LED feedback runs in a watcher thread.
             with self._hold_lock:
                 if self._stopped or self._pressed:
                     return
-                self._press_start = time.monotonic()
+                self._press_start = at
                 self._pressed = True
                 if self._hold_watcher_stop is not None:
                     self._hold_watcher_stop.set()
@@ -178,10 +248,6 @@ class GPIOButtonHandler:
             return
 
         if not self._pressed:
-            # Stale release edge (matching press was debounce-dropped).
-            # _press_start may be from minutes ago — refusing to act is
-            # safer than firing a destructive action against stale state.
-            logger.warning("GPIO button release without matching press -- ignoring")
             return
         self._pressed = False
         # Cancel blinking without blocking the GPIO callback on RGB I/O.
@@ -191,7 +257,7 @@ class GPIOButtonHandler:
                 self._hold_watcher_stop = None
             self._hold_led.release()
 
-        held = time.monotonic() - self._press_start
+        held = max(0.0, at - self._press_start)
         if button_hold_tier(held, behavior=self._behavior, hold_s=self._hold_s,
                             factory_reset=self._factory_reset):
             self._click_count = 0

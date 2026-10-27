@@ -21,6 +21,7 @@ def actions():
     with (
         mock.patch.object(gpio_button, "HoldLEDFeedback") as led,
         mock.patch.object(gpio_button.threading, "Thread", ImmediateThread),
+        mock.patch.object(gpio_button.threading, "Timer", FakeTimer),
         mock.patch.object(button_actions, "factory_reset_action") as reset,
         mock.patch.object(button_actions, "hold_release_action") as normal,
         mock.patch.object(gpio_button, "single_click_action") as single,
@@ -151,3 +152,126 @@ def test_cleanup_errors_do_not_prevent_remaining_cleanup(actions):
     button.stop()
     button._lgpio.gpiochip_close.assert_called_once_with(7)
     assert button._callback is None and button._handle is None
+
+
+class FakeTimer:
+    """threading.Timer stand-in: the test decides when the settle read-back runs."""
+    pending = []
+
+    def __init__(self, interval, function):
+        self.function, self.cancelled = function, False
+
+    def start(self):
+        FakeTimer.pending.append(self)
+
+    def cancel(self):
+        self.cancelled = True
+
+
+class Line:
+    """The button line as lgpio reports it: 1 released (pull-up), 0 pressed."""
+    def __init__(self):
+        self.level = 1
+
+    def gpio_read(self, handle, pin):
+        return self.level
+
+
+def wired(behavior="factory_reset", debounce_ms=200, **kwargs):
+    name = "reset" if behavior == "factory_reset" else "primary"
+    button = gpio_button.GPIOButtonHandler(
+        ButtonConfig(chip=1, line=9, debounce_ns=debounce_ms * 1_000_000),
+        name=name, behavior=behavior, **kwargs)
+    line = Line()
+    button._handle, button._lgpio = 3, line
+    return button, line
+
+
+def bounce(button, line, level, seconds):
+    """One edge at `seconds`; the line is left at `level`."""
+    line.level = level
+    edge(button, level, seconds)
+
+
+def settle(seconds):
+    """Run the latest pending read-back, as SETTLE_S after the last edge would."""
+    live = [t for t in FakeTimer.pending if not t.cancelled]
+    FakeTimer.pending.clear()
+    if live:
+        with mock.patch.object(gpio_button.time, "monotonic", return_value=seconds):
+            live[-1].function()
+
+
+@pytest.fixture
+def timers():
+    FakeTimer.pending = []
+    yield
+
+
+def test_bounced_tap_does_not_leave_a_phantom_hold(actions, timers):
+    # A ~250 ms tap whose press and release both bounce. Separate press/release clocks
+    # accepted the last press bounce and dropped the final release, so the next tap
+    # 20 s later closed a 20 s "hold" and factory-reset the device.
+    led, reset, normal, single, triple, cue = actions
+    button, line = wired(behavior="standard", factory_reset=True)
+    bounce(button, line, 0, 0.000)   # press
+    bounce(button, line, 1, 0.002)   # press bounce
+    bounce(button, line, 0, 0.004)
+    bounce(button, line, 1, 0.250)   # real release
+    bounce(button, line, 0, 0.254)   # release bounce
+    bounce(button, line, 1, 0.255)
+    settle(0.305)
+    assert not button._pressed
+    bounce(button, line, 0, 20.80)   # the next ordinary tap
+    bounce(button, line, 1, 20.95)
+    settle(21.0)
+    reset.assert_not_called()
+    normal.assert_not_called()
+    assert not button._pressed
+
+
+def test_tap_shorter_than_debounce_is_released_by_the_read_back(actions, timers):
+    button, line = wired(behavior="standard")
+    bounce(button, line, 0, 0.0)
+    bounce(button, line, 1, 0.1)     # inside the 200 ms window: dropped
+    assert button._pressed
+    settle(0.15)
+    assert not button._pressed
+    actions[3].assert_called_once_with(source="GPIO button", announce=False)
+
+
+def test_read_back_applies_a_dropped_press(actions, timers):
+    button, line = wired(behavior="standard")
+    bounce(button, line, 0, 0.0)
+    bounce(button, line, 1, 0.3)     # accepted release
+    bounce(button, line, 0, 0.35)    # real press inside the window: dropped
+    settle(0.4)
+    assert button._pressed and button._press_start == 0.35
+
+
+def test_hold_watcher_ends_a_hold_whose_release_edge_was_lost(actions, timers):
+    led, reset = actions[0], actions[1]
+    button, line = wired()
+    bounce(button, line, 0, 0.0)
+    line.level = 1                   # released, but no edge ever arrives
+    stop = button._hold_watcher_stop
+    with mock.patch.object(gpio_button.time, "monotonic", return_value=30.0):
+        button._hold_watcher(stop)
+    assert not button._pressed and stop.is_set()
+    reset.assert_not_called()
+
+
+def test_real_long_hold_still_factory_resets(actions, timers):
+    led, reset = actions[0], actions[1]
+    button, line = wired(hold_s=10)
+    bounce(button, line, 0, 0.0)
+    bounce(button, line, 1, 0.003)   # press bounce
+    bounce(button, line, 0, 0.005)
+    settle(0.055)
+    stop = button._hold_watcher_stop
+    with mock.patch.object(gpio_button.time, "monotonic", return_value=5.0):
+        with mock.patch.object(stop, "wait", return_value=True):
+            button._hold_watcher(stop)
+    assert button._pressed           # line still reads pressed: the hold continues
+    bounce(button, line, 1, 12.0)
+    reset.assert_called_once()

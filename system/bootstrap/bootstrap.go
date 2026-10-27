@@ -148,6 +148,18 @@ func (b *Bootstrap) waitForConfig(ctx context.Context) bool {
 func (b *Bootstrap) Serve() error {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
+	return b.serve(ctx)
+}
+
+func (b *Bootstrap) serve(ctx context.Context) error {
+	// Interrupted local transitions must be recovered even if provisioning,
+	// the feed URL or poll settings are unavailable after a power loss.
+	if err := b.recoverWithFreshUpdater(ctx); err != nil {
+		if !bootstrapSelfUpdateInProgress(err) {
+			return fmt.Errorf("startup OTA recovery: %w", err)
+		}
+		slog.Info("bootstrap self-update is awaiting health; recovery deferred while installer holds lock", "component", "bootstrap")
+	}
 
 	if !b.waitForConfig(ctx) {
 		return nil
@@ -251,7 +263,7 @@ func (b *Bootstrap) checkLoop(ctx context.Context, pollInterval time.Duration) {
 
 // checkComponent fetches metadata and reconciles a single named component.
 func (b *Bootstrap) checkComponent(ctx context.Context, key string) error {
-	if err := b.recoverPendingUpdate(ctx); err != nil {
+	if err := b.recoverWithFreshUpdater(ctx); err != nil {
 		return err
 	}
 	meta, err := b.fetchMetadata(ctx)
@@ -276,7 +288,7 @@ func (b *Bootstrap) checkComponent(ctx context.Context, key string) error {
 
 // checkOnce fetches metadata and reconciles all components.
 func (b *Bootstrap) checkOnce(ctx context.Context) error {
-	if err := b.recoverPendingUpdate(ctx); err != nil {
+	if err := b.recoverWithFreshUpdater(ctx); err != nil {
 		return err
 	}
 	meta, err := b.fetchMetadata(ctx)
@@ -580,15 +592,13 @@ func (b *Bootstrap) fetchMetadataPayload(ctx context.Context) (payload []byte, v
 func decodeOTAMetadataPayload(payload []byte, requireChecksums bool) (domain.OTAMetadata, error) {
 	var meta domain.OTAMetadata
 	if err := json.Unmarshal(payload, &meta); err != nil {
-		return nil, fmt.Errorf("decode verified metadata payload: %w", err)
+		return nil, fmt.Errorf("decode metadata payload: %w", err)
 	}
 	for key, c := range meta {
-		if c.Service != "" || len(c.Replaces) > 0 || len(c.ActivateByDevice) > 0 {
-			if !requireChecksums {
-				delete(meta, key)
-				continue
-			}
-			if err := domain.ValidateOTAServiceComponent(key, c); err != nil {
+		if c.Service != "" || len(c.Replaces) > 0 || len(c.ActivateByDevice) > 0 || len(c.ActivationReleaseByDevice) > 0 {
+			// Service packages always require their topology, URL and checksum,
+			// including devices using the legacy unsigned metadata trust mode.
+			if err := validateOTAMetadata(domain.OTAMetadata{key: c}); err != nil {
 				return nil, err
 			}
 		}
@@ -817,11 +827,9 @@ func (b *Bootstrap) applyUpdate(ctx context.Context, key string, component domai
 		return err
 	}
 	if _, ok := registry.Components[key]; ok {
-		runCtx, cancel := context.WithTimeout(ctx, 10*time.Minute)
-		defer cancel()
-		out, err := system.Run(runCtx, "software-update", key)
+		out, err := runUpdater(ctx, installTimeout, key)
 		if err != nil {
-			return fmt.Errorf("software-update %s: %w: %s", key, err, out)
+			return fmt.Errorf("software-update %s: %w: %s", key, err, updaterOutputTail(out))
 		}
 		return nil
 	}
@@ -829,11 +837,9 @@ func (b *Bootstrap) applyUpdate(ctx context.Context, key string, component domai
 	case domain.OTAKeyOSServer, domain.OTAKeyWeb, domain.OTAKeyHal, domain.OTAKeyBuddy, domain.OTAKeyOpenClaw, domain.OTAKeyDevice,
 		domain.OTAKeyCodex, domain.OTAKeyClaudeCode, domain.OTAKeyOpenCode, domain.OTAKeyPicoClaw, domain.OTAKeyHermes:
 		// Non-bootstrap components delegate to the on-device `software-update <key>`.
-		runCtx, cancel := context.WithTimeout(ctx, 10*time.Minute)
-		defer cancel()
-		out, err := system.Run(runCtx, "software-update", key)
+		out, err := runUpdater(ctx, installTimeout, key)
 		if err != nil {
-			return fmt.Errorf("software-update %s: %w", key, err)
+			return fmt.Errorf("software-update %s: %w: %s", key, err, updaterOutputTail(out))
 		}
 		slog.Info("update output", "component", "bootstrap", "key", key, "output", out)
 		return nil

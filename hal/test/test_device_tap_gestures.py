@@ -126,9 +126,10 @@ def test_mpr121_rapid_taps_stay_queued_individually(tap):
 
 def test_gpio_rapid_taps_do_not_arm_triple_click(tap):
     from hal.board.gpio_button import ButtonConfig
-    from hal.test.test_gpio_button import ImmediateThread, edge
+    from hal.test.test_gpio_button import FakeTimer, ImmediateThread, edge
     with (mock.patch.object(gpio_button, "HoldLEDFeedback"),
           mock.patch.object(gpio_button.threading, "Thread", ImmediateThread),
+          mock.patch.object(gpio_button.threading, "Timer", FakeTimer),
           mock.patch.object(gpio_button, "physical_short_tap") as action,
           mock.patch.object(gpio_button, "triple_click_action") as triple,
           mock.patch.object(gpio_button, "announce_listening_cue") as cue):

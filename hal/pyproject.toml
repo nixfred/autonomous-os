@@ -100,6 +100,12 @@ lerobot = { git = "https://github.com/huggingface/lerobot", rev = "55198de096f46
 # targets only CPython 3.12, so a future Python-range expansion cannot select
 # an incompatible wheel. Other platforms compile the PyPI sdist.
 aec-audio-processing = { url = "https://github.com/autonomous-ai/autonomous-os/releases/download/wheels/aec-1.0.1/aec_audio_processing-1.0.1-cp312-cp312-linux_aarch64.whl", marker = "sys_platform == 'linux' and platform_machine == 'aarch64' and python_full_version < '3.13'" }
+# webrtcvad: PyPI ships only an sdist, so without this every HAL install
+# compiled the C extension on the device, and a device whose compiler could not
+# build it could not install HAL. Rebuild with
+# scripts/release/build-webrtcvad-wheel.sh and `make upload-webrtcvad-wheel`
+# (tag `wheels/webrtcvad-<version>`); same marker rules as above.
+webrtcvad = { url = "https://github.com/autonomous-ai/autonomous-os/releases/download/wheels/webrtcvad-2.0.10/webrtcvad-2.0.10-cp312-cp312-linux_aarch64.whl", marker = "sys_platform == 'linux' and platform_machine == 'aarch64' and python_full_version < '3.13'" }
 
 # Static metadata for sdist-only deps of the `reachy` extra. Without this,
 # resolving the lock (on ANY machine, even when the extra is not installed)

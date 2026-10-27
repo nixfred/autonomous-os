@@ -65,6 +65,87 @@ class HALUpdateTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("uv not found", result.stderr)
 
+    def run_ensure(self, curl_body):
+        script = SCRIPT.read_text()
+        functions = "\n".join(
+            re.search(rf"^{name}\(\) \{{\n.*?^\}}$", script, re.M | re.S).group(0)
+            for name in ("cli_semver", "find_hal_uv", "uv_at_least_min", "ensure_hal_uv")
+        )
+        for path in ("/root/.local/bin/uv", "/home/pollen/.local/bin/uv"):
+            functions = functions.replace(path, str(self.root / path.lstrip("/")))
+        # Keep the script's own floor, so the tests follow a change to it.
+        floor = re.search(r"^HAL_UV_MIN=.*$", script, re.M).group(0)
+        curl = self.bin / "curl"
+        curl.write_text("#!/bin/sh\n" + curl_body)
+        curl.chmod(0o755)
+        for name in ("sort", "head", "mktemp", "rm", "sh", "mkdir", "chmod"):
+            if not (self.bin / name).exists():
+                (self.bin / name).symlink_to(shutil.which(name))
+        return subprocess.run(
+            ["/bin/bash", "-c", "set -e\n" + floor + "\n" + functions + "\nensure_hal_uv"],
+            env={**os.environ, "PATH": str(self.bin),
+                 "HAL_UV_HOME": str(self.root / "pinned"), "HAL_UV_PIN": "0.12.23"},
+            capture_output=True, text=True,
+        )
+
+    def make_versioned_uv(self, path, version):
+        candidate = self.root / path
+        candidate.parent.mkdir(parents=True, exist_ok=True)
+        candidate.write_text(f"#!/bin/sh\necho 'uv {version} (aarch64-unknown-linux-gnu)'\n")
+        candidate.chmod(0o755)
+        return candidate
+
+    # The installer stub writes a uv into UV_UNMANAGED_INSTALL, like astral's script.
+    INSTALLER = (
+        'out=""; while [ $# -gt 0 ]; do [ "$1" = -o ] && out="$2"; shift; done\n'
+        'printf \'%s\\n\' \'mkdir -p "$UV_UNMANAGED_INSTALL"\' '
+        '\'printf "#!/bin/sh\\necho uv 0.12.23\\n" > "$UV_UNMANAGED_INSTALL/uv"\' '
+        '\'chmod 755 "$UV_UNMANAGED_INSTALL/uv"\' > "$out"\n'
+    )
+
+    def test_new_enough_device_uv_is_kept(self):
+        device = self.make_versioned_uv("root/.local/bin/uv", "0.6.6")
+        result = self.run_ensure("echo curl must not run >&2; exit 1\n")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), str(device))
+
+    def test_kept_uv_is_logged_with_its_version(self):
+        device = self.make_versioned_uv("root/.local/bin/uv", "0.7.2")
+        result = self.run_ensure("echo curl must not run >&2; exit 1\n")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(f"using uv 0.7.2 at {device} (HAL needs >= 0.6.6)", result.stderr)
+
+    def test_old_device_uv_gets_pinned_uv_beside_it(self):
+        device = self.make_versioned_uv("bin/uv", "0.4.20")
+        before = device.read_text()
+        result = self.run_ensure(self.INSTALLER)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), str(self.root / "pinned/uv"))
+        self.assertIn(f"uv 0.4.20 at {device} is older than 0.6.6", result.stderr)
+        self.assertEqual(device.read_text(), before)
+
+    def test_missing_uv_gets_pinned_uv(self):
+        result = self.run_ensure(self.INSTALLER)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), str(self.root / "pinned/uv"))
+
+    def test_installed_pinned_uv_is_reused(self):
+        self.make_versioned_uv("bin/uv", "0.5.31")
+        pinned = self.make_versioned_uv("pinned/uv", "0.12.23")
+        result = self.run_ensure("echo curl must not run >&2; exit 1\n")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), str(pinned))
+
+    def test_failed_install_stops_before_hal(self):
+        self.make_versioned_uv("bin/uv", "0.4.20")
+        result = self.run_ensure("exit 22\n")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("uv 0.12.23 install failed", result.stderr)
+        script = SCRIPT.read_text()
+        branch = script.index('elif [ "$APP" = "hal" ]; then')
+        self.assertLess(script.index('UV_BIN="$(ensure_hal_uv)" || exit 1', branch),
+                        script.index("  systemctl stop hal", branch))
+
     def test_device_env_selects_reachy_and_preserves_other_devices(self):
         for device, expected in (("reachy-mini", "reachy"), ("lamp", "aec"),
                                  ("intern-v2", "aec")):
@@ -103,6 +184,46 @@ class HALUpdateTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(result.stdout.splitlines(), expected)
         self.assertIn('run_uv_with_activity "$UV_BIN" sync --python 3.12 --extra hardware "${HAL_EXTRA_ARGS[@]}"', script)
+
+
+class StagingFailureTests(unittest.TestCase):
+    def test_each_staging_step_names_itself_on_failure(self):
+        script = SCRIPT.read_text()
+        self.assertIn('HAL staging failed: unzip exited', script)
+        self.assertIn('HAL staging failed: uv sync exited $status (uv ', script)
+
+
+class DetachedRunTests(unittest.TestCase):
+    """The detached unit's output only reaches its journal; a failure repeats the end of it."""
+
+    def run_wrapper(self, unit_status):
+        with tempfile.TemporaryDirectory() as temporary:
+            stubs = Path(temporary)
+            for name, body in (
+                ("id", "echo 0"),
+                # The probe succeeds; the real run exits with unit_status.
+                ("systemd-run", f'case "$*" in *probe-*) exit 0;; esac; exit {unit_status}'),
+                ("journalctl", 'case "$*" in *--sync*) exit 0;; esac; '
+                               'echo "uv: lock mismatch"; echo "HAL staging failed: uv sync exited 2"'),
+            ):
+                (stubs / name).write_text(f"#!/bin/sh\n{body}\n")
+                (stubs / name).chmod(0o755)
+            return subprocess.run(
+                ["/bin/bash", str(SCRIPT), "hal"],
+                env={"PATH": f"{stubs}:/usr/bin:/bin", "HOME": temporary},
+                capture_output=True, text=True, timeout=30,
+            )
+
+    def test_failed_unit_relays_its_journal_tail(self):
+        result = self.run_wrapper(1)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertRegex(result.stderr, r"software-update-hal-\d+ failed \(exit 1\); last output:")
+        self.assertIn("HAL staging failed: uv sync exited 2", result.stderr)
+
+    def test_successful_unit_prints_no_journal(self):
+        result = self.run_wrapper(0)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("last output", result.stderr)
 
 
 class HALHealthTests(unittest.TestCase):

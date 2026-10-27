@@ -1,5 +1,5 @@
 version = 1
-revision = 3
+revision = 5
 requires-python = "==3.12.*"
 resolution-markers = [
     "platform_machine == 'aarch64' and sys_platform == 'linux'",
@@ -16,8 +16,6 @@ conflicts = [[
     { package = "hal-runtime", extra = "pipecat" },
     { package = "hal-runtime", extra = "reachy" },
 ]]
-
-[manifest]
 
 [[manifest.dependency-metadata]]
 name = "pycairo"
@@ -538,15 +536,6 @@ wheels = [
 ]
 
 [[package]]
-name = "comtypes"
-version = "1.4.16"
-source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/c6/2a/65274c13327f637ec13af8d39f2cf579d9ebe7a0e683696b5f05236d2805/comtypes-1.4.16.tar.gz", hash = "sha256:cd66d1add01265cface4df51ba1e31cd1657e04463c281c802e737e79e1ba93c", size = 260252, upload-time = "2026-03-02T23:11:42.413Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/5f/7c/0eb685107290b6221c03c46d39214a4e42a124189691cb83ae3228257f46/comtypes-1.4.16-py3-none-any.whl", hash = "sha256:e18d85179ff12955524c5a8c3bc09cb3c0d890f1da4d7123d14244c7b78f84c8", size = 296230, upload-time = "2026-03-02T23:11:41.049Z" },
-]
-
-[[package]]
 name = "contourpy"
 version = "1.3.3"
 source = { registry = "https://pypi.org/simple" }
@@ -1001,146 +990,6 @@ wheels = [
 ]
 
 [[package]]
-name = "gstreamer-bundle"
-version = "1.28.3"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "gstreamer-cli", marker = "(platform_machine != 'x86_64' and sys_platform == 'darwin') or (platform_machine != 'aarch64' and sys_platform == 'linux') or (sys_platform != 'darwin' and sys_platform != 'linux')" },
-    { name = "gstreamer-gtk", marker = "(platform_machine != 'x86_64' and sys_platform == 'darwin') or (platform_machine != 'aarch64' and sys_platform == 'linux') or (sys_platform != 'darwin' and sys_platform != 'linux')" },
-    { name = "gstreamer-libs", marker = "(platform_machine != 'x86_64' and sys_platform == 'darwin') or (platform_machine != 'aarch64' and sys_platform == 'linux') or (sys_platform != 'darwin' and sys_platform != 'linux')" },
-    { name = "gstreamer-plugins", marker = "(platform_machine != 'x86_64' and sys_platform == 'darwin') or (platform_machine != 'aarch64' and sys_platform == 'linux') or (sys_platform != 'darwin' and sys_platform != 'linux')" },
-    { name = "gstreamer-plugins-gpl", marker = "(platform_machine != 'x86_64' and sys_platform == 'darwin') or (platform_machine != 'aarch64' and sys_platform == 'linux') or (sys_platform != 'darwin' and sys_platform != 'linux')" },
-    { name = "gstreamer-plugins-gpl-restricted", marker = "(platform_machine != 'x86_64' and sys_platform == 'darwin') or (platform_machine != 'aarch64' and sys_platform == 'linux') or (sys_platform != 'darwin' and sys_platform != 'linux')" },
-    { name = "gstreamer-plugins-restricted", marker = "(platform_machine != 'x86_64' and sys_platform == 'darwin') or (platform_machine != 'aarch64' and sys_platform == 'linux') or (sys_platform != 'darwin' and sys_platform != 'linux')" },
-    { name = "gstreamer-python", marker = "(platform_machine != 'x86_64' and sys_platform == 'darwin') or (platform_machine != 'aarch64' and sys_platform == 'linux') or (sys_platform != 'darwin' and sys_platform != 'linux')" },
-]
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/07/0f/0dedd5e30e6a7f553cddf850ee39dadbd729a40e9509976f85437a9aaf26/gstreamer_bundle-1.28.3-py3-none-any.whl", hash = "sha256:1270a2f84b4bdb72ecc76c20802d7fafc58a8af0c8540a8e25dbcff91e190b71", size = 2572, upload-time = "2026-05-16T00:03:25.433Z" },
-]
-
-[[package]]
-name = "gstreamer-cli"
-version = "1.28.7"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "gstreamer-libs", marker = "(platform_machine != 'x86_64' and sys_platform == 'darwin') or (platform_machine != 'aarch64' and sys_platform == 'linux') or (sys_platform != 'darwin' and sys_platform != 'linux')" },
-]
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/93/f1/2b69e1ab84552a140f3f5ffd6b4801b74b0343e6135667e4339195d27122/gstreamer_cli-1.28.7-cp39-abi3-macosx_10_13_universal2.whl", hash = "sha256:1b2138761d355cd4c61e854a96a15fc010a732802302c2688459e607bd8c881a", size = 15777566, upload-time = "2026-09-08T05:18:48.458Z" },
-    { url = "https://files.pythonhosted.org/packages/49/64/32eaf68000351ac7f1e18de80a5f45bdff3498cb66f650a1ad316de18ced/gstreamer_cli-1.28.7-cp39-abi3-win32.whl", hash = "sha256:4c46f06dd40331189dad0f886d5e35b2ec9e6b035e5e3cf4ae5bc0a75b7b9c23", size = 5651001, upload-time = "2026-09-11T00:49:16.388Z" },
-    { url = "https://files.pythonhosted.org/packages/e0/97/9fd786a9554342633daa16621785d2d3e9000189e37a8477e2851c95f9aa/gstreamer_cli-1.28.7-cp39-abi3-win_amd64.whl", hash = "sha256:d89e0036f9cdcc1f2bbb8b6fd6ac2fb3fdc1cb00fbe35e89cdebc83d6aaa183d", size = 6332974, upload-time = "2026-09-11T00:49:18.753Z" },
-]
-
-[[package]]
-name = "gstreamer-ext-runtime"
-version = "1.28.7"
-source = { registry = "https://pypi.org/simple" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/8a/c8/ffffa044b674e63f33a1737f55df6367d8dc11c838767bc3804f32597f21/gstreamer_ext_runtime-1.28.7-cp39-abi3-macosx_10_13_universal2.whl", hash = "sha256:bd4227766ba0c8ba47d83adb969d6bd6f5da65b0a8827ba10cc4e79d54cb35b8", size = 2375, upload-time = "2026-09-08T05:19:04.347Z" },
-    { url = "https://files.pythonhosted.org/packages/50/20/9ab8bcca29914dbf6d23da56245598f3140149e536abf501be879daca7c0/gstreamer_ext_runtime-1.28.7-cp39-abi3-win32.whl", hash = "sha256:419b1de5cb173c773efe3e14a145c9077bd4cd7b8676e634f2e266d0b152844a", size = 871750, upload-time = "2026-09-11T00:49:20.792Z" },
-    { url = "https://files.pythonhosted.org/packages/79/6a/2cf0a9b4c51c5d94433919af55a7112b087f826ce7b8c84e8e79143644e8/gstreamer_ext_runtime-1.28.7-cp39-abi3-win_amd64.whl", hash = "sha256:838f7543ca718d05536cfe785d685a372b318505119f2190be59307a2a8a78f2", size = 1004083, upload-time = "2026-09-11T00:49:23.313Z" },
-]
-
-[[package]]
-name = "gstreamer-gtk"
-version = "1.28.7"
-source = { registry = "https://pypi.org/simple" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/30/76/4c72ea8f7a250bd44fc472c9e6505fe160427afe18e1eab27793ab2aff07/gstreamer_gtk-1.28.7-cp39-abi3-macosx_10_15_universal2.whl", hash = "sha256:1bc61338ad286e6484e4f956bdef5e493ac33c074cb87a6b5dd758afc1c10c9b", size = 20498055, upload-time = "2026-09-08T05:19:10.668Z" },
-    { url = "https://files.pythonhosted.org/packages/6f/6f/8b95ca07cc9388c48ec476cc1aeb574b04e13fc24ac4ad5087a6630f52bf/gstreamer_gtk-1.28.7-cp39-abi3-win32.whl", hash = "sha256:68dc198502f044795ac5d44159c7c406e06d65c8833f1c40bd6cd863d28f89f6", size = 4852361, upload-time = "2026-09-11T00:49:29.04Z" },
-    { url = "https://files.pythonhosted.org/packages/57/26/bd2074ac0362c6a93759cab2d89f0ddba6e46456985463369c5ed06c31e8/gstreamer_gtk-1.28.7-cp39-abi3-win_amd64.whl", hash = "sha256:a4bd0038a9cb9e0b95a9d08f1ed9765d8d83dd54d9e862ec74021985c0bb16b9", size = 5876908, upload-time = "2026-09-11T00:49:34.12Z" },
-]
-
-[[package]]
-name = "gstreamer-libs"
-version = "1.28.7"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "gstreamer-ext-runtime", marker = "(platform_machine != 'x86_64' and sys_platform == 'darwin') or (platform_machine != 'aarch64' and sys_platform == 'linux') or (sys_platform != 'darwin' and sys_platform != 'linux')" },
-    { name = "setuptools", marker = "(platform_machine != 'x86_64' and sys_platform == 'darwin') or (platform_machine != 'aarch64' and sys_platform == 'linux') or (sys_platform != 'darwin' and sys_platform != 'linux')" },
-]
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/22/a3/969350d1f0708cb6a507d50531127c46930183f1422ad56adc96149e2416/gstreamer_libs-1.28.7-cp39-abi3-macosx_10_13_universal2.whl", hash = "sha256:5a181336d80f4be235a2a7a62deed2ef6a47846bad3bd76135bd6600774377af", size = 96346436, upload-time = "2026-09-08T05:19:35.842Z" },
-    { url = "https://files.pythonhosted.org/packages/75/bb/0b3fef200067ea0f44526df4986d8bd33592675423d71d71854e9d2dad7e/gstreamer_libs-1.28.7-cp39-abi3-win32.whl", hash = "sha256:726728519ce9fe809b5fdc3800970b311292c300675ba134b7b78b7f7e4a97e4", size = 29146598, upload-time = "2026-09-11T00:49:41.683Z" },
-    { url = "https://files.pythonhosted.org/packages/db/10/1f71e13414c505253c86990a129c74af5adffb556a63d99483b4333bc5f7/gstreamer_libs-1.28.7-cp39-abi3-win_amd64.whl", hash = "sha256:ea81c0f3aba25ca53053202b274c9a05e71037761def9e2dbb172982e8e961bf", size = 33068736, upload-time = "2026-09-11T00:49:47.328Z" },
-]
-
-[[package]]
-name = "gstreamer-plugins"
-version = "1.28.7"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "gstreamer-plugins-libs", marker = "(platform_machine != 'x86_64' and sys_platform == 'darwin') or (platform_machine != 'aarch64' and sys_platform == 'linux') or (sys_platform != 'darwin' and sys_platform != 'linux')" },
-]
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/0e/14/0296d360ab2e23dc2bec75f7582a5bf7afc14eac8ba322aa3ec44d450921/gstreamer_plugins-1.28.7-cp39-abi3-macosx_10_13_universal2.whl", hash = "sha256:8d39f567ce15447a884bdbd4c8f2be5f78f2abe125fba1928e80bbb5b22a9e2c", size = 101434618, upload-time = "2026-09-08T05:20:11.37Z" },
-    { url = "https://files.pythonhosted.org/packages/8e/52/483e379c94336c66bd790a01b4d42b2cf288ac637235764e136c2bc310d2/gstreamer_plugins-1.28.7-cp39-abi3-win32.whl", hash = "sha256:d240a676d9befdfda9552ce0d44a717d22a1ccaaa128474548450ffcbab097dc", size = 40004021, upload-time = "2026-09-11T00:49:53.547Z" },
-    { url = "https://files.pythonhosted.org/packages/62/4d/8f60c96a1c2afeaf00b3a90b60cd2f3bec1f2fc5c381c58337068ef48f39/gstreamer_plugins-1.28.7-cp39-abi3-win_amd64.whl", hash = "sha256:960f8cc19f4c4dfb460e782b1c8a426e95d06a300195b6f356319731a3a2b70b", size = 46659073, upload-time = "2026-09-11T00:50:00.445Z" },
-]
-
-[[package]]
-name = "gstreamer-plugins-gpl"
-version = "1.28.7"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "gstreamer-plugins-libs", marker = "(platform_machine != 'x86_64' and sys_platform == 'darwin') or (platform_machine != 'aarch64' and sys_platform == 'linux') or (sys_platform != 'darwin' and sys_platform != 'linux')" },
-]
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/fd/8f/eee90a9d202bf5ad33025d982fc5384c209a968c7b4c406bf6938ed5c0f6/gstreamer_plugins_gpl-1.28.7-cp39-abi3-macosx_10_13_universal2.whl", hash = "sha256:7f3254415f0b100f2611cfe1f7e5fcfb7448a02563d0880efb0f399dc84704e6", size = 1050672, upload-time = "2026-09-08T05:20:18.533Z" },
-    { url = "https://files.pythonhosted.org/packages/67/1e/8681ed5c76926dbafd44d69962950cfd85d14c95cc512859e4a410ee71b1/gstreamer_plugins_gpl-1.28.7-cp39-abi3-win32.whl", hash = "sha256:2361a788741b69878f999484751f19fdc15f45ae449d9408112c97cc189bd139", size = 319711, upload-time = "2026-09-11T00:50:07.195Z" },
-    { url = "https://files.pythonhosted.org/packages/d5/3b/a0044016ed82c9e5a4b3486cdd935e13e8cc72abca277613bc767076a51e/gstreamer_plugins_gpl-1.28.7-cp39-abi3-win_amd64.whl", hash = "sha256:b3142c6d3b5443ccbd775903ab9bce512db29053db52dc3fa0f804be5789ef49", size = 357163, upload-time = "2026-09-11T00:50:09.128Z" },
-]
-
-[[package]]
-name = "gstreamer-plugins-gpl-restricted"
-version = "1.28.7"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "gstreamer-plugins-libs", marker = "(platform_machine != 'x86_64' and sys_platform == 'darwin') or (platform_machine != 'aarch64' and sys_platform == 'linux') or (sys_platform != 'darwin' and sys_platform != 'linux')" },
-]
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/2f/4b/ac434298e49508c90c9ac8729c3a2e578ddc8b973e82c692b434577ef836/gstreamer_plugins_gpl_restricted-1.28.7-cp39-abi3-macosx_10_13_universal2.whl", hash = "sha256:7dcfb68ec48fc45764a398bc43124ba174a8f22dd53fc3c27c6b3f70224da2fe", size = 13453657, upload-time = "2026-09-08T05:20:22.654Z" },
-    { url = "https://files.pythonhosted.org/packages/03/4a/17549d797026c0f7b66e25842316bbe3af22f80f5357b16e9f8eb1efa53b/gstreamer_plugins_gpl_restricted-1.28.7-cp39-abi3-win32.whl", hash = "sha256:3d7a676549f092281138f0aa3735d3069d2b267aef8bdbfd6410e41da4fa4ba3", size = 2150276, upload-time = "2026-09-11T00:50:11.659Z" },
-    { url = "https://files.pythonhosted.org/packages/0d/87/0a83fcceaaf5d117ba99eae719aa3af20a97ac93d727a070d84e7aa44b43/gstreamer_plugins_gpl_restricted-1.28.7-cp39-abi3-win_amd64.whl", hash = "sha256:821875d01cb54b2b720a6e8965a7b7b2e05dfacc9f708e5f66ae34fff6e16713", size = 3403262, upload-time = "2026-09-11T00:50:13.74Z" },
-]
-
-[[package]]
-name = "gstreamer-plugins-libs"
-version = "1.28.7"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "gstreamer-libs", marker = "(platform_machine != 'x86_64' and sys_platform == 'darwin') or (platform_machine != 'aarch64' and sys_platform == 'linux') or (sys_platform != 'darwin' and sys_platform != 'linux')" },
-]
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/7d/8c/ea1a272ece86216ad2ff4f7a024cd0bfd74e37889f8e6bb983d3de37b512/gstreamer_plugins_libs-1.28.7-cp39-abi3-macosx_10_13_universal2.whl", hash = "sha256:3691f3c649b426e82fbad423619c9012e19446db7e09a3b298c4c4ab33434bda", size = 83541399, upload-time = "2026-09-08T05:20:44.293Z" },
-    { url = "https://files.pythonhosted.org/packages/52/7d/ecf0b70f14df53e5e002da52db71a3511c01731166fb0f6fe3f54c70e5dd/gstreamer_plugins_libs-1.28.7-cp39-abi3-win32.whl", hash = "sha256:6dbf1f8b040956fb86ccbf1ad4b29ec0126559ffc395c529e5aae0216a0144e4", size = 16395927, upload-time = "2026-09-11T00:50:16.499Z" },
-    { url = "https://files.pythonhosted.org/packages/ea/0e/ae869eaefbcc164494be251260ba953e624b873ada017eb3c66877b1939d/gstreamer_plugins_libs-1.28.7-cp39-abi3-win_amd64.whl", hash = "sha256:5bfd41b8f3ec6ad1dac30132ad0ae4738a8a79de926606c7cc2c736bb1d22d06", size = 21170686, upload-time = "2026-09-11T00:50:20.786Z" },
-]
-
-[[package]]
-name = "gstreamer-plugins-restricted"
-version = "1.28.7"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "gstreamer-plugins-libs", marker = "(platform_machine != 'x86_64' and sys_platform == 'darwin') or (platform_machine != 'aarch64' and sys_platform == 'linux') or (sys_platform != 'darwin' and sys_platform != 'linux')" },
-]
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/b7/d8/b750310c32a238608a3451afb1de16f57cb302c2686e2707c9a974dc5a78/gstreamer_plugins_restricted-1.28.7-cp39-abi3-macosx_10_13_universal2.whl", hash = "sha256:72489fd5f15532811b1dcc8363b9c8bfa7dfb8a3a64271718805ff29d525f9cc", size = 6106223, upload-time = "2026-09-08T05:20:50.548Z" },
-    { url = "https://files.pythonhosted.org/packages/4e/fc/216f10d55a10ef290c291b0dcfcdad395ebb3fde76b1e6985dd5a726281c/gstreamer_plugins_restricted-1.28.7-cp39-abi3-win32.whl", hash = "sha256:ed517b3eadfd3736dfd8fb897942d01540a9caa79dda31e0c3d76b25215a25c6", size = 1422553, upload-time = "2026-09-11T00:50:23.81Z" },
-    { url = "https://files.pythonhosted.org/packages/9d/0d/a5eecf37046ffe3bd6dae2decc6e7c4029f1f783e4bfb925f0dc067c8ff7/gstreamer_plugins_restricted-1.28.7-cp39-abi3-win_amd64.whl", hash = "sha256:7e25451b61b93f0e0b2a0f14d6b8a9151e990dd011468aa9f3616595340c9355", size = 1514571, upload-time = "2026-09-11T00:50:25.986Z" },
-]
-
-[[package]]
-name = "gstreamer-python"
-version = "1.28.7"
-source = { registry = "https://pypi.org/simple" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/50/90/51c8549565480d81d78a4e84c67870fdb1fa1813c4e53bc833b7136f4a47/gstreamer_python-1.28.7-cp312-cp312-macosx_10_13_universal2.whl", hash = "sha256:27b64026d8672a2db58ce0027167c6c058b3abdf9cc5a0b288a7d1e2a84b047d", size = 1196708, upload-time = "2026-09-08T05:48:02.439Z" },
-    { url = "https://files.pythonhosted.org/packages/f1/5b/8b0ac01601599d7a7a82246920b0d5515b6c501e1c822b46c4e94453cc71/gstreamer_python-1.28.7-cp312-cp312-win32.whl", hash = "sha256:e456682cbdeb8b6845daee16a6ddd479ec3508da415ebb12bfb21e136f7d03e7", size = 933311, upload-time = "2026-09-11T00:52:41.826Z" },
-    { url = "https://files.pythonhosted.org/packages/b8/9d/4ea948bf47e4d751d02a64e48b2a534a10db5d4388765bdb90442c887909/gstreamer_python-1.28.7-cp312-cp312-win_amd64.whl", hash = "sha256:1dec42f6ec7e08f6ed3c167a61dfa43d303c36ba6c1d83ebeb514af9443fde8f", size = 973976, upload-time = "2026-09-11T00:52:43.553Z" },
-]
-
-[[package]]
 name = "gymnasium"
 version = "0.29.1"
 source = { registry = "https://pypi.org/simple" }
@@ -1200,7 +1049,8 @@ dependencies = [
     { name = "soundfile" },
     { name = "ultralytics" },
     { name = "uvicorn" },
-    { name = "webrtcvad" },
+    { name = "webrtcvad", version = "2.0.10", source = { registry = "https://pypi.org/simple" }, marker = "platform_machine != 'aarch64' or sys_platform != 'linux' or (extra == 'extra-11-hal-runtime-pipecat' and extra == 'extra-11-hal-runtime-reachy')" },
+    { name = "webrtcvad", version = "2.0.10", source = { url = "https://github.com/autonomous-ai/autonomous-os/releases/download/wheels/webrtcvad-2.0.10/webrtcvad-2.0.10-cp312-cp312-linux_aarch64.whl" }, marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine != 'aarch64' and extra == 'extra-11-hal-runtime-pipecat' and extra == 'extra-11-hal-runtime-reachy') or (sys_platform != 'linux' and extra == 'extra-11-hal-runtime-pipecat' and extra == 'extra-11-hal-runtime-reachy')" },
     { name = "websockets" },
     { name = "yt-dlp" },
 ]
@@ -1272,7 +1122,8 @@ requires-dist = [
     { name = "spidev", marker = "extra == 'hardware'" },
     { name = "ultralytics", specifier = ">=8.4,<9" },
     { name = "uvicorn", specifier = ">=0.34.0" },
-    { name = "webrtcvad", specifier = ">=2.0.10" },
+    { name = "webrtcvad", marker = "python_full_version >= '3.13' or platform_machine != 'aarch64' or sys_platform != 'linux'", specifier = ">=2.0.10" },
+    { name = "webrtcvad", marker = "python_full_version < '3.13' and platform_machine == 'aarch64' and sys_platform == 'linux'", url = "https://github.com/autonomous-ai/autonomous-os/releases/download/wheels/webrtcvad-2.0.10/webrtcvad-2.0.10-cp312-cp312-linux_aarch64.whl" },
     { name = "websockets", specifier = ">=12.0" },
     { name = "yt-dlp", specifier = ">=2026.8.17.73947.dev0" },
 ]
@@ -1617,7 +1468,7 @@ name = "libusb-package"
 version = "1.0.30.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "importlib-resources", marker = "platform_machine != 'x86_64' or sys_platform != 'darwin'" },
+    { name = "importlib-resources", marker = "sys_platform == 'linux'" },
 ]
 wheels = [
     { url = "https://files.pythonhosted.org/packages/42/a8/8b3d5dae7340880d556f9f866874b9674b2e3a22fee1e2b96f1ab0feae36/libusb_package-1.0.30.0-py3-none-macosx_10_9_x86_64.whl", hash = "sha256:2b98784bac3bedda7e95bb5039dd0eded84b02f36110e4d5d607375366c61090", size = 69516, upload-time = "2026-06-30T07:41:02.451Z" },
@@ -1833,7 +1684,7 @@ name = "markdown-it-py"
 version = "4.2.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "mdurl", marker = "platform_machine != 'x86_64' or sys_platform != 'darwin'" },
+    { name = "mdurl", marker = "sys_platform == 'linux'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/06/ff/7841249c247aa650a76b9ee4bbaeae59370dc8bfd2f6c01f3630c35eb134/markdown_it_py-4.2.0.tar.gz", hash = "sha256:04a21681d6fbb623de53f6f364d352309d4094dd4194040a10fd51833e418d49", size = 82454, upload-time = "2026-05-07T12:08:28.36Z" }
 wheels = [
@@ -2109,7 +1960,7 @@ name = "nvidia-cudnn-cu12"
 version = "9.5.1.17"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "nvidia-cublas-cu12", marker = "(platform_machine != 'x86_64' and sys_platform == 'darwin') or (platform_machine != 'aarch64' and sys_platform == 'linux') or (sys_platform != 'darwin' and sys_platform != 'linux' and sys_platform != 'win32') or (sys_platform == 'darwin' and extra == 'extra-11-hal-runtime-pipecat' and extra == 'extra-11-hal-runtime-reachy') or (sys_platform == 'linux' and extra == 'extra-11-hal-runtime-pipecat' and extra == 'extra-11-hal-runtime-reachy') or (sys_platform == 'win32' and extra == 'extra-11-hal-runtime-pipecat' and extra == 'extra-11-hal-runtime-reachy')" },
+    { name = "nvidia-cublas-cu12", marker = "(platform_machine != 'aarch64' and sys_platform == 'linux') or (platform_machine == 'aarch64' and extra == 'extra-11-hal-runtime-pipecat' and extra == 'extra-11-hal-runtime-reachy') or (sys_platform != 'linux' and extra == 'extra-11-hal-runtime-pipecat' and extra == 'extra-11-hal-runtime-reachy')" },
 ]
 wheels = [
     { url = "https://files.pythonhosted.org/packages/99/93/a201a12d3ec1caa8c6ac34c1c2f9eeb696b886f0c36ff23c638b46603bd0/nvidia_cudnn_cu12-9.5.1.17-py3-none-manylinux_2_28_aarch64.whl", hash = "sha256:9fd4584468533c61873e5fda8ca41bac3a38bcb2d12350830c69b0a96a7e4def", size = 570523509, upload-time = "2024-10-25T19:53:03.148Z" },
@@ -2122,7 +1973,7 @@ name = "nvidia-cufft-cu12"
 version = "11.3.0.4"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "nvidia-nvjitlink-cu12", marker = "(platform_machine != 'x86_64' and sys_platform == 'darwin') or (platform_machine != 'aarch64' and sys_platform == 'linux') or (sys_platform != 'darwin' and sys_platform != 'linux' and sys_platform != 'win32') or (sys_platform == 'darwin' and extra == 'extra-11-hal-runtime-pipecat' and extra == 'extra-11-hal-runtime-reachy') or (sys_platform == 'linux' and extra == 'extra-11-hal-runtime-pipecat' and extra == 'extra-11-hal-runtime-reachy') or (sys_platform == 'win32' and extra == 'extra-11-hal-runtime-pipecat' and extra == 'extra-11-hal-runtime-reachy')" },
+    { name = "nvidia-nvjitlink-cu12", marker = "(platform_machine != 'aarch64' and sys_platform == 'linux') or (platform_machine == 'aarch64' and extra == 'extra-11-hal-runtime-pipecat' and extra == 'extra-11-hal-runtime-reachy') or (sys_platform != 'linux' and extra == 'extra-11-hal-runtime-pipecat' and extra == 'extra-11-hal-runtime-reachy')" },
 ]
 wheels = [
     { url = "https://files.pythonhosted.org/packages/1f/37/c50d2b2f2c07e146776389e3080f4faf70bcc4fa6e19d65bb54ca174ebc3/nvidia_cufft_cu12-11.3.0.4-py3-none-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:d16079550df460376455cba121db6564089176d9bac9e4f360493ca4741b22a6", size = 200164144, upload-time = "2024-11-20T17:40:58.288Z" },
@@ -2158,9 +2009,9 @@ name = "nvidia-cusolver-cu12"
 version = "11.7.1.2"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "nvidia-cublas-cu12", marker = "(platform_machine != 'x86_64' and sys_platform == 'darwin') or (platform_machine != 'aarch64' and sys_platform == 'linux') or (sys_platform != 'darwin' and sys_platform != 'linux' and sys_platform != 'win32') or (sys_platform == 'darwin' and extra == 'extra-11-hal-runtime-pipecat' and extra == 'extra-11-hal-runtime-reachy') or (sys_platform == 'linux' and extra == 'extra-11-hal-runtime-pipecat' and extra == 'extra-11-hal-runtime-reachy') or (sys_platform == 'win32' and extra == 'extra-11-hal-runtime-pipecat' and extra == 'extra-11-hal-runtime-reachy')" },
-    { name = "nvidia-cusparse-cu12", marker = "(platform_machine != 'x86_64' and sys_platform == 'darwin') or (platform_machine != 'aarch64' and sys_platform == 'linux') or (sys_platform != 'darwin' and sys_platform != 'linux' and sys_platform != 'win32') or (sys_platform == 'darwin' and extra == 'extra-11-hal-runtime-pipecat' and extra == 'extra-11-hal-runtime-reachy') or (sys_platform == 'linux' and extra == 'extra-11-hal-runtime-pipecat' and extra == 'extra-11-hal-runtime-reachy') or (sys_platform == 'win32' and extra == 'extra-11-hal-runtime-pipecat' and extra == 'extra-11-hal-runtime-reachy')" },
-    { name = "nvidia-nvjitlink-cu12", marker = "(platform_machine != 'x86_64' and sys_platform == 'darwin') or (platform_machine != 'aarch64' and sys_platform == 'linux') or (sys_platform != 'darwin' and sys_platform != 'linux' and sys_platform != 'win32') or (sys_platform == 'darwin' and extra == 'extra-11-hal-runtime-pipecat' and extra == 'extra-11-hal-runtime-reachy') or (sys_platform == 'linux' and extra == 'extra-11-hal-runtime-pipecat' and extra == 'extra-11-hal-runtime-reachy') or (sys_platform == 'win32' and extra == 'extra-11-hal-runtime-pipecat' and extra == 'extra-11-hal-runtime-reachy')" },
+    { name = "nvidia-cublas-cu12", marker = "(platform_machine != 'aarch64' and sys_platform == 'linux') or (platform_machine == 'aarch64' and extra == 'extra-11-hal-runtime-pipecat' and extra == 'extra-11-hal-runtime-reachy') or (sys_platform != 'linux' and extra == 'extra-11-hal-runtime-pipecat' and extra == 'extra-11-hal-runtime-reachy')" },
+    { name = "nvidia-cusparse-cu12", marker = "(platform_machine != 'aarch64' and sys_platform == 'linux') or (platform_machine == 'aarch64' and extra == 'extra-11-hal-runtime-pipecat' and extra == 'extra-11-hal-runtime-reachy') or (sys_platform != 'linux' and extra == 'extra-11-hal-runtime-pipecat' and extra == 'extra-11-hal-runtime-reachy')" },
+    { name = "nvidia-nvjitlink-cu12", marker = "(platform_machine != 'aarch64' and sys_platform == 'linux') or (platform_machine == 'aarch64' and extra == 'extra-11-hal-runtime-pipecat' and extra == 'extra-11-hal-runtime-reachy') or (sys_platform != 'linux' and extra == 'extra-11-hal-runtime-pipecat' and extra == 'extra-11-hal-runtime-reachy')" },
 ]
 wheels = [
     { url = "https://files.pythonhosted.org/packages/93/17/dbe1aa865e4fdc7b6d4d0dd308fdd5aaab60f939abfc0ea1954eac4fb113/nvidia_cusolver_cu12-11.7.1.2-py3-none-manylinux2014_aarch64.whl", hash = "sha256:0ce237ef60acde1efc457335a2ddadfd7610b892d94efee7b776c64bb1cac9e0", size = 157833628, upload-time = "2024-10-01T17:05:05.591Z" },
@@ -2175,7 +2026,7 @@ name = "nvidia-cusparse-cu12"
 version = "12.5.4.2"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "nvidia-nvjitlink-cu12", marker = "(platform_machine != 'x86_64' and sys_platform == 'darwin') or (platform_machine != 'aarch64' and sys_platform == 'linux') or (sys_platform != 'darwin' and sys_platform != 'linux' and sys_platform != 'win32') or (sys_platform == 'darwin' and extra == 'extra-11-hal-runtime-pipecat' and extra == 'extra-11-hal-runtime-reachy') or (sys_platform == 'linux' and extra == 'extra-11-hal-runtime-pipecat' and extra == 'extra-11-hal-runtime-reachy') or (sys_platform == 'win32' and extra == 'extra-11-hal-runtime-pipecat' and extra == 'extra-11-hal-runtime-reachy')" },
+    { name = "nvidia-nvjitlink-cu12", marker = "(platform_machine != 'aarch64' and sys_platform == 'linux') or (platform_machine == 'aarch64' and extra == 'extra-11-hal-runtime-pipecat' and extra == 'extra-11-hal-runtime-reachy') or (sys_platform != 'linux' and extra == 'extra-11-hal-runtime-pipecat' and extra == 'extra-11-hal-runtime-reachy')" },
 ]
 wheels = [
     { url = "https://files.pythonhosted.org/packages/eb/eb/6681efd0aa7df96b4f8067b3ce7246833dd36830bb4cec8896182773db7d/nvidia_cusparse_cu12-12.5.4.2-py3-none-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:d25b62fb18751758fe3c93a4a08eff08effedfe4edf1c6bb5afd0890fe88f887", size = 216451147, upload-time = "2024-11-20T17:44:18.055Z" },
@@ -2240,11 +2091,11 @@ name = "onnxruntime"
 version = "1.24.4"
 source = { registry = "https://pypi.org/simple" }
 resolution-markers = [
-    "platform_machine == 'x86_64' and sys_platform == 'darwin'",
     "platform_machine == 'aarch64' and sys_platform == 'linux'",
     "sys_platform == 'win32'",
     "platform_machine != 'aarch64' and sys_platform == 'linux'",
     "(platform_machine != 'x86_64' and sys_platform == 'darwin') or (sys_platform != 'darwin' and sys_platform != 'linux' and sys_platform != 'win32')",
+    "platform_machine == 'x86_64' and sys_platform == 'darwin'",
 ]
 dependencies = [
     { name = "flatbuffers", marker = "(platform_machine == 'x86_64' and sys_platform == 'darwin') or (platform_machine != 'x86_64' and extra == 'extra-11-hal-runtime-pipecat') or (sys_platform != 'darwin' and extra == 'extra-11-hal-runtime-pipecat')" },
@@ -2617,7 +2468,7 @@ name = "prompt-toolkit"
 version = "3.0.51"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "wcwidth", marker = "platform_machine != 'x86_64' or sys_platform != 'darwin'" },
+    { name = "wcwidth", marker = "sys_platform == 'linux'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/bb/6e/9d084c929dfe9e3bfe0c6a47e31f78a25c54627d64a66e884a8bf5474f1c/prompt_toolkit-3.0.51.tar.gz", hash = "sha256:931a162e3b27fc90c86f1b48bb1fb2c528c2761475e57c9c06de13311c7b54ed", size = 428940, upload-time = "2025-04-15T09:18:47.731Z" }
 wheels = [
@@ -2765,19 +2616,6 @@ wheels = [
 ]
 
 [[package]]
-name = "pycaw"
-version = "20251023"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "comtypes", marker = "sys_platform == 'win32'" },
-    { name = "psutil", marker = "sys_platform == 'win32'" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/d1/81/19181e3118a503f94d8689fbbed60616e85d08cee3a295c11245ae73018f/pycaw-20251023.tar.gz", hash = "sha256:19935b92eb5efc3f3ea5ee8a2d37ca49009e9dc00f83d067b74b9922e84b5b3b", size = 23421, upload-time = "2025-10-23T18:26:45.087Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/ff/bc/f60c1622da5c53770c2d62457b5b6fc9623ab41b9d276269b857cd337e22/pycaw-20251023-py3-none-any.whl", hash = "sha256:ef06d234a2fe3c175925a2a8c7ed8824e450851014fdb7d900af1b56ce422d4e", size = 25849, upload-time = "2025-10-23T18:26:43.955Z" },
-]
-
-[[package]]
 name = "pycparser"
 version = "2.22"
 source = { registry = "https://pypi.org/simple" }
@@ -2866,7 +2704,7 @@ name = "pygobject"
 version = "3.46.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "pycairo", marker = "(platform_machine != 'x86_64' and sys_platform == 'darwin') or (sys_platform != 'darwin' and sys_platform != 'win32')" },
+    { name = "pycairo", marker = "sys_platform == 'linux'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/ac/4a/f24ddf1d20cc4b56affc7921e29928559a06c922eb60077448392792b914/PyGObject-3.46.0.tar.gz", hash = "sha256:481437b05af0a66b7c366ea052710eb3aacbb979d22d30b797f7ec29347ab1e6", size = 723367, upload-time = "2023-09-10T09:56:26.737Z" }
 
@@ -2909,10 +2747,10 @@ name = "pyobjc-framework-applicationservices"
 version = "11.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "pyobjc-core", marker = "(platform_machine != 'x86_64' and sys_platform == 'darwin') or (platform_machine != 'aarch64' and sys_platform == 'linux') or (sys_platform != 'darwin' and sys_platform != 'linux' and sys_platform != 'win32') or (sys_platform == 'darwin' and extra == 'extra-11-hal-runtime-pipecat' and extra == 'extra-11-hal-runtime-reachy') or (sys_platform == 'linux' and extra == 'extra-11-hal-runtime-pipecat' and extra == 'extra-11-hal-runtime-reachy') or (sys_platform == 'win32' and extra == 'extra-11-hal-runtime-pipecat' and extra == 'extra-11-hal-runtime-reachy')" },
-    { name = "pyobjc-framework-cocoa", marker = "(platform_machine != 'x86_64' and sys_platform == 'darwin') or (platform_machine != 'aarch64' and sys_platform == 'linux') or (sys_platform != 'darwin' and sys_platform != 'linux' and sys_platform != 'win32') or (sys_platform == 'darwin' and extra == 'extra-11-hal-runtime-pipecat' and extra == 'extra-11-hal-runtime-reachy') or (sys_platform == 'linux' and extra == 'extra-11-hal-runtime-pipecat' and extra == 'extra-11-hal-runtime-reachy') or (sys_platform == 'win32' and extra == 'extra-11-hal-runtime-pipecat' and extra == 'extra-11-hal-runtime-reachy')" },
-    { name = "pyobjc-framework-coretext", marker = "(platform_machine != 'x86_64' and sys_platform == 'darwin') or (platform_machine != 'aarch64' and sys_platform == 'linux') or (sys_platform != 'darwin' and sys_platform != 'linux' and sys_platform != 'win32') or (sys_platform == 'darwin' and extra == 'extra-11-hal-runtime-pipecat' and extra == 'extra-11-hal-runtime-reachy') or (sys_platform == 'linux' and extra == 'extra-11-hal-runtime-pipecat' and extra == 'extra-11-hal-runtime-reachy') or (sys_platform == 'win32' and extra == 'extra-11-hal-runtime-pipecat' and extra == 'extra-11-hal-runtime-reachy')" },
-    { name = "pyobjc-framework-quartz", marker = "(platform_machine != 'x86_64' and sys_platform == 'darwin') or (platform_machine != 'aarch64' and sys_platform == 'linux') or (sys_platform != 'darwin' and sys_platform != 'linux' and sys_platform != 'win32') or (sys_platform == 'darwin' and extra == 'extra-11-hal-runtime-pipecat' and extra == 'extra-11-hal-runtime-reachy') or (sys_platform == 'linux' and extra == 'extra-11-hal-runtime-pipecat' and extra == 'extra-11-hal-runtime-reachy') or (sys_platform == 'win32' and extra == 'extra-11-hal-runtime-pipecat' and extra == 'extra-11-hal-runtime-reachy')" },
+    { name = "pyobjc-core", marker = "(platform_machine != 'x86_64' and sys_platform == 'darwin') or (sys_platform != 'darwin' and sys_platform != 'linux' and sys_platform != 'win32') or (sys_platform == 'darwin' and extra == 'extra-11-hal-runtime-pipecat' and extra == 'extra-11-hal-runtime-reachy') or (sys_platform == 'linux' and extra == 'extra-11-hal-runtime-pipecat' and extra == 'extra-11-hal-runtime-reachy') or (sys_platform == 'win32' and extra == 'extra-11-hal-runtime-pipecat' and extra == 'extra-11-hal-runtime-reachy')" },
+    { name = "pyobjc-framework-cocoa", marker = "(platform_machine != 'x86_64' and sys_platform == 'darwin') or (sys_platform != 'darwin' and sys_platform != 'linux' and sys_platform != 'win32') or (sys_platform == 'darwin' and extra == 'extra-11-hal-runtime-pipecat' and extra == 'extra-11-hal-runtime-reachy') or (sys_platform == 'linux' and extra == 'extra-11-hal-runtime-pipecat' and extra == 'extra-11-hal-runtime-reachy') or (sys_platform == 'win32' and extra == 'extra-11-hal-runtime-pipecat' and extra == 'extra-11-hal-runtime-reachy')" },
+    { name = "pyobjc-framework-coretext", marker = "(platform_machine != 'x86_64' and sys_platform == 'darwin') or (sys_platform != 'darwin' and sys_platform != 'linux' and sys_platform != 'win32') or (sys_platform == 'darwin' and extra == 'extra-11-hal-runtime-pipecat' and extra == 'extra-11-hal-runtime-reachy') or (sys_platform == 'linux' and extra == 'extra-11-hal-runtime-pipecat' and extra == 'extra-11-hal-runtime-reachy') or (sys_platform == 'win32' and extra == 'extra-11-hal-runtime-pipecat' and extra == 'extra-11-hal-runtime-reachy')" },
+    { name = "pyobjc-framework-quartz", marker = "(platform_machine != 'x86_64' and sys_platform == 'darwin') or (sys_platform != 'darwin' and sys_platform != 'linux' and sys_platform != 'win32') or (sys_platform == 'darwin' and extra == 'extra-11-hal-runtime-pipecat' and extra == 'extra-11-hal-runtime-reachy') or (sys_platform == 'linux' and extra == 'extra-11-hal-runtime-pipecat' and extra == 'extra-11-hal-runtime-reachy') or (sys_platform == 'win32' and extra == 'extra-11-hal-runtime-pipecat' and extra == 'extra-11-hal-runtime-reachy')" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/be/3f/b33ce0cecc3a42f6c289dcbf9ff698b0d9e85f5796db2e9cb5dadccffbb9/pyobjc_framework_applicationservices-11.1.tar.gz", hash = "sha256:03fcd8c0c600db98fa8b85eb7b3bc31491701720c795e3f762b54e865138bbaf", size = 224842, upload-time = "2025-06-14T20:56:40.648Z" }
 wheels = [
@@ -2924,7 +2762,7 @@ name = "pyobjc-framework-cocoa"
 version = "11.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "pyobjc-core", marker = "(platform_machine != 'x86_64' and sys_platform == 'darwin') or (platform_machine != 'aarch64' and sys_platform == 'linux') or (sys_platform != 'darwin' and sys_platform != 'linux' and sys_platform != 'win32') or (sys_platform == 'darwin' and extra == 'extra-11-hal-runtime-pipecat' and extra == 'extra-11-hal-runtime-reachy') or (sys_platform == 'linux' and extra == 'extra-11-hal-runtime-pipecat' and extra == 'extra-11-hal-runtime-reachy') or (sys_platform == 'win32' and extra == 'extra-11-hal-runtime-pipecat' and extra == 'extra-11-hal-runtime-reachy')" },
+    { name = "pyobjc-core", marker = "(platform_machine != 'x86_64' and sys_platform == 'darwin') or (sys_platform != 'darwin' and sys_platform != 'linux' and sys_platform != 'win32') or (sys_platform == 'darwin' and extra == 'extra-11-hal-runtime-pipecat' and extra == 'extra-11-hal-runtime-reachy') or (sys_platform == 'linux' and extra == 'extra-11-hal-runtime-pipecat' and extra == 'extra-11-hal-runtime-reachy') or (sys_platform == 'win32' and extra == 'extra-11-hal-runtime-pipecat' and extra == 'extra-11-hal-runtime-reachy')" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/4b/c5/7a866d24bc026f79239b74d05e2cf3088b03263da66d53d1b4cf5207f5ae/pyobjc_framework_cocoa-11.1.tar.gz", hash = "sha256:87df76b9b73e7ca699a828ff112564b59251bb9bbe72e610e670a4dc9940d038", size = 5565335, upload-time = "2025-06-14T20:56:59.683Z" }
 wheels = [
@@ -2936,9 +2774,9 @@ name = "pyobjc-framework-coretext"
 version = "11.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "pyobjc-core", marker = "(platform_machine != 'x86_64' and sys_platform == 'darwin') or (platform_machine != 'aarch64' and sys_platform == 'linux') or (sys_platform != 'darwin' and sys_platform != 'linux' and sys_platform != 'win32') or (sys_platform == 'darwin' and extra == 'extra-11-hal-runtime-pipecat' and extra == 'extra-11-hal-runtime-reachy') or (sys_platform == 'linux' and extra == 'extra-11-hal-runtime-pipecat' and extra == 'extra-11-hal-runtime-reachy') or (sys_platform == 'win32' and extra == 'extra-11-hal-runtime-pipecat' and extra == 'extra-11-hal-runtime-reachy')" },
-    { name = "pyobjc-framework-cocoa", marker = "(platform_machine != 'x86_64' and sys_platform == 'darwin') or (platform_machine != 'aarch64' and sys_platform == 'linux') or (sys_platform != 'darwin' and sys_platform != 'linux' and sys_platform != 'win32') or (sys_platform == 'darwin' and extra == 'extra-11-hal-runtime-pipecat' and extra == 'extra-11-hal-runtime-reachy') or (sys_platform == 'linux' and extra == 'extra-11-hal-runtime-pipecat' and extra == 'extra-11-hal-runtime-reachy') or (sys_platform == 'win32' and extra == 'extra-11-hal-runtime-pipecat' and extra == 'extra-11-hal-runtime-reachy')" },
-    { name = "pyobjc-framework-quartz", marker = "(platform_machine != 'x86_64' and sys_platform == 'darwin') or (platform_machine != 'aarch64' and sys_platform == 'linux') or (sys_platform != 'darwin' and sys_platform != 'linux' and sys_platform != 'win32') or (sys_platform == 'darwin' and extra == 'extra-11-hal-runtime-pipecat' and extra == 'extra-11-hal-runtime-reachy') or (sys_platform == 'linux' and extra == 'extra-11-hal-runtime-pipecat' and extra == 'extra-11-hal-runtime-reachy') or (sys_platform == 'win32' and extra == 'extra-11-hal-runtime-pipecat' and extra == 'extra-11-hal-runtime-reachy')" },
+    { name = "pyobjc-core", marker = "(platform_machine != 'x86_64' and sys_platform == 'darwin') or (sys_platform != 'darwin' and sys_platform != 'linux' and sys_platform != 'win32') or (sys_platform == 'darwin' and extra == 'extra-11-hal-runtime-pipecat' and extra == 'extra-11-hal-runtime-reachy') or (sys_platform == 'linux' and extra == 'extra-11-hal-runtime-pipecat' and extra == 'extra-11-hal-runtime-reachy') or (sys_platform == 'win32' and extra == 'extra-11-hal-runtime-pipecat' and extra == 'extra-11-hal-runtime-reachy')" },
+    { name = "pyobjc-framework-cocoa", marker = "(platform_machine != 'x86_64' and sys_platform == 'darwin') or (sys_platform != 'darwin' and sys_platform != 'linux' and sys_platform != 'win32') or (sys_platform == 'darwin' and extra == 'extra-11-hal-runtime-pipecat' and extra == 'extra-11-hal-runtime-reachy') or (sys_platform == 'linux' and extra == 'extra-11-hal-runtime-pipecat' and extra == 'extra-11-hal-runtime-reachy') or (sys_platform == 'win32' and extra == 'extra-11-hal-runtime-pipecat' and extra == 'extra-11-hal-runtime-reachy')" },
+    { name = "pyobjc-framework-quartz", marker = "(platform_machine != 'x86_64' and sys_platform == 'darwin') or (sys_platform != 'darwin' and sys_platform != 'linux' and sys_platform != 'win32') or (sys_platform == 'darwin' and extra == 'extra-11-hal-runtime-pipecat' and extra == 'extra-11-hal-runtime-reachy') or (sys_platform == 'linux' and extra == 'extra-11-hal-runtime-pipecat' and extra == 'extra-11-hal-runtime-reachy') or (sys_platform == 'win32' and extra == 'extra-11-hal-runtime-pipecat' and extra == 'extra-11-hal-runtime-reachy')" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/65/e9/d3231c4f87d07b8525401fd6ad3c56607c9e512c5490f0a7a6abb13acab6/pyobjc_framework_coretext-11.1.tar.gz", hash = "sha256:a29bbd5d85c77f46a8ee81d381b847244c88a3a5a96ac22f509027ceceaffaf6", size = 274702, upload-time = "2025-06-14T20:57:16.059Z" }
 wheels = [
@@ -2950,8 +2788,8 @@ name = "pyobjc-framework-quartz"
 version = "11.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "pyobjc-core", marker = "(platform_machine != 'x86_64' and sys_platform == 'darwin') or (platform_machine != 'aarch64' and sys_platform == 'linux') or (sys_platform != 'darwin' and sys_platform != 'linux' and sys_platform != 'win32') or (sys_platform == 'darwin' and extra == 'extra-11-hal-runtime-pipecat' and extra == 'extra-11-hal-runtime-reachy') or (sys_platform == 'linux' and extra == 'extra-11-hal-runtime-pipecat' and extra == 'extra-11-hal-runtime-reachy') or (sys_platform == 'win32' and extra == 'extra-11-hal-runtime-pipecat' and extra == 'extra-11-hal-runtime-reachy')" },
-    { name = "pyobjc-framework-cocoa", marker = "(platform_machine != 'x86_64' and sys_platform == 'darwin') or (platform_machine != 'aarch64' and sys_platform == 'linux') or (sys_platform != 'darwin' and sys_platform != 'linux' and sys_platform != 'win32') or (sys_platform == 'darwin' and extra == 'extra-11-hal-runtime-pipecat' and extra == 'extra-11-hal-runtime-reachy') or (sys_platform == 'linux' and extra == 'extra-11-hal-runtime-pipecat' and extra == 'extra-11-hal-runtime-reachy') or (sys_platform == 'win32' and extra == 'extra-11-hal-runtime-pipecat' and extra == 'extra-11-hal-runtime-reachy')" },
+    { name = "pyobjc-core", marker = "(platform_machine != 'x86_64' and sys_platform == 'darwin') or (sys_platform != 'darwin' and sys_platform != 'linux' and sys_platform != 'win32') or (sys_platform == 'darwin' and extra == 'extra-11-hal-runtime-pipecat' and extra == 'extra-11-hal-runtime-reachy') or (sys_platform == 'linux' and extra == 'extra-11-hal-runtime-pipecat' and extra == 'extra-11-hal-runtime-reachy') or (sys_platform == 'win32' and extra == 'extra-11-hal-runtime-pipecat' and extra == 'extra-11-hal-runtime-reachy')" },
+    { name = "pyobjc-framework-cocoa", marker = "(platform_machine != 'x86_64' and sys_platform == 'darwin') or (sys_platform != 'darwin' and sys_platform != 'linux' and sys_platform != 'win32') or (sys_platform == 'darwin' and extra == 'extra-11-hal-runtime-pipecat' and extra == 'extra-11-hal-runtime-reachy') or (sys_platform == 'linux' and extra == 'extra-11-hal-runtime-pipecat' and extra == 'extra-11-hal-runtime-reachy') or (sys_platform == 'win32' and extra == 'extra-11-hal-runtime-pipecat' and extra == 'extra-11-hal-runtime-reachy')" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/c7/ac/6308fec6c9ffeda9942fef72724f4094c6df4933560f512e63eac37ebd30/pyobjc_framework_quartz-11.1.tar.gz", hash = "sha256:a57f35ccfc22ad48c87c5932818e583777ff7276605fef6afad0ac0741169f75", size = 3953275, upload-time = "2025-06-14T20:58:17.924Z" }
 wheels = [
@@ -3104,7 +2942,7 @@ name = "questionary"
 version = "2.1.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "prompt-toolkit", marker = "platform_machine != 'x86_64' or sys_platform != 'darwin'" },
+    { name = "prompt-toolkit", marker = "sys_platform == 'linux'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/f6/45/eafb0bba0f9988f6a2520f9ca2df2c82ddfa8d67c95d6625452e97b204a5/questionary-2.1.1.tar.gz", hash = "sha256:3d7e980292bb0107abaa79c68dd3eee3c561b83a0f89ae482860b181c8bd412d", size = 25845, upload-time = "2025-08-28T19:00:20.851Z" }
 wheels = [
@@ -3116,39 +2954,37 @@ name = "reachy-mini"
 version = "1.9.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "aiohttp", version = "3.14.2", source = { registry = "https://pypi.org/simple" }, marker = "platform_machine != 'x86_64' or sys_platform != 'darwin'" },
-    { name = "asgiref", marker = "platform_machine != 'x86_64' or sys_platform != 'darwin'" },
-    { name = "fastapi", marker = "platform_machine != 'x86_64' or sys_platform != 'darwin'" },
-    { name = "gstreamer-bundle", marker = "(platform_machine != 'x86_64' and sys_platform == 'darwin') or (sys_platform != 'darwin' and sys_platform != 'linux')" },
-    { name = "huggingface-hub", marker = "platform_machine != 'x86_64' or sys_platform != 'darwin'" },
-    { name = "jinja2", marker = "platform_machine != 'x86_64' or sys_platform != 'darwin'" },
-    { name = "libusb-package", marker = "platform_machine != 'x86_64' or sys_platform != 'darwin'" },
-    { name = "log-throttling", marker = "platform_machine != 'x86_64' or sys_platform != 'darwin'" },
-    { name = "numpy", marker = "platform_machine != 'x86_64' or sys_platform != 'darwin'" },
-    { name = "onnxruntime", version = "1.27.0", source = { registry = "https://pypi.org/simple" }, marker = "platform_machine != 'x86_64' or sys_platform != 'darwin'" },
-    { name = "pip", marker = "platform_machine != 'x86_64' or sys_platform != 'darwin'" },
-    { name = "platformdirs", marker = "platform_machine != 'x86_64' or sys_platform != 'darwin'" },
-    { name = "psutil", marker = "platform_machine != 'x86_64' or sys_platform != 'darwin'" },
+    { name = "aiohttp", version = "3.14.2", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform == 'linux'" },
+    { name = "asgiref", marker = "sys_platform == 'linux'" },
+    { name = "fastapi", marker = "sys_platform == 'linux'" },
+    { name = "huggingface-hub", marker = "sys_platform == 'linux'" },
+    { name = "jinja2", marker = "sys_platform == 'linux'" },
+    { name = "libusb-package", marker = "sys_platform == 'linux'" },
+    { name = "log-throttling", marker = "sys_platform == 'linux'" },
+    { name = "numpy", marker = "sys_platform == 'linux'" },
+    { name = "onnxruntime", version = "1.27.0", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform == 'linux'" },
+    { name = "pip", marker = "sys_platform == 'linux'" },
+    { name = "platformdirs", marker = "sys_platform == 'linux'" },
+    { name = "psutil", marker = "sys_platform == 'linux'" },
     { name = "pulsectl", marker = "sys_platform == 'linux'" },
-    { name = "pycaw", marker = "sys_platform == 'win32'" },
-    { name = "pydantic", marker = "platform_machine != 'x86_64' or sys_platform != 'darwin'" },
+    { name = "pydantic", marker = "sys_platform == 'linux'" },
     { name = "pygobject", marker = "sys_platform == 'linux'" },
-    { name = "pyserial", marker = "platform_machine != 'x86_64' or sys_platform != 'darwin'" },
-    { name = "python-multipart", version = "0.0.32", source = { registry = "https://pypi.org/simple" }, marker = "platform_machine != 'x86_64' or sys_platform != 'darwin'" },
-    { name = "pyusb", marker = "platform_machine != 'x86_64' or sys_platform != 'darwin'" },
-    { name = "pyyaml", marker = "platform_machine != 'x86_64' or sys_platform != 'darwin'" },
-    { name = "questionary", marker = "platform_machine != 'x86_64' or sys_platform != 'darwin'" },
-    { name = "reachy-mini-motor-controller", marker = "platform_machine != 'x86_64' or sys_platform != 'darwin'" },
-    { name = "reachy-mini-rust-kinematics", marker = "platform_machine != 'x86_64' or sys_platform != 'darwin'" },
-    { name = "requests", version = "2.34.2", source = { registry = "https://pypi.org/simple" }, marker = "platform_machine != 'x86_64' or sys_platform != 'darwin'" },
-    { name = "rich", marker = "platform_machine != 'x86_64' or sys_platform != 'darwin'" },
-    { name = "rustypot", marker = "platform_machine != 'x86_64' or sys_platform != 'darwin'" },
-    { name = "scipy", marker = "platform_machine != 'x86_64' or sys_platform != 'darwin'" },
-    { name = "starlette", version = "0.52.1", source = { registry = "https://pypi.org/simple" }, marker = "platform_machine != 'x86_64' or sys_platform != 'darwin'" },
-    { name = "toml", marker = "platform_machine != 'x86_64' or sys_platform != 'darwin'" },
-    { name = "uvicorn", extra = ["standard"], marker = "(platform_machine != 'x86_64' and extra == 'extra-11-hal-runtime-reachy') or (sys_platform != 'darwin' and extra == 'extra-11-hal-runtime-reachy') or (extra == 'extra-11-hal-runtime-pipecat' and extra == 'extra-11-hal-runtime-reachy')" },
-    { name = "websockets", marker = "platform_machine != 'x86_64' or sys_platform != 'darwin'" },
-    { name = "zeroconf", marker = "platform_machine != 'x86_64' or sys_platform != 'darwin'" },
+    { name = "pyserial", marker = "sys_platform == 'linux'" },
+    { name = "python-multipart", version = "0.0.32", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform == 'linux'" },
+    { name = "pyusb", marker = "sys_platform == 'linux'" },
+    { name = "pyyaml", marker = "sys_platform == 'linux'" },
+    { name = "questionary", marker = "sys_platform == 'linux'" },
+    { name = "reachy-mini-motor-controller", marker = "sys_platform == 'linux'" },
+    { name = "reachy-mini-rust-kinematics", marker = "sys_platform == 'linux'" },
+    { name = "requests", version = "2.34.2", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform == 'linux'" },
+    { name = "rich", marker = "sys_platform == 'linux'" },
+    { name = "rustypot", marker = "sys_platform == 'linux'" },
+    { name = "scipy", marker = "sys_platform == 'linux'" },
+    { name = "starlette", version = "0.52.1", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform == 'linux'" },
+    { name = "toml", marker = "sys_platform == 'linux'" },
+    { name = "uvicorn", extra = ["standard"], marker = "(sys_platform == 'linux' and extra == 'extra-11-hal-runtime-reachy') or (extra == 'extra-11-hal-runtime-pipecat' and extra == 'extra-11-hal-runtime-reachy')" },
+    { name = "websockets", marker = "sys_platform == 'linux'" },
+    { name = "zeroconf", marker = "sys_platform == 'linux'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/0e/ae/da44c9dd1d7c67715fef69b0a78c22ec21384fbcc3a63300b1da821acf94/reachy_mini-1.9.0.tar.gz", hash = "sha256:3a7e022cd585396c4b5ba7dbf356f93509cba9211bb1e06d90417dec7a3ee7cf", size = 23496378, upload-time = "2026-07-09T15:53:05.795Z" }
 wheels = [
@@ -3293,8 +3129,8 @@ name = "rich"
 version = "15.0.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "markdown-it-py", marker = "platform_machine != 'x86_64' or sys_platform != 'darwin'" },
-    { name = "pygments", marker = "platform_machine != 'x86_64' or sys_platform != 'darwin'" },
+    { name = "markdown-it-py", marker = "sys_platform == 'linux'" },
+    { name = "pygments", marker = "sys_platform == 'linux'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/c0/8f/0722ca900cc807c13a6a0c696dacf35430f72e0ec571c4275d2371fca3e9/rich-15.0.0.tar.gz", hash = "sha256:edd07a4824c6b40189fb7ac9bc4c52536e9780fbbfbddf6f1e2502c31b068c36", size = 230680, upload-time = "2026-04-12T08:24:00.75Z" }
 wheels = [
@@ -3686,7 +3522,7 @@ name = "triton"
 version = "3.3.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "setuptools", marker = "(platform_machine != 'x86_64' and sys_platform == 'darwin') or (platform_machine != 'aarch64' and sys_platform == 'linux') or (sys_platform != 'darwin' and sys_platform != 'linux' and sys_platform != 'win32') or (sys_platform == 'darwin' and extra == 'extra-11-hal-runtime-pipecat' and extra == 'extra-11-hal-runtime-reachy') or (sys_platform == 'linux' and extra == 'extra-11-hal-runtime-pipecat' and extra == 'extra-11-hal-runtime-reachy') or (sys_platform == 'win32' and extra == 'extra-11-hal-runtime-pipecat' and extra == 'extra-11-hal-runtime-reachy')" },
+    { name = "setuptools", marker = "(platform_machine != 'aarch64' and sys_platform == 'linux') or (platform_machine == 'aarch64' and extra == 'extra-11-hal-runtime-pipecat' and extra == 'extra-11-hal-runtime-reachy') or (sys_platform != 'linux' and extra == 'extra-11-hal-runtime-pipecat' and extra == 'extra-11-hal-runtime-reachy')" },
 ]
 wheels = [
     { url = "https://files.pythonhosted.org/packages/24/5f/950fb373bf9c01ad4eb5a8cd5eaf32cdf9e238c02f9293557a2129b9c4ac/triton-3.3.1-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:9999e83aba21e1a78c1f36f21bce621b77bcaa530277a50484a7cb4a822f6e43", size = 155669138, upload-time = "2025-05-29T23:39:51.771Z" },
@@ -3819,13 +3655,12 @@ wheels = [
 
 [package.optional-dependencies]
 standard = [
-    { name = "colorama", marker = "sys_platform == 'win32'" },
-    { name = "httptools", marker = "platform_machine != 'x86_64' or sys_platform != 'darwin'" },
-    { name = "python-dotenv", marker = "platform_machine != 'x86_64' or sys_platform != 'darwin'" },
-    { name = "pyyaml", marker = "platform_machine != 'x86_64' or sys_platform != 'darwin'" },
-    { name = "uvloop", marker = "(platform_machine != 'x86_64' and platform_python_implementation != 'PyPy' and sys_platform == 'darwin') or (platform_python_implementation != 'PyPy' and sys_platform != 'cygwin' and sys_platform != 'darwin' and sys_platform != 'win32')" },
-    { name = "watchfiles", marker = "platform_machine != 'x86_64' or sys_platform != 'darwin'" },
-    { name = "websockets", marker = "platform_machine != 'x86_64' or sys_platform != 'darwin'" },
+    { name = "httptools", marker = "sys_platform == 'linux'" },
+    { name = "python-dotenv", marker = "sys_platform == 'linux'" },
+    { name = "pyyaml", marker = "sys_platform == 'linux'" },
+    { name = "uvloop", marker = "platform_python_implementation != 'PyPy' and sys_platform == 'linux'" },
+    { name = "watchfiles", marker = "sys_platform == 'linux'" },
+    { name = "websockets", marker = "sys_platform == 'linux'" },
 ]
 
 [[package]]
@@ -3908,7 +3743,35 @@ wheels = [
 name = "webrtcvad"
 version = "2.0.10"
 source = { registry = "https://pypi.org/simple" }
+resolution-markers = [
+    "sys_platform == 'win32'",
+    "platform_machine != 'aarch64' and sys_platform == 'linux'",
+    "(platform_machine != 'x86_64' and sys_platform == 'darwin') or (sys_platform != 'darwin' and sys_platform != 'linux' and sys_platform != 'win32')",
+    "platform_machine == 'x86_64' and sys_platform == 'darwin'",
+]
 sdist = { url = "https://files.pythonhosted.org/packages/89/34/e2de2d97f3288512b9ea56f92e7452f8207eb5a0096500badf9dfd48f5e6/webrtcvad-2.0.10.tar.gz", hash = "sha256:f1bed2fb25b63fb7b1a55d64090c993c9c9167b28485ae0bcdd81cf6ede96aea", size = 66156, upload-time = "2017-01-07T23:05:18.732Z" }
+
+[[package]]
+name = "webrtcvad"
+version = "2.0.10"
+source = { url = "https://github.com/autonomous-ai/autonomous-os/releases/download/wheels/webrtcvad-2.0.10/webrtcvad-2.0.10-cp312-cp312-linux_aarch64.whl" }
+resolution-markers = [
+    "platform_machine == 'aarch64' and sys_platform == 'linux'",
+]
+wheels = [
+    { url = "https://github.com/autonomous-ai/autonomous-os/releases/download/wheels/webrtcvad-2.0.10/webrtcvad-2.0.10-cp312-cp312-linux_aarch64.whl", hash = "sha256:14c2fd0a898d81487060a42fd63005e454a3b7afc9139e8db4e34a5edeb46233" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "check-manifest", marker = "extra == 'dev'" },
+    { name = "memory-profiler", marker = "extra == 'dev'" },
+    { name = "nose", marker = "extra == 'dev'" },
+    { name = "psutil", marker = "extra == 'dev'" },
+    { name = "unittest2", marker = "extra == 'dev'" },
+    { name = "zest-releaser", marker = "extra == 'dev'" },
+]
+provides-extras = ["dev"]
 
 [[package]]
 name = "websockets"
@@ -4019,7 +3882,7 @@ name = "zeroconf"
 version = "0.150.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "ifaddr", marker = "platform_machine != 'x86_64' or sys_platform != 'darwin'" },
+    { name = "ifaddr", marker = "sys_platform == 'linux'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/09/ea/34bb185645ecaa18d34e5883bffea71aa9bffbbb994634884e8b2f3ad0c4/zeroconf-0.150.0.tar.gz", hash = "sha256:a5fe7feab1de6ef5e541e0a3d07e534fd91629b813fc27281593584100f63164", size = 213634, upload-time = "2026-06-22T17:52:37.982Z" }
 wheels = [

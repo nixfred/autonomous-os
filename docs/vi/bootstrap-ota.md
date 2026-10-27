@@ -390,6 +390,15 @@ profile thất bại. Check lỗi sẽ tự phục hồi profile trước đó v
 thái service cũ. Dùng `software-update rollback device` khi operator rollback;
 version profile bị loại sau đó sẽ bị chặn.
 
+Trước khi dừng bất cứ thứ gì, updater kiểm tra HAL đang cài có load được profile
+mới không. HAL đọc `ROBOT.md` từ 0.1.2 (`DEVICE_HAL_MIN`); HAL cũ hơn chỉ mở
+`DEVICE.md` và không khởi động được nếu thiếu file này. Vì vậy profile không có
+`DEVICE.md` bị từ chối khi `/opt/hal/VERSION_HAL` thấp hơn 0.1.2 hoặc không đọc
+được: update thất bại với "Device profile needs HAL >= 0.1.2 … Update HAL first;
+profile unchanged", và không service, file hay recovery journal nào bị đụng tới.
+Mỗi lần thử vẫn tải lại package cho tới khi HAL được update. Máy không có
+`/opt/hal`, hoặc profile vẫn kèm `DEVICE.md`, không bị ảnh hưởng.
+
 ### Override phần cứng tùy chọn
 
 OS đọc tên trên một dòng trong `/etc/autonomous/hardware-profile`. Thiếu file,
@@ -744,7 +753,7 @@ resolve từ `metadata.devices.<device_type>` lồng nhau thay vì danh sách co
 
 | Thành phần | Các bước |
 |---|---|
-| `os-server` | Chạy `software-update os-server` (block tối đa 10 phút) |
+| `os-server` | Chạy `software-update os-server` (block tối đa 30 phút, xem bên dưới) |
 | `bootstrap` | Spawn detached `software-update bootstrap` (tự cập nhật, sống sót sau restart) |
 | `web` | Chạy `software-update web` |
 | `device` | Chạy `software-update device` cho profile `devices.<device_type>` đã resolve; rootfs overlay được áp dụng nhưng vẫn giữ `.env` HAL local của thiết bị |
@@ -752,6 +761,34 @@ resolve từ `metadata.devices.<device_type>` lồng nhau thay vì danh sách co
 | `hal` | Chạy `software-update hal` → `systemctl restart hal` |
 | `codex` / `claudecode` / `opencode` / `picoclaw` | Chạy `software-update <key>` — CHỈ trên thiết bị có `agent_runtime` đúng bằng runtime đó |
 | `hermes` | Chạy `software-update hermes` — chỉ khi `agent_runtime` là hermes, entry metadata có `commit`, VÀ updater trên máy là bản biết pin (`updaterSupportsHermesPin`: có đọc `.hermes.commit`). Entry chưa pin (không có `commit`) bị cả loop lẫn `/versions` bỏ qua, nên nút trên web không hiện — `hermes update` sẽ lên upstream HEAD và không bao giờ đạt sàn. |
+
+**Giới hạn thời gian cài đặt.** Mỗi lần cài `software-update <key>` do
+bootstrap chạy (poll tự động, force update, kích hoạt service được promote) được
+tối đa 30 phút; cài từ một phiên bản cũ hơn nhiều có thể thực sự cần chừng đó
+thời gian. `software-update recover` vẫn giữ giới hạn 10 phút. Khi hết giới hạn,
+bootstrap dừng updater thay vì bỏ mặc nó:
+
+1. Gửi SIGTERM tới mọi process của updater: unit tạm
+   `software-update-<key>-<pid>` nếu updater chạy dưới dạng unit, nếu không thì
+   process group riêng của updater. Trap EXIT của updater khôi phục bản cài trước
+   đó, và các bước con chạy lâu (tải về, cài package) kết thúc.
+2. Sau 3 phút ân hạn, đủ cho bước khôi phục và health check của nó, gửi SIGKILL
+   tới chính các process đó, để không process sót lại nào còn giữ update lock.
+3. Nếu bước khôi phục chưa xong, journal vẫn còn và lần poll bootstrap tiếp theo
+   sẽ chạy `software-update recover`.
+
+Dừng hoặc restart chính bootstrap không hủy lần cài đang chạy; chỉ giới hạn thời
+gian mới hủy. Watcher báo hoàn tất `system.software_update` của os-server chờ tối
+đa 40 phút, đủ cho giới hạn cộng thời gian ân hạn.
+
+**Lý do thất bại.** Output của updater nằm trong journal của unit tạm. Khi unit
+lỗi, updater in lại 40 dòng cuối của journal đó ra stderr, và bootstrap đưa
+2.000 byte cuối của output updater vào lỗi của nó (`software-update <key>: exit
+status 1: …`), nên đọc được lý do ngay trong log của bootstrap mà không cần mở
+journal trên thiết bị. Lần cài HAL ghi rõ bước bị lỗi: `using uv <version> at
+<path>` hoặc `uv <version> at <path> is older than <min>` (khi đó cài uv được
+pin), `HAL staging failed: unzip exited <n>`, hoặc `HAL staging failed: uv sync
+exited <n>` kèm phiên bản và đường dẫn uv, cờ lock và dung lượng trống.
 
 Cập nhật OpenClaw thủ công và force update chạy `software-update openclaw`.
 Trước khi cài phiên bản trong OTA metadata, updater đọc `engines.node` của
@@ -893,6 +930,16 @@ SIGKILL hoặc mất điện được phục hồi ở lần chạy updater ho�
 theo; cơ chế này không bảo đảm khôi phục mọi lỗi dữ liệu thẻ SD hoặc máy không
 boot được tới bước chạy các service đó.
 
+Recovery chạy updater đang có trên máy, trước khi vòng kiểm tra tới bước làm mới
+ở trên. Nếu updater đó recovery thất bại, bootstrap làm mới nó từ feed một lần và
+chỉ khi file thực sự thay đổi mới chạy lại recovery bằng bản mới
+(`recoverWithFreshUpdater`). Điều này áp dụng lúc khởi động, ở poll tự động,
+component check và force update. Nếu không có bước này, một lỗi recovery trong
+updater trên máy sẽ chặn mọi vòng kiểm tra trước khi bản sửa kịp tới. Updater
+không đổi, làm mới thất bại hoặc installer đang giữ lock thì trả lỗi ban đầu và
+không chạy lại recovery. Bootstrap chưa có bước này thì máy kẹt như vậy vẫn phải
+sửa updater thủ công.
+
 Nếu cài HAL lần đầu mà không có runtime hay backup trước đó, recovery đưa
 candidate lỗi ra khỏi đường dẫn live và giữ HAL dừng. Nó không báo đã phục hồi
 một bản cũ vốn không tồn tại.
@@ -911,8 +958,21 @@ profile khi core lỗi). Chỉ upload HAL sẽ không phân phối các thay đ�
 ### Xử lý HAL
 
 Updater tìm `uv` trong `PATH`, rồi `/root/.local/bin/uv`, rồi
-`/home/pollen/.local/bin/uv` (vị trí bộ cài Reachy sử dụng). Trước khi dừng HAL,
-script chọn Python extras theo `DEVICE_TYPE` trong `/opt/hal/.env`, fallback sang
+`/home/pollen/.local/bin/uv` (vị trí bộ cài Reachy sử dụng).
+
+`pyproject.toml` và `uv.lock` của HAL cần uv 0.6.6 trở lên (`HAL_UV_MIN`). Ảnh
+máy cũ có thể mang uv cũ hơn:
+- uv 0.4.x báo `unknown field required-environments`.
+- uv từ 0.5.31 đến 0.6.5 báo lockfile cần cập nhật khi chạy `--locked`.
+
+Cả hai trường hợp sync đều lỗi và máy vẫn ở HAL cũ. Khi uv tìm được bị thiếu
+hoặc cũ hơn mức tối thiểu, updater dùng `/usr/local/lib/autonomous/uv/uv` nếu
+bản đó đủ mới. Nếu không, nó cài uv ghim sẵn (`HAL_UV_PIN`, 0.12.23) vào đó
+bằng bộ cài của astral cho đúng bản này, với `UV_UNMANAGED_INSTALL`: không ghi
+receipt và không sửa PATH. uv có sẵn của máy giữ nguyên. Nếu cài lỗi, cập nhật
+dừng trước khi HAL bị dừng.
+
+Trước khi dừng HAL, script chọn Python extras theo `DEVICE_TYPE` trong `/opt/hal/.env`, fallback sang
 `device_type` trong `/root/config/config.json`: `reachy-mini` dùng `hardware + reachy`
 để giữ Pollen SDK; các thiết bị khác dùng `hardware + aec + pipecat`.
 
@@ -1291,9 +1351,16 @@ Version của HAL là file text `hal/VERSION_HAL` (cài thành `/opt/hal/VERSION
 
 ## Thay service qua OTA feed hiện tại
 
-Component khai báo service dùng payload metadata đã ký hiện tại; không có release
+Component khai báo service dùng metadata và chế độ tin cậy OTA hiện tại; không có release
 manifest thứ hai hay key theo kiến trúc `runtime`, `v2`, `v3`. Component mô tả
-service thực tế được phát hành:
+service thực tế được phát hành. Device chưa cấu hình `signing_public_key` dùng feed
+legacy không ký, gồm cả cài service lần đầu và các lần update sau. Gói service vẫn
+bắt buộc URL và SHA-256 hợp lệ trong cả hai chế độ. Nếu device đã có public key,
+chữ ký vẫn bắt buộc; chữ ký thiếu/sai không tự hạ về legacy. Upload dùng thông tin
+gsutil hiện có. Ký release vẫn được hỗ trợ tùy chọn; không ghi đè feed đã ký thành
+không ký chỉ vì shell publish thiếu key.
+
+Ví dụ:
 
 ```json
 {
@@ -1303,6 +1370,7 @@ service thực tế được phát hành:
     "sha256": "<artifact SHA-256>",
     "min_version_by_device": {"lamp": "0.1.0"},
     "activate_by_device": {"lamp": true},
+    "activation_release_by_device": {"lamp": {"version": "0.1.0", "sha256": "<same artifact SHA-256>"}},
     "service": "lamp-os",
     "replaces": ["hal", "os-server"]
   }
@@ -1312,13 +1380,16 @@ service thực tế được phát hành:
 Key component phải trùng tên service không có hậu tố `.service`. `replaces` chỉ
 định `hal`/`os-server` hoặc component khai báo service đã đăng ký,
 không phải service hệ thống tùy ý. Bản này chưa hỗ trợ thay các component V1 khác. Cơ chế này không được thay bootstrap. Tên, quyền
-sở hữu và metadata đã ký được kiểm tra trước khi chuyển service. Các trường này
+sở hữu và metadata được kiểm tra trước khi chuyển service. Các trường này
 không được chứa lệnh shell hay hook thực thi tùy ý.
 
-Máy tự chuyển lần đầu khi mục service trong metadata đã ký đặt
+Máy tự chuyển lần đầu khi mục service trong metadata đặt
 `activate_by_device[device_type]` thành `true` và có ngưỡng
 `min_version_by_device[device_type]` hợp lệ, không rỗng, không lớn hơn version
-đang phát hành. Người vận hành release bật bằng promote; người dùng device
+đang phát hành, đồng thời `activation_release_by_device[device_type]` phải khớp
+chính xác version và SHA-256 hiện tại. Promote cũ chỉ có boolean không cho phép
+migrate. `ACTIVATE=1` chọn version hiện tại trên feed và ghi binding đó.
+Người vận hành release bật bằng promote; người dùng device
 không cần SSH hay chạy CLI:
 
 ```bash
@@ -1327,13 +1398,17 @@ make promote-service COMPONENT=lamp-os FOR=lamp V=0.1.0 ACTIVATE=1
 
 Bootstrap tìm các service được promote rồi gọi
 `software-update lamp-os --activate-promoted`. Updater kiểm tra lại metadata
-đã ký vừa tải và loại device thực tế trước khi dùng giao dịch chuyển service
-hiện có. Metadata không ký, thiếu chỉ định loại máy, ngưỡng không hợp lệ,
+vừa tải và loại device thực tế trước khi dùng giao dịch chuyển service
+hiện có. Thiếu chỉ định loại máy, ngưỡng không hợp lệ,
 xung đột quyền sở hữu hoặc updater cũ không cho phép cài lần đầu. Phải đưa
 bootstrap và updater tương thích xuống device trước khi bật chỉ định trên feed.
+Migrate `lamp-os` tự động lần đầu còn yêu cầu protocol preflight và cleanup;
+updater cũ chỉ có activation bị từ chối trước cutover.
 
-Chỉ publish không tự kích hoạt. Promote không truyền `ACTIVATE` giữ nguyên
-chỉ định kích hoạt đã có. `ACTIVATE=0 FOR=lamp` ngừng các lần cài đầu tiếp theo
+Publish version/artifact mới xoá cờ activation và binding; cần promote kích hoạt
+rõ ràng lại cho artifact đó. Publish lại đúng version/hash giữ nguyên chúng.
+Promote không truyền `ACTIVATE` giữ nguyên chỉ định đã có.
+`ACTIVATE=0 FOR=lamp` xoá binding và ngừng các lần cài đầu tiếp theo
 cho Lamp; không gỡ hay rollback service đã hoạt động. Phạm vi là loại device,
 không phải ID từng máy hoặc tỷ lệ rollout.
 
@@ -1344,16 +1419,50 @@ Các component độc lập có thể cùng tồn tại. Lệnh thủ công
 `sudo software-update lamp-os --activate` vẫn dùng được để kiểm thử, nhưng
 không phải bước bắt buộc khi chuyển toàn bộ thiết bị.
 
+Refresh updater cũng giữ khả năng preflight và cleanup đã cài: script cũ từ feed không được làm mất các khả năng này, kể cả khi device vẫn chạy V1.
+
+
 ### Hợp đồng adapter của gói
 
 ZIP chứa `VERSION` khớp version metadata, executable `bin/service` và các
 worker/tài nguyên đi kèm. Updater tạo systemd unit; gói không cung cấp systemd
 unit tùy ý. Entrypoint hỗ trợ các đối số cố định:
 
+- `bin/service prepare`: bắt buộc cho migrate `lamp-os` lần đầu; ZIP phải có
+  `SERVICE_PREFLIGHT` chứa `1`. Chuẩn bị dữ liệu candidate riêng và kiểm tra
+  config/prerequisites, không dừng chủ sở hữu hiện tại hoặc tác động hardware.
+  Các service cũ khác có thể opt-in bằng cùng marker.
 - `bin/service serve`: quản lý component và các process con của nó.
 - `bin/service health`: hỏi component đang chạy và trả JSON chứa `ready: true`,
   `version` khớp và `pid` của supervisor đang chạy. Updater đối chiếu PID với
   MainPID của systemd trong thời hạn giới hạn.
+- `bin/service cleanup`: gói có `SERVICE_CLEANUP=1` chạy lệnh cố định này sau stop
+  để dọn tài nguyên lifecycle thuộc chính nó. Cleanup có timeout và phải thành
+  công trước khi recovery bật lại chủ sở hữu hardware cũ.
+
+Web của V1 (lampOS #2396): khi adapter `lamp-os` cài, nếu `nginx.service` của
+V1 đang bật lúc boot thì nó ghi unit này vào journal, rồi disable và stop. Lamp
+đã chuyển vì vậy có cổng 80 trống sau khi V2 chạy, và không còn route V1 nào
+(`/monitor`, `/setting`, proxy `/api` sang os-server, `/hw`) trả lời. File của
+nginx giữ nguyên. ZIP chung không mang `lamp-setup`, nên trên V2 không gì bật
+nginx. `cleanup`, chạy khi rollback trước recovery, enable và start lại nó, nên
+V1 trở về với đủ site. Lamp có nginx không bật lúc boot thì giữ nguyên.
+
+ZIP `lamp-os` build trên main có `SERVICE_PREFLIGHT=1` và `SERVICE_CLEANUP=1`.
+`bin/service prepare` exec chính `bin/lamp-keeper prepare` của release (hợp đồng
+V2 từ lamp-voice #1094), bỏ `AUTONOMOUS_SERVICE_NAME` và `AUTONOMOUS_SERVICE_DATA`
+giống cách `serve` chạy keeper. Vì exec chứ không spawn, timeout 120 giây, tín hiệu
+và mã thoát của updater đi thẳng tới keeper; không còn tiến trình mồ côi chạy
+tiếp sau timeout. Keeper ghi key của device (`llm_api_key` trong
+`/root/config/config.json`) vào `/etc/lampOS/voice/credential` và
+`/etc/lampOS/policy/jev.key` nếu chưa có. Nó không dừng gì, không đụng hardware
+hay unit. Không có key dùng được thì nó vẫn thoát 0 và để setup nhận key, nên
+prepare thành công **không** chứng minh credentials voice hay setup đã đủ.
+Packaging báo lỗi khi `lamp-keeper` được build không có `prepare` (source cũ hơn
+#1094); nếu keeper cũ vẫn được chạy thì nó thoát khác 0. Prepare không chuyển
+calibration hay settings V1; profile của device, pose và các required path bên dưới
+vẫn phải chuẩn bị riêng từng máy. ZIP `lamp-os` thiếu `SERVICE_PREFLIGHT=1` (0.0.2
+trở về trước) bị từ chối migrate lần đầu; không promote chỉ vì updater đã nâng cấp.
 
 Adapter health không được bật runtime thứ hai hoặc di chuyển hardware. Readiness
 chỉ chứng minh các kiểm tra khởi động mà gói khai báo, không chứng minh hội thoại
@@ -1363,10 +1472,15 @@ hiện có trở thành gói cài được.
 
 ### Giới hạn chuyển đổi, dữ liệu và rollback
 
-Tải và kiểm tra gói trước khi dừng service hiện tại. Updater ghi trạng thái sở
+Tải, giải nén và chạy `prepare` được khai báo trước khi dừng service hiện tại.
+Chuẩn bị lỗi thì xoá staging và giữ chủ sở hữu cũ chạy. Với update service đã
+cài, prepare snapshot dữ liệu riêng lần đầu; sau khi dừng process ghi, lấy snapshot
+nhất quán lần hai và prepare lại trước khi chuyển. Lỗi giai đoạn hai dùng recovery
+có journal. Updater ghi trạng thái sở
 hữu và phục hồi, dừng các chủ sở hữu cũ được khai báo và xác nhận đã dừng trước
-khi bật service thay thế. Khi lỗi hoặc phục hồi giao dịch bị gián đoạn, nó khôi
-phục cấu hình trước đó. Trạng thái sở hữu bền vững cũng ngăn OTA cũ hoặc reboot
+khi bật service thay thế. Khi lỗi hoặc phục hồi giao dịch bị gián đoạn, nó thử
+khôi phục cấu hình trước đó. Lỗi stop, cleanup hoặc restart giữ journal và chặn
+cutover; không có nghĩa V1 đã được khôi phục thành công. Trạng thái sở hữu bền vững cũng ngăn OTA cũ hoặc reboot
 bật lại các service đã bị thay thế. Rollback không được bật service tổ tiên
 khi service thay thế nó vẫn đang hoạt động.
 
@@ -1375,6 +1489,20 @@ credentials, calibration, memory hay config của V1. Bên đóng gói phải đ
 migration đó riêng trước khi deploy. Cập nhật giữ snapshot dữ liệu riêng để
 rollback; rollback có thể mất các thay đổi ghi sau snapshot. Gói không được sửa
 dữ liệu V1 dùng chung rồi coi rollback hoàn tất chỉ vì binary cũ khởi động được.
+
+Lần kích hoạt thành công đầu tiên giữ checkpoint legacy riêng, không bị update
+service sau đó ghi đè. `software-update rollback lamp-os` chọn release trước;
+`software-update rollback-to-legacy lamp-os` khôi phục quyền sở hữu/trạng thái
+chạy legacy ban đầu kể cả sau update V2. Thiếu/sai checkpoint thì từ chối, không
+tự đoán trạng thái cũ. Bootstrap chạy pending recovery lúc startup, trước khi
+chờ metadata URL hoặc parse poll settings. Recovery lỗi thì dừng startup và giữ
+journal để thử lại. Ngoại lệ hẹp là journal tự update bootstrap đã được kiểm tra
+và có process thực sự giữ `flock` của updater: bootstrap mới phục vụ `/health`
+để installer hoàn tất, nhưng mọi thao tác OTA vẫn bị chặn với update-in-progress.
+File PID không chứng minh installer còn chạy. Khi lock được nhả, journal còn lại
+đi qua recovery bình thường. Sau khi V2 thay HAL/os-server, vẫn cho recovery
+bootstrap/web hợp lệ; journal nhắm HAL/os-server/device profile đã bị thay vẫn
+bị chặn.
 
 Bootstrap vẫn độc lập và nâng cấp được. Khai báo tương thích ngăn thay bootstrap
 hoặc updater bằng bản cũ không hiểu quyền sở hữu service và phục hồi. Kiểm tra
@@ -1385,63 +1513,171 @@ kích hoạt trên device, reboot/mất điện và hành vi voice/hardware th�
 
 ### Phát hành component service
 
-Build và kiểm chứng gói riêng, sau đó phát hành bằng thông tin ký hiện có
-(`OTA_SIGNING_PRIVATE_KEY`, `OTA_SIGNING_KEY_ID`):
+Build và kiểm chứng gói riêng, sau đó phát hành bằng thông tin đăng nhập GCS
+hiện có. Ký là tùy chọn, giống các component OTA legacy:
 
 ```bash
 make upload-service COMPONENT=lamp-os V=0.1.0 PACKAGE=/path/lamp-os.zip REPLACES='hal os-server'
 make promote-service COMPONENT=lamp-os FOR=lamp V=0.1.0 ACTIVATE=1
 ```
 
-Publisher bắt buộc metadata đã ký, kiểm tra gói, giữ nguyên ngưỡng promote và các
+Publisher kiểm tra gói và SHA-256, giữ nguyên ngưỡng promote và các
 component khác, đồng thời từ chối đổi tổ chức service dưới key cũ. URL gói chứa
-hash nội dung. Không được dùng lại version với nội dung khác khi version đó đang
-là bản hiện tại trên feed. Chạy các lần publish tuần tự như các script release
-hiện có; cập nhật metadata chưa phải giao dịch hỗ trợ nhiều người ghi đồng thời.
-Promote với `ACTIVATE=1` cho phép tự cài lần đầu trên loại device được chọn;
+hash nội dung. Từ chối publish version thấp hơn feed hoặc dùng lại version hiện
+tại với nội dung khác. Mọi script ghi metadata release đọc generation GCS cố định
+và publish với điều kiện generation còn khớp. Có người ghi đồng thời thì huỷ
+publication; chạy lại từ lần đọc feed mới, không ghi đè promote bằng dữ liệu cũ.
+Credentials GCS hiện có và signing tùy chọn giữ nguyên. Promote `ACTIVATE=1`
+cho phép tự cài lần đầu đúng artifact trên loại device được chọn;
 các lần cập nhật tiếp theo vẫn tuân theo ngưỡng promote.
-Nếu kích hoạt tự động lỗi sau khi bắt đầu chuyển, recovery khôi phục service cũ
-và ghi nhận version bị từ chối để polling không thử lại liên tục. Nếu không ghi
-được thông tin từ chối, journal recovery vẫn được giữ lại. `ACTIVATE=0` giữ
+Nếu kích hoạt tự động lỗi sau khi bắt đầu chuyển, recovery thử khôi phục service
+cũ và ghi version bị từ chối để polling không thử liên tục. Lỗi stop, cleanup,
+khôi phục hoặc ghi thông tin từ chối sẽ giữ journal; có thể vẫn cần chẩn đoán
+thủ công. `ACTIVATE=0` giữ
 nguyên các ngưỡng version hiện có.
 
-### Build supervisor V2 từ main
-
-Từ checkout có công cụ release, chạy:
+### Build và publish gói service V2 đầy đủ
 
 ```bash
 make upload-lamp-os
 ```
 
-Lệnh fetch `refs/heads/lamp-voice` từ `origin` của checkout vào repository tạm
-riêng, cố định commit vừa lấy rồi chỉ giải nén `lampOS/`. Không đổi branch hiện
-tại và không lấy source chưa commit. Dùng Rust toolchain và lockfile của workspace
-đó để chạy
-`cargo zigbuild --locked --release --target aarch64-unknown-linux-gnu -p lamp-keeper`.
-Máy build cần Cargo/rustup, cargo-zigbuild, Zig, target
-`aarch64-unknown-linux-gnu` của toolchain được pin và `gsutil` đã đăng nhập.
+Lệnh fetch và cố định commit `lamp-voice` từ `origin` trong thư mục source riêng.
+`LAMP_OS_SOURCE_COMMIT=<SHA 40 ký tự hex>` build đúng commit đã review thay vì
+đầu nhánh; commit fetch về phải khớp chính xác, nếu không lệnh dừng trước khi build.
+Toàn bộ binary workspace Rust và adapter lifecycle OTA được build trong Docker
+Linux ARM64 dùng toolchain/lockfile của source. Máy host không cần Cargo/Zig nữa.
+Cần Docker hỗ trợ Linux ARM64, git, curl, Python 3.10+ và gsutil đã đăng nhập.
+`OTA_SIGNING_PRIVATE_KEY` / `OTA_SIGNING_KEY_ID` là tùy chọn. Builder Debian bookworm yêu cầu
+runtime ARM64 tương thích Debian 12; đây không phải image chung cho mọi robot.
 
-Binary quản lý được upload với tên `lamp-os`, kèm `build.json`, `VERSION` và `SHA256SUMS`,
-vào `gs://${GCS_BUCKET}/${BUCKET_PREFIX}/services/lamp-os/builds/<version>/<commit>/<sha256>/`.
-Mặc định vẫn là bucket `s3-autonomous-upgrade-3`, prefix `os`; có thể override qua
-biến môi trường như các lệnh release khác. Lệnh kiểm tra ELF ARM64 trước upload,
-sau đó tải lại binary đã lưu để đối chiếu SHA-256 trước khi báo thành công.
-Đây là kiểm tra build và nguồn gốc, chưa phải kiểm chứng trên hardware.
+ZIP chứa `VERSION`, `bin/service` (adapter lifecycle OTA bằng Rust),
+`bin/lamp-keeper`, các binary V2 cần thiết kể cả worker turn-end, model/ONNX Runtime
+được pin SHA, thư viện liên kết ngoài glibc, tài nguyên character/policy, template
+unit và manifest checksum toàn bộ file. Không lấy secret hoặc calibration của máy
+test đưa vào gói. Có thể mang binary `lamp-update`/`lamp-surround` nhưng không kích
+hoạt hai service update độc lập đó: bootstrap quản lý update release này.
 
-Artifact bước đầu này là supervisor `lamp-keeper`, sau này đặt thành `bin/service`
-trong gói service `lamp-os`. **Chưa phải ZIP OTA V2 hoàn chỉnh**: phải đóng gói và
-kiểm chứng riêng các binary con, model, config/calibration của device và các unit
-đã render. Lệnh không sửa OTA metadata, ngưỡng version hay chỉ định kích hoạt.
-Chỉ dùng `upload-service` khi gói đầy đủ đã sẵn sàng; upload này không thay đổi V1
-hoặc các loại device khác.
+`system/VERSION_LAMP_OS` tự tăng patch sau khi build gói hoàn chỉnh. VERSION trong
+ZIP và package.json ghi version; package.json ghi cả commit source. Publish dùng lại
+`upload-service`: một ZIP theo hash ở
+`gs://${GCS_BUCKET}/${BUCKET_PREFIX}/services/lamp-os/<sha256>.zip` và một entry
+`lamp-os` trong OTA JSON, khai báo `replaces: ["hal", "os-server"]`.
+Giữ nguyên ngưỡng promote, nhưng artifact mới xoá cờ activation/binding và cần
+promote kích hoạt lại. Mặc định bucket `s3-autonomous-upgrade-3`, prefix `os`. Giữ
+version-file đã thay đổi trong lịch sử release; checkout cũ không thể publish
+version thấp hơn đè lên feed.
 
-`system/VERSION_LAMP_OS` theo dõi version release riêng, độc lập HAL và bootstrap.
-File khởi tạo `0.0.0`; sau khi build binary hợp lệ, `upload-lamp-os` tự tăng patch
-(lần upload đầu là `0.0.1`). Version được ghi vào `build.json`, file `VERSION`
-upload kèm và đường dẫn GCS. Keeper đọc file `VERSION` của release để trả health
-cho OTA; lệnh không sửa version crate Rust. Giống các lệnh release hiện có, nếu
-upload lỗi sau bước tăng version thì file vẫn giữ số mới. Chạy release tuần tự,
-giữ lại version file đã cập nhật trong lịch sử release; không tự tăng bằng tay.
+Build kiểm tra local, không publish hoặc tăng version-file:
 
-Nếu PATH của shell chưa có Cargo, lệnh còn kiểm tra bản đã cài trong
-`${CARGO_HOME:-$HOME/.cargo}/bin`. Lệnh không tự cài Rust.
+```bash
+LAMP_OS_BUILD_ONLY=1 LAMP_OS_OUTPUT=/path/lamp-os.zip make upload-lamp-os
+```
+
+ZIP chung vẫn cần chuẩn bị device: `/etc/lampOS/package-profile.json` thuộc root,
+không cho group/others ghi, có `unit_id`, map `substitutions` cho các placeholder
+được manifest khai báo và `required_paths` tùy chọn. Pose servo, đường dẫn hardware
+và service account phải lấy đúng máy. Credentials riêng trong
+`/etc/lampOS/voice/provider.json` và config controls được cấp riêng. Thiếu điều kiện
+hoặc sai hostname sẽ fail preflight. Lệnh này chưa tự chuyển credentials/calibration
+V1. State V2 nằm ngoài thư mục dữ liệu riêng của updater không được snapshot bởi
+updater; đổi schema ở đó cần chính sách migration/rollback tương thích được kiểm
+chứng riêng. Xem manifest trong gói để biết điều kiện cụ thể trước khi chọn máy migrate.
+
+Adapter chỉ tạo unit con/drop-in trong `/run/systemd/system`, ràng buộc vào
+`lamp-os`, ghi journal trước khi sửa. Không enable hay mask bền vững unit con/V1.
+Khi dừng bình thường hoặc qua `ExecStopPost`, cleanup chỉ xoá file do nó tạo mà
+nội dung còn nguyên; lỗi dừng/cleanup không được coi rollback đã hoàn thành.
+Marker `SERVICE_CLEANUP` bật thao tác cố định này; updater còn gọi cleanup đồng
+bộ sau khi stop (kể cả recovery), không suy ra thành công chỉ từ trạng thái systemd; gói cũ không có marker giữ hành
+vi cũ. Unit cấp cao cho phép 60 giây shutdown. Phải cập nhật updater trước khi
+cài gói: adapter kiểm tra khả năng cleanup và từ chối an toàn với updater cũ.
+Keeper chạy như process con được theo dõi, không tự cài unit nữa. Bus chung
+`/run/lampos-bus` được giữ tới reboot; cleanup không xoá đệ quy dữ liệu IPC.
+
+Health trả PID/version adapter và trạng thái active của các unit con với kiểm tra
+độ mới. Không chứng minh voice/provider hay an toàn chuyển động thực tế. Cần test
+activation, reboot/gián đoạn và rollback trên device trước khi promote migration.
+Gói chung không có nghĩa được phép chuyển các robot khác hoặc toàn bộ Lamp.
+
+Inventory còn mang `lamp-selftest`, `lamp-settings` và `lamp-setup` khi upstream
+build chúng; thêm executable không tự bật service hay chạy self-test/reset.
+`lamp-cloud` và `lamp-skills` là service sản phẩm nên executable được đưa vào gói
+(packaging báo lỗi nếu source khai báo mà build thiếu), nhưng unit của chúng không
+được cài hay bật: `lamp-cloud` kết nối broker công ty, là opt-in và không được dùng
+chung MQTT client ID với os-server V1; `lamp-skills` còn cần skills và settings sản
+phẩm mà ZIP này chưa mang. `lamp-body-measure` là công cụ nhà máy/provisioning ghi
+`BODY_POSES` của từng lamp lúc đứng yên. ZIP chung mang nó ở
+`tools/lamp-body-measure` cho script migrate V1 bên dưới, và pose không bao giờ được
+ship hay chép từ lamp khác. Khi build từ source lampOS có
+`deploy/units/lamp-body-measure.service` (lampOS #2163), ZIP chung mang thêm unit
+oneshot đó và đặt công cụ cạnh `lamp-body` (`runtime/body/<sha>/`). Trên lamp chưa có
+cả `/etc/lampOS/body/lamp.env` lẫn `/var/lib/lampos-body/measured.env`, sau cutover
+nó đọc lamp đứng yên ở tư thế ngồi (`--home`, pitch window và `--torque on`, không
+stand) trước lần chạy body đầu tiên. Body chỉ cử động đầu và đế cho tới khi có người
+xác nhận lần đứng đầu tiên. Lần đọc bị từ chối (torque đang bật) giữ body không
+chạy, và nó không bao giờ tắt torque. Build từ source cũ thì ZIP như trước.
+Khi build từ source có `deploy/units/lamp-first-stand.service` (lampOS #2396), ZIP
+chung mang thêm unit đó, với cùng công cụ đặt cạnh `lamp-body`. Unit chạy
+`lamp-body-measure first-stand` bằng root.
+- Khi có người ở gần một lamp đang ngồi, lamp xin đứng lần đầu.
+- Chạm giữ một giây là đồng ý. Khi đó tay lamp đứng như bước nhà máy và ghi
+  `/etc/lampOS/body/lamp.env`.
+- Không có đồng ý thì không gì cử động. Unit không lấy bus từ unit sản phẩm.
+`lamp-memory-fixture`, `lamp-records-fixture`, `lamp-policy-replay` và CLI đo
+`lamp-same-voice pairs` hiện là công cụ phát triển nên không đưa vào gói. `lamp-station` (công cụ bench của trạm sản xuất) cũng không đưa vào. `lamp-body-mood` là công cụ nhà máy, mang cùng `lamp-body-measure` trong `tools/`, còn `lamp-peek` được mang nhưng không có unit. Source lampOS có `lampOS/deploy/package-binaries.json` (lamp-voice #2481) tự phân loại binary của nó ở đó (`core`, `optional`, `provisioning`, `development`), và packager làm theo. Khi đó binary mới không cần sửa gì trên main. Các danh sách trên chỉ còn dùng cho source cũ chưa có file này. Một tên nằm ở hai danh sách, hoặc một part `core` mà packager chưa biết đặt, vẫn làm đóng gói thất bại. Binary
+chưa phân loại vẫn làm packaging báo lỗi để không âm thầm bỏ sót runtime mới.
+
+ZIP chung vẫn render `DEFAULT_UNITS` của main từ `lampOS/deploy/units`. Chỗ nào
+template khác unit của chính part đó trong `lampOS/deploy/product` đến mức lamp không
+chạy được, packager chỉnh cho khớp và báo lỗi nếu một trong hai phía đổi cấu trúc:
+
+- `lamp-policy.service` chạy bằng `@LAMP_USER@` thay cho `DynamicUser` (nằm ngoài
+  group của bus), có `StateDirectoryMode=0700` (lamp-policy từ chối thư mục log 0755)
+  và `--endpoint` của unit sản phẩm (Jev relay; thiếu nó policy gọi endpoint mặc định).
+- Part nào có unit sản phẩm đặt `LAMP_BUS=on`, `LAMP_BUS_AUDIO=on` hoặc
+  `--bus-root /run/lampos-bus` thì được đặt y vậy: voice, body và eyes vào bus và voice
+  đưa âm thanh mic lên bus, nên name nghe được mic và health nghe được mọi part.
+
+ZIP còn mang các template `voice-provider.json`, `controls.json` và
+`controls-pins.json` của sản phẩm trong `provision/`. Installer sản phẩm V2 vẫn cài
+thêm nhiều thứ (chặn theo setup, schedule, skills, ears, air, records, các tính năng
+`LAMP_*` khác của voice, link `current`), nên lamp migrate chưa phải bản cài sản phẩm
+V2 đầy đủ.
+
+### Migrate một Lamp V1
+
+`scripts/provision/lamp-v2-migrate` chạy trên lamp bằng root sau khi gói đã có trên
+feed. Với `--dry-run` nó không đổi gì; còn lại:
+
+1. Kiểm lamp: `device_type` là `lamp`, updater có preflight protocol, `lamp-os` chưa
+   chạy, có user `orangepi`.
+2. Đọc phần cứng: đúng một adapter servo `1a86` trong `/dev/serial/by-id`, đúng một
+   camera USB (`/dev/video0`, `vendor:product@cổng-usb`), mic `device_micro2`
+   (`--microphone mic2`), `allwinnerhdmi`/`Speaker`, các CPU nhanh nhất và vùng nhiệt
+   `cpu`/`skin`. Thiếu hoặc không phân biệt được thì từ chối.
+3. Tải ZIP `lamp-os` của feed (`OTA_METADATA_URL` hoặc `/root/config/bootstrap.json`,
+   kiểm sha256; `--package ZIP` đọc file cục bộ) và từ chối gói không có `tools/` và
+   `provision/`.
+4. Đo pose nếu chưa có `/etc/lampOS/body/lamp.env` (`--remeasure` đo lại): HAL dừng
+   vài giây, `lamp-body-measure` đọc lamp đứng yên bằng user `orangepi` (nó từ chối
+   root), không ghi thanh ghi nào, và HAL luôn được bật lại. Lamp phải gập và nằm yên.
+   Tool không đo gaze; thiếu gaze thì body từ chối `--gaze-socket`, nên script thêm
+   `--gaze 755,555`, giá trị giữa của hai Lamp V1 đã đo trong `docs/body.md` của
+   lampOS, để đo lại trên chính lamp sau.
+5. Ghi `/etc/lampOS/body/lamp.env`, `package-profile.json`, `voice/provider.json`
+   (0600), `controls/controls.json` và `controls/controls-pins.json` (bỏ `reset`/
+   `legacy_head` chỉ dùng cho touch, vì unit controls chung chạy không có `--touch`),
+   và tạo thư mục voice sessions, memory, actions và lock. File khác nội dung được để
+   nguyên trừ khi có `--force`.
+6. Chạy `software-update lamp-os --activate` và chờ. Prepare ghi credential; nếu V2
+   không ready, updater tự khôi phục V1.
+
+`--no-activate` dừng sau bước 5, `--rollback` chạy
+`software-update rollback-to-legacy lamp-os`. Script không promote gì và không đổi lamp
+khác.
+
+Đã kiểm trên lamp-a63e (V1, 2026-10-19) với các gói build từ lamp-voice `ec9b26a`:
+V1 lên V2, rồi cập nhật V2 lên V2, mọi part active và health `ok`. Voice của nó không
+kết nối được Gemini (quota campaign-api của device đó, `quota_exceeded`), nên phần nói
+chưa được kiểm và voice khởi động lại cho tới khi có quota.
